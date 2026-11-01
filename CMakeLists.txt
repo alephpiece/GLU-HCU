@@ -42,4 +42,18 @@ add_executable(lu_cmd src/lu_cmd.cpp src/numeric.cu src/symbolic.cc
     src/Timer.cpp src/preprocess/preprocess.c)
 glu_configure_target(lu_cmd)
 
+option(GLU_BUILD_TESTS "Build GPU numeric regression tests" OFF)
+if(GLU_BUILD_TESTS)
+    enable_testing()
+    set_source_files_properties(tests/gpu-kernels.cu PROPERTIES LANGUAGE ${GLU_BACKEND})
+    add_executable(gpu-kernel-tests tests/gpu-kernels.cu src/symbolic.cc)
+    glu_configure_target(gpu-kernel-tests)
+    add_test(NAME gpu-kernels COMMAND gpu-kernel-tests)
+    set_tests_properties(gpu-kernels PROPERTIES TIMEOUT 120)
+    add_test(NAME cli-output COMMAND ${CMAKE_COMMAND}
+        -DGLU_EXECUTABLE=$<TARGET_FILE:lu_cmd>
+        -DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/cli-output-test
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli-output.cmake)
+    set_tests_properties(cli-output PROPERTIES TIMEOUT 120)
+endif()
 message(STATUS "GLU backend: ${GLU_BACKEND}; FP32: ${GLU_USE_FP32}")
