@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include "symbolic.h"
 #include "numeric.h"
 #include "Timer.h"
@@ -113,7 +114,14 @@ int main(int argc, char** argv)
 #endif
 
     // Numeric factorization on GPU updates A_sym.val in place to LU factors.
-    LUonDevice(A_sym, cout, cerr, PERTURB);
+    if (!LUonDevice(A_sym, cout, cerr, PERTURB)) {
+        NicsLU_Destroy(nicslu);
+        free(nicslu);
+        free(ax);
+        free(ai);
+        free(ap);
+        return 1;
+    }
 
 #if GLU_DEBUG
     A_sym.ABFTCheckResult();
@@ -122,17 +130,30 @@ int main(int argc, char** argv)
     // Solve Ax=b with the computed factors and NICSLU permutations/scales.
     vector<REAL> b(n, 1.);
     vector<REAL> x = A_sym.solve(nicslu, b);
-    {
-        ofstream x_f("x.dat");
-        for (double xx: x)
-            x_f << xx << '\n';
-    }
-
     NicsLU_Destroy(nicslu);
     free(nicslu);
     free(ax);
     free(ai);
     free(ap);
 
+    for (REAL value : x) {
+        if (!isfinite(value)) {
+            cerr << "Solution contains NaN/Inf." << endl;
+            return 1;
+        }
+    }
+    ofstream x_f("x.dat");
+    if (!x_f) {
+        cerr << "Failed to open x.dat for writing." << endl;
+        return 1;
+    }
+    x_f << setprecision(numeric_limits<REAL>::max_digits10);
+    for (REAL value : x)
+        x_f << value << '\n';
+    x_f.close();
+    if (!x_f) {
+        cerr << "Failed to write x.dat." << endl;
+        return 1;
+    }
     return 0;
 }

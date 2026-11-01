@@ -1,8 +1,9 @@
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include "gpu-compat.h"
+#include "numeric.h"
 #include <iostream>
 #include "symbolic.h"
 #include <cmath>
+#include <algorithm>
 
 using namespace std;
 
@@ -23,13 +24,11 @@ __global__ void RL(
 {
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
-    const int wid = threadIdx.x / 32;
+    const int wid = threadIdx.x / GLU_GROUP_SIZE;
 
     const unsigned currentCol = level_idx_dev[levelHead+inLevPos+bid];
     const unsigned currentLColSize = sym_c_ptr_dev[currentCol + 1] - l_col_ptr_dev[currentCol] - 1;
     const unsigned currentLPos = l_col_ptr_dev[currentCol] + tid + 1;
-
-    extern __shared__ REAL s[];
 
     //update current col
 
@@ -41,7 +40,7 @@ __global__ void RL(
             unsigned ridx = sym_r_idx_dev[currentLPos + offset];
 
             val_dev[currentLPos + offset] /= val_dev[l_col_ptr_dev[currentCol]];
-            tmpMem[bid*n + ridx]= val_dev[currentLPos + offset];
+            tmpMem[size_t(bid)*n + ridx]= val_dev[currentLPos + offset];
         }
         offset += blockDim.x;
     }
@@ -51,7 +50,7 @@ __global__ void RL(
     const unsigned subColPos = csr_diag_ptr_dev[currentCol] + wid + 1;
     const unsigned subMatSize = csr_r_ptr_dev[currentCol + 1] - csr_diag_ptr_dev[currentCol] - 1;
     unsigned subCol;
-    const int tidInWarp = threadIdx.x % 32;
+    const int tidInWarp = threadIdx.x % GLU_GROUP_SIZE;
     unsigned subColElem = 0;
 
     int woffset = 0;
@@ -59,33 +58,31 @@ __global__ void RL(
     {
         if (wid + woffset < subMatSize)
         {
-            offset = 0;
             subCol = csr_c_idx_dev[subColPos + woffset];
-            while(offset < sym_c_ptr_dev[subCol + 1] - sym_c_ptr_dev[subCol])
+            const unsigned begin = sym_c_ptr_dev[subCol];
+            const unsigned count = sym_c_ptr_dev[subCol + 1] - begin;
+            REAL pivot = 0;
+            for (unsigned offset = 0; offset < count; offset += GLU_GROUP_SIZE)
             {
-                if (tidInWarp + offset < sym_c_ptr_dev[subCol + 1] - sym_c_ptr_dev[subCol])
-                {
-
-                    subColElem = sym_c_ptr_dev[subCol] + tidInWarp + offset;
-                    unsigned ridx = sym_r_idx_dev[subColElem];
-
-                    if (ridx == currentCol)
-                    {
-                        s[wid] = val_dev[subColElem];
-                    }
-                    //Threads in a warp are always synchronized
-                    //__syncthreads();
-                    if (ridx > currentCol)
-                    {
-                        //elem in currentCol same row with subColElem might be 0, so
-                        //clearing tmpMem is necessary
-                        atomicAdd(&val_dev[subColElem], -tmpMem[ridx+n*bid]*s[wid]);
-                    }
+                const bool active = tidInWarp + offset < count;
+                subColElem = begin + tidInWarp + offset;
+                const unsigned ridx = active ? sym_r_idx_dev[subColElem] : 0;
+                const bool is_pivot = active && ridx == currentCol;
+                const REAL value = is_pivot ? val_dev[subColElem] : REAL(0);
+                const unsigned mask = gpuBallot32(is_pivot);
+                if (mask)
+                    pivot = gpuShuffle32(value, __ffs(mask) - 1);
+                // Sorted row indices put the pivot before all rows using it.
+                // Keep it in registers across chunks; no implicit warp sync.
+                if (active && ridx > currentCol) {
+                    const REAL factor = tmpMem[ridx+n*size_t(bid)];
+                    // Avoid zero-contribution writes to another column's pivot.
+                    if (factor != REAL(0))
+                        atomicAdd(&val_dev[subColElem], -factor*pivot);
                 }
-                offset += 32;
             }
         }
-        woffset += blockDim.x/32;
+        woffset += blockDim.x/GLU_GROUP_SIZE;
     }
 
     __syncthreads();
@@ -96,7 +93,7 @@ __global__ void RL(
         if (tid + offset < currentLColSize)
         {
             unsigned ridx = sym_r_idx_dev[currentLPos + offset];
-            tmpMem[bid*n + ridx]= 0;
+            tmpMem[size_t(bid)*n + ridx]= 0;
         }
         offset += blockDim.x;
     }
@@ -115,17 +112,19 @@ __global__ void RL_perturb(
         const unsigned n,
         const int levelHead,
         const int inLevPos,
-        const float pert)
+        const REAL pert)
 {
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
-    const int wid = threadIdx.x / 32;
+    const int wid = threadIdx.x / GLU_GROUP_SIZE;
 
     const unsigned currentCol = level_idx_dev[levelHead+inLevPos+bid];
     const unsigned currentLColSize = sym_c_ptr_dev[currentCol + 1] - l_col_ptr_dev[currentCol] - 1;
     const unsigned currentLPos = l_col_ptr_dev[currentCol] + tid + 1;
 
-    extern __shared__ REAL s[];
+    if (tid == 0 && fabs(val_dev[l_col_ptr_dev[currentCol]]) < pert)
+        val_dev[l_col_ptr_dev[currentCol]] = pert;
+    __syncthreads();
 
     //update current col
 
@@ -136,11 +135,8 @@ __global__ void RL_perturb(
         {
             unsigned ridx = sym_r_idx_dev[currentLPos + offset];
 
-            if (fabs(val_dev[l_col_ptr_dev[currentCol]]) < pert)
-                val_dev[l_col_ptr_dev[currentCol]] = pert;
-
             val_dev[currentLPos + offset] /= val_dev[l_col_ptr_dev[currentCol]];
-            tmpMem[bid*n + ridx]= val_dev[currentLPos + offset];
+            tmpMem[size_t(bid)*n + ridx]= val_dev[currentLPos + offset];
         }
         offset += blockDim.x;
     }
@@ -150,7 +146,7 @@ __global__ void RL_perturb(
     const unsigned subColPos = csr_diag_ptr_dev[currentCol] + wid + 1;
     const unsigned subMatSize = csr_r_ptr_dev[currentCol + 1] - csr_diag_ptr_dev[currentCol] - 1;
     unsigned subCol;
-    const int tidInWarp = threadIdx.x % 32;
+    const int tidInWarp = threadIdx.x % GLU_GROUP_SIZE;
     unsigned subColElem = 0;
 
     int woffset = 0;
@@ -158,33 +154,31 @@ __global__ void RL_perturb(
     {
         if (wid + woffset < subMatSize)
         {
-            offset = 0;
             subCol = csr_c_idx_dev[subColPos + woffset];
-            while(offset < sym_c_ptr_dev[subCol + 1] - sym_c_ptr_dev[subCol])
+            const unsigned begin = sym_c_ptr_dev[subCol];
+            const unsigned count = sym_c_ptr_dev[subCol + 1] - begin;
+            REAL pivot = 0;
+            for (unsigned offset = 0; offset < count; offset += GLU_GROUP_SIZE)
             {
-                if (tidInWarp + offset < sym_c_ptr_dev[subCol + 1] - sym_c_ptr_dev[subCol])
-                {
-
-                    subColElem = sym_c_ptr_dev[subCol] + tidInWarp + offset;
-                    unsigned ridx = sym_r_idx_dev[subColElem];
-
-                    if (ridx == currentCol)
-                    {
-                        s[wid] = val_dev[subColElem];
-                    }
-                    //Threads in a warp are always synchronized
-                    //__syncthreads();
-                    if (ridx > currentCol)
-                    {
-                        //elem in currentCol same row with subColElem might be 0, so
-                        //clearing tmpMem is necessary
-                        atomicAdd(&val_dev[subColElem], -tmpMem[ridx+n*bid]*s[wid]);
-                    }
+                const bool active = tidInWarp + offset < count;
+                subColElem = begin + tidInWarp + offset;
+                const unsigned ridx = active ? sym_r_idx_dev[subColElem] : 0;
+                const bool is_pivot = active && ridx == currentCol;
+                const REAL value = is_pivot ? val_dev[subColElem] : REAL(0);
+                const unsigned mask = gpuBallot32(is_pivot);
+                if (mask)
+                    pivot = gpuShuffle32(value, __ffs(mask) - 1);
+                // Sorted row indices put the pivot before all rows using it.
+                // Keep it in registers across chunks; no implicit warp sync.
+                if (active && ridx > currentCol) {
+                    const REAL factor = tmpMem[ridx+n*size_t(bid)];
+                    // Avoid zero-contribution writes to another column's pivot.
+                    if (factor != REAL(0))
+                        atomicAdd(&val_dev[subColElem], -factor*pivot);
                 }
-                offset += 32;
             }
         }
-        woffset += blockDim.x/32;
+        woffset += blockDim.x/GLU_GROUP_SIZE;
     }
 
     __syncthreads();
@@ -195,7 +189,7 @@ __global__ void RL_perturb(
         if (tid + offset < currentLColSize)
         {
             unsigned ridx = sym_r_idx_dev[currentLPos + offset];
-            tmpMem[bid*n + ridx]= 0;
+            tmpMem[size_t(bid)*n + ridx]= 0;
         }
         offset += blockDim.x;
     }
@@ -226,7 +220,7 @@ __global__ void RL_onecol_factorizeCurrentCol(
             unsigned ridx = sym_r_idx_dev[currentLPos + offset];
 
             val_dev[currentLPos + offset] /= val_dev[l_col_ptr_dev[currentCol]];
-            tmpMem[stream * n + ridx]= val_dev[currentLPos + offset];
+            tmpMem[size_t(stream) * n + ridx]= val_dev[currentLPos + offset];
         }
         offset += blockDim.x;
     }
@@ -241,12 +235,16 @@ __global__ void RL_onecol_factorizeCurrentCol_perturb(
         REAL* __restrict__ tmpMem,
         const int stream,
         const unsigned n,
-        const float pert)
+        const REAL pert)
 {
     const int tid = threadIdx.x;
 
     const unsigned currentLColSize = sym_c_ptr_dev[currentCol + 1] - l_col_ptr_dev[currentCol] - 1;
     const unsigned currentLPos = l_col_ptr_dev[currentCol] + tid + 1;
+
+    if (tid == 0 && fabs(val_dev[l_col_ptr_dev[currentCol]]) < pert)
+        val_dev[l_col_ptr_dev[currentCol]] = pert;
+    __syncthreads();
 
     //update current col
 
@@ -257,11 +255,8 @@ __global__ void RL_onecol_factorizeCurrentCol_perturb(
         {
             unsigned ridx = sym_r_idx_dev[currentLPos + offset];
 
-            if (fabs(val_dev[l_col_ptr_dev[currentCol]]) < pert)
-                val_dev[l_col_ptr_dev[currentCol]] = pert;
-
             val_dev[currentLPos + offset] /= val_dev[l_col_ptr_dev[currentCol]];
-            tmpMem[stream * n + ridx]= val_dev[currentLPos + offset];
+            tmpMem[size_t(stream) * n + ridx]= val_dev[currentLPos + offset];
         }
         offset += blockDim.x;
     }
@@ -311,7 +306,9 @@ __global__ void RL_onecol_updateSubmat(
         __syncthreads();
         if (active && ridx > currentCol)
         {
-            atomicAdd(&val_dev[subColElem], -tmpMem[stream * n + ridx] * s);
+            const REAL factor = tmpMem[size_t(stream) * n + ridx];
+            if (factor != REAL(0))
+                atomicAdd(&val_dev[subColElem], -factor * s);
         }
         __syncthreads();
         offset += blockDim.x;
@@ -338,17 +335,17 @@ __global__ void RL_onecol_cleartmpMem(
         if (tid + offset < currentLColSize)
         {
             unsigned ridx = sym_r_idx_dev[currentLPos + offset];
-            tmpMem[stream * n + ridx]= 0;
+            tmpMem[size_t(stream) * n + ridx]= 0;
         }
         offset += blockDim.x;
     }
 }
 
-void LUonDevice(Symbolic_Matrix &A_sym, ostream &out, ostream &err, bool PERTURB)
+bool LUonDevice(Symbolic_Matrix &A_sym, ostream &out, ostream &err, bool PERTURB)
 {
     if (A_sym.n == 0 || A_sym.nnz == 0) {
         err << "Matrix is empty; skipping GPU factorization." << endl;
-        return;
+        return false;
     }
 
     auto cudaCheck = [&](cudaError_t status, const char *op) -> bool {
@@ -365,18 +362,26 @@ void LUonDevice(Symbolic_Matrix &A_sym, ostream &out, ostream &err, bool PERTURB
 
     int deviceCount = 0;
     if (!cudaCheck(cudaGetDeviceCount(&deviceCount), "cudaGetDeviceCount"))
-        return;
+        return false;
     if (deviceCount <= 0) {
-        err << "No CUDA-capable GPU detected." << endl;
-        return;
+        err << "No GPU detected." << endl;
+        return false;
     }
 
     int dev = 0;
     cudaDeviceProp deviceProp;
     if (!cudaCheck(cudaGetDeviceProperties(&deviceProp, dev), "cudaGetDeviceProperties"))
-        return;
+        return false;
+    if (deviceProp.warpSize != 32 && deviceProp.warpSize != 64) {
+        err << "Unsupported hardware warp size: " << deviceProp.warpSize << endl;
+        return false;
+    }
+    if (deviceProp.maxThreadsPerBlock < 1024) {
+        err << "This implementation requires 1024 threads per block." << endl;
+        return false;
+    }
     if (!cudaCheck(cudaSetDevice(dev), "cudaSetDevice"))
-        return;
+        return false;
     out << "Device " << dev << ": " << deviceProp.name << " has been selected." << endl;
 
     cudaEvent_t start = nullptr, stop = nullptr;
@@ -424,7 +429,7 @@ void LUonDevice(Symbolic_Matrix &A_sym, ostream &out, ostream &err, bool PERTURB
     do { \
         if (!cudaCheck((call), (op_name))) { \
             cleanup(); \
-            return; \
+            return false; \
         } \
     } while (0)
 
@@ -483,18 +488,20 @@ void LUonDevice(Symbolic_Matrix &A_sym, ostream &out, ostream &err, bool PERTURB
     if (TMPMEMNUM == 0)
         TMPMEMNUM = 1;
 
+    const int active_streams = std::min<unsigned>(Nstreams, TMPMEMNUM);
+
     const size_t tmp_bytes = size_t(TMPMEMNUM) * size_t(n) * sizeof(REAL);
     CUDA_RETURN_ON_ERR(cudaMalloc((void**)&tmpMem, tmp_bytes), "cudaMalloc(tmpMem)");
     CUDA_RETURN_ON_ERR(cudaMemset(tmpMem, 0, tmp_bytes), "cudaMemset(tmpMem)");
 
     // calculate 1-norm of A and perturbation value for perturbation
-    float pert = 0;
+    REAL pert = 0;
     if (PERTURB)
     {
-        float norm_A = 0;
+        REAL norm_A = 0;
         for (unsigned i = 0; i < n; ++i)
         {
-            float tmp = 0;
+            REAL tmp = 0;
             for (unsigned j = A_sym.sym_c_ptr[i]; j < A_sym.sym_c_ptr[i+1]; ++j)
                 tmp += fabs(A_sym.val[j]);
             if (norm_A < tmp)
@@ -506,8 +513,7 @@ void LUonDevice(Symbolic_Matrix &A_sym, ostream &out, ostream &err, bool PERTURB
     }
 
     auto launch_batched_level = [&](unsigned level_head, int level_size, unsigned warps_per_block) {
-        dim3 dimBlock(warps_per_block * 32, 1);
-        size_t mem_size = warps_per_block * sizeof(REAL);
+        dim3 dimBlock(warps_per_block * GLU_GROUP_SIZE, 1);
 
         int remaining = level_size;
         unsigned chunk_idx = 0;
@@ -517,7 +523,7 @@ void LUonDevice(Symbolic_Matrix &A_sym, ostream &out, ostream &err, bool PERTURB
             dim3 dimGrid(rest_col, 1);
             int in_level_pos = static_cast<int>(chunk_idx * TMPMEMNUM);
             if (!PERTURB)
-                RL<<<dimGrid, dimBlock, mem_size>>>(sym_c_ptr_dev,
+                RL<<<dimGrid, dimBlock>>>(sym_c_ptr_dev,
                                                     sym_r_idx_dev,
                                                     val_dev,
                                                     l_col_ptr_dev,
@@ -530,7 +536,7 @@ void LUonDevice(Symbolic_Matrix &A_sym, ostream &out, ostream &err, bool PERTURB
                                                     level_head,
                                                     in_level_pos);
             else
-                RL_perturb<<<dimGrid, dimBlock, mem_size>>>(sym_c_ptr_dev,
+                RL_perturb<<<dimGrid, dimBlock>>>(sym_c_ptr_dev,
                                                             sym_r_idx_dev,
                                                             val_dev,
                                                             l_col_ptr_dev,
@@ -565,8 +571,8 @@ void LUonDevice(Symbolic_Matrix &A_sym, ostream &out, ostream &err, bool PERTURB
         }
         else {
             // Small levels are mapped to one stream per column to reduce launch overhead.
-            for (int offset = 0; offset < lev_size; offset += Nstreams) {
-                for (int j = 0; j < Nstreams; j++) {
+            for (int offset = 0; offset < lev_size; offset += active_streams) {
+                for (int j = 0; j < active_streams; j++) {
                     if (j + offset < lev_size) {
                         const unsigned currentCol = A_sym.level_idx[A_sym.level_ptr[i] + j + offset];
                         const unsigned subMatSize = A_sym.csr_r_ptr[currentCol + 1]
@@ -624,8 +630,7 @@ void LUonDevice(Symbolic_Matrix &A_sym, ostream &out, ostream &err, bool PERTURB
 
     out << "Total GPU time: " << time << " ms" << endl;
 
-#ifdef GLU_DEBUG
-    // check NaN elements
+    // Reject unusable factors even in release builds.
     unsigned err_find = 0;
     for(unsigned i = 0; i < nnz; i++)
         if(isnan(A_sym.val[i]) || isinf(A_sym.val[i]))
@@ -633,7 +638,14 @@ void LUonDevice(Symbolic_Matrix &A_sym, ostream &out, ostream &err, bool PERTURB
 
     if (err_find != 0)
         err << "LU data check: NaN/Inf found." << endl;
-#endif
+    for (unsigned column = 0; column < n; ++column) {
+        if (A_sym.val[A_sym.l_col_ptr[column]] == REAL(0)) {
+            err << "LU data check: zero diagonal at column " << column << endl;
+            ++err_find;
+            break;
+        }
+    }
     cleanup();
+    return err_find == 0;
 #undef CUDA_RETURN_ON_ERR
 }

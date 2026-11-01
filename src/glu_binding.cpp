@@ -114,16 +114,13 @@ GLUFactorization::GLUFactorization(
     std::free(ap_out);
 
     /* GPU factorization — overwrites m_sym->val with LU factors */
-    LUonDevice(*m_sym, out_ss, err_ss, perturb);
-
-    /* Surface CUDA errors: scan for NaN/Inf in the LU factors */
-    std::string err_msg = err_ss.str();
-    if (!err_msg.empty()) {
-        bool bad = false;
-        for (float v : m_sym->val)
-            if (std::isnan(v) || std::isinf(v)) { bad = true; break; }
-        if (bad)
-            throw std::runtime_error("GPU factorization failed: " + err_msg);
+    if (!LUonDevice(*m_sym, out_ss, err_ss, perturb)) {
+        delete m_sym;
+        m_sym = nullptr;
+        NicsLU_Destroy(m_nicslu);
+        std::free(m_nicslu);
+        m_nicslu = nullptr;
+        throw std::runtime_error("GPU factorization failed: " + err_ss.str());
     }
 }
 
@@ -138,14 +135,14 @@ py::array_t<double> GLUFactorization::solve(
 
     auto b_buf = b_arr.unchecked<1>();
 
-    /* double → float (REAL) */
+    /* Convert the Python input to the selected solver precision. */
     std::vector<REAL> rhs(m_n);
     for (unsigned i = 0; i < m_n; ++i)
         rhs[i] = static_cast<REAL>(b_buf(i));
 
     std::vector<REAL> x_f = m_sym->solve(m_nicslu, rhs);
 
-    /* float (REAL) → double */
+    /* Return a double-precision Python array. */
     py::array_t<double> x_out(static_cast<py::ssize_t>(m_n));
     auto x_buf = x_out.mutable_unchecked<1>();
     for (unsigned i = 0; i < m_n; ++i)
