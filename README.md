@@ -2,6 +2,13 @@
 
 Last update: March 19, 2026
 
+## CUDA / HIP build
+
+This branch provides native CUDA and HIP builds of the command-line solver,
+using FP64 by default. See [BUILDING.md](BUILDING.md) for build and test commands
+and the optional FP32 configuration. The Python extension remains CUDA-only
+and has not been validated with this branch's FP64 default.
+
 ## Authors:
 Shaoyi Peng (speng004@ucr.edu)\
 Kai He (khe004@ucr.edu)\
@@ -60,7 +67,7 @@ x = pyglu.spsolve(A, b)
 x = pyglu.spsolve(A, b, perturb=True)
 ```
 
-`splu` accepts any scipy sparse matrix (any format) or a raw `(data, indices, indptr, shape)` tuple in CSC format. The solver uses single-precision (float32) arithmetic on the GPU; inputs and outputs are float64 with conversion at the boundary.
+`splu` accepts any scipy sparse matrix (any format) or a raw `(data, indices, indptr, shape)` tuple in CSC format. GPU arithmetic follows the selected `REAL` precision (FP64 by default). Python inputs and outputs are float64, with conversion at the boundary when built for FP32.
 
 ## Publications: 
 J1.  K. He, S. X.-D. Tan, H. Wang and G. Shi, “GPU-Accelerated Parallel Sparse LU Factorization Method for Fast Circuit Analysis”, IEEE Transactions on Very Large Scale Integrated Systems  (TVLSI), vol. 24, no.3, pp.1140-1150, March 2016.
