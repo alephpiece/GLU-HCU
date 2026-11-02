@@ -23,10 +23,13 @@ public:
     std::vector<int> level_ptr;
 
     void predictLU(unsigned*, unsigned*, double*);
+    // Complete preprocessed-matrix ||B-LU||inf / ||B||inf (long double accumulation).
+    double factor_residual(const REAL* factors) const;
     void csr();
     void leveling();
     void fill_in(unsigned*, unsigned*);
     std::vector<REAL> solve(SNicsLU*, const std::vector<REAL> &);
+    std::vector<REAL> solve(SNicsLU*, const std::vector<REAL> &, const REAL* factors) const;
 
 #if GLU_DEBUG
     void PrintLevel();

@@ -4,6 +4,10 @@
 #include "symbolic.h"
 #include <cmath>
 #include <algorithm>
+#include <chrono>
+#include <limits>
+#include <stdexcept>
+#include <utility>
 
 using namespace std;
 
@@ -341,311 +345,228 @@ __global__ void RL_onecol_cleartmpMem(
     }
 }
 
-bool LUonDevice(Symbolic_Matrix &A_sym, ostream &out, ostream &err, bool PERTURB)
+
+namespace {
+void gpu_check(cudaError_t status, const char* operation)
 {
-    if (A_sym.n == 0 || A_sym.nnz == 0) {
-        err << "Matrix is empty; skipping GPU factorization." << endl;
-        return false;
+    if (status != cudaSuccess)
+        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+}
+
+template<class T, bool Pinned = false> struct Buffer {
+    T* ptr = nullptr;
+    Buffer() = default;
+    Buffer(const Buffer&) = delete;
+    Buffer& operator=(const Buffer&) = delete;
+    ~Buffer() { if (ptr) { if (Pinned) cudaFreeHost(ptr); else cudaFree(ptr); } }
+    void allocate(size_t count) {
+        if (count > std::numeric_limits<size_t>::max() / sizeof(T))
+            throw std::overflow_error("GPU allocation size overflow");
+        if (Pinned) gpu_check(cudaMallocHost(reinterpret_cast<void**>(&ptr), count*sizeof(T)), "allocate pinned buffer");
+        else gpu_check(cudaMalloc(reinterpret_cast<void**>(&ptr), count*sizeof(T)), "allocate device buffer");
     }
-
-    auto cudaCheck = [&](cudaError_t status, const char *op) -> bool {
-        if (status != cudaSuccess) {
-            err << op << " failed: " << cudaGetErrorString(status) << endl;
-            return false;
-        }
-        return true;
-    };
-
-    unsigned n = A_sym.n;
-    unsigned nnz = A_sym.nnz;
-    unsigned num_lev = A_sym.num_lev;
-
-    int deviceCount = 0;
-    if (!cudaCheck(cudaGetDeviceCount(&deviceCount), "cudaGetDeviceCount"))
-        return false;
-    if (deviceCount <= 0) {
-        err << "No GPU detected." << endl;
-        return false;
+    void upload(const std::vector<T>& input) {
+        allocate(input.size());
+        gpu_check(cudaMemcpy(ptr, input.data(), input.size()*sizeof(T), cudaMemcpyHostToDevice), "upload structure");
     }
+};
+}
 
-    int dev = 0;
-    cudaDeviceProp deviceProp;
-    if (!cudaCheck(cudaGetDeviceProperties(&deviceProp, dev), "cudaGetDeviceProperties"))
-        return false;
-    if (deviceProp.warpSize != 32 && deviceProp.warpSize != 64) {
-        err << "Unsupported hardware warp size: " << deviceProp.warpSize << endl;
-        return false;
-    }
-    if (deviceProp.maxThreadsPerBlock < 1024) {
-        err << "This implementation requires 1024 threads per block." << endl;
-        return false;
-    }
-    if (!cudaCheck(cudaSetDevice(dev), "cudaSetDevice"))
-        return false;
-    out << "Device " << dev << ": " << deviceProp.name << " has been selected." << endl;
+struct GpuMatrix::Impl {
+    unsigned n, nnz, slots;
+    bool perturb;
+    REAL threshold = 0;
+    std::string device;
+    std::vector<int> levels, columns;
+    std::vector<unsigned> csr_rows, csr_diags, diagonals;
+    Buffer<unsigned> col, row, diag, csr_row, csr_col, csr_diag;
+    Buffer<int> level_idx;
+    Buffer<REAL, true> input;
 
-    cudaEvent_t start = nullptr, stop = nullptr;
-    unsigned *sym_c_ptr_dev = nullptr, *sym_r_idx_dev = nullptr, *l_col_ptr_dev = nullptr;
-    REAL *val_dev = nullptr;
-    unsigned *csr_r_ptr_dev = nullptr, *csr_c_idx_dev = nullptr, *csr_diag_ptr_dev = nullptr;
-    int *level_idx_dev = nullptr;
-    REAL *tmpMem = nullptr;
-    float time = 0.0f;
-
-    constexpr int Nstreams = 16;
-    cudaStream_t streams[Nstreams];
-    bool stream_created[Nstreams] = {false};
-
-    auto cleanup = [&]() {
-        for (int j = 0; j < Nstreams; ++j) {
-            if (stream_created[j])
-                cudaStreamDestroy(streams[j]);
-        }
-        if (tmpMem != nullptr)
-            cudaFree(tmpMem);
-        if (sym_c_ptr_dev != nullptr)
-            cudaFree(sym_c_ptr_dev);
-        if (sym_r_idx_dev != nullptr)
-            cudaFree(sym_r_idx_dev);
-        if (val_dev != nullptr)
-            cudaFree(val_dev);
-        if (l_col_ptr_dev != nullptr)
-            cudaFree(l_col_ptr_dev);
-        if (csr_c_idx_dev != nullptr)
-            cudaFree(csr_c_idx_dev);
-        if (csr_r_ptr_dev != nullptr)
-            cudaFree(csr_r_ptr_dev);
-        if (csr_diag_ptr_dev != nullptr)
-            cudaFree(csr_diag_ptr_dev);
-        if (level_idx_dev != nullptr)
-            cudaFree(level_idx_dev);
-        if (start != nullptr)
-            cudaEventDestroy(start);
-        if (stop != nullptr)
-            cudaEventDestroy(stop);
-    };
-
-#define CUDA_RETURN_ON_ERR(call, op_name) \
-    do { \
-        if (!cudaCheck((call), (op_name))) { \
-            cleanup(); \
-            return false; \
-        } \
-    } while (0)
-
-    CUDA_RETURN_ON_ERR(cudaEventCreate(&start), "cudaEventCreate(start)");
-    CUDA_RETURN_ON_ERR(cudaEventCreate(&stop), "cudaEventCreate(stop)");
-    CUDA_RETURN_ON_ERR(cudaEventRecord(start, 0), "cudaEventRecord(start)");
-
-    CUDA_RETURN_ON_ERR(cudaMalloc((void**)&sym_c_ptr_dev, (n + 1) * sizeof(unsigned)), "cudaMalloc(sym_c_ptr_dev)");
-    CUDA_RETURN_ON_ERR(cudaMalloc((void**)&sym_r_idx_dev, nnz * sizeof(unsigned)), "cudaMalloc(sym_r_idx_dev)");
-    CUDA_RETURN_ON_ERR(cudaMalloc((void**)&val_dev, nnz * sizeof(REAL)), "cudaMalloc(val_dev)");
-    CUDA_RETURN_ON_ERR(cudaMalloc((void**)&l_col_ptr_dev, n * sizeof(unsigned)), "cudaMalloc(l_col_ptr_dev)");
-    CUDA_RETURN_ON_ERR(cudaMalloc((void**)&csr_r_ptr_dev, (n + 1) * sizeof(unsigned)), "cudaMalloc(csr_r_ptr_dev)");
-    CUDA_RETURN_ON_ERR(cudaMalloc((void**)&csr_c_idx_dev, nnz * sizeof(unsigned)), "cudaMalloc(csr_c_idx_dev)");
-    CUDA_RETURN_ON_ERR(cudaMalloc((void**)&csr_diag_ptr_dev, n * sizeof(unsigned)), "cudaMalloc(csr_diag_ptr_dev)");
-    CUDA_RETURN_ON_ERR(cudaMalloc((void**)&level_idx_dev, n * sizeof(int)), "cudaMalloc(level_idx_dev)");
-
-    CUDA_RETURN_ON_ERR(cudaMemcpy(sym_c_ptr_dev, &(A_sym.sym_c_ptr[0]), (n + 1) * sizeof(unsigned), cudaMemcpyHostToDevice),
-        "cudaMemcpy(sym_c_ptr_dev)");
-    CUDA_RETURN_ON_ERR(cudaMemcpy(sym_r_idx_dev, &(A_sym.sym_r_idx[0]), nnz * sizeof(unsigned), cudaMemcpyHostToDevice),
-        "cudaMemcpy(sym_r_idx_dev)");
-    CUDA_RETURN_ON_ERR(cudaMemcpy(val_dev, &(A_sym.val[0]), nnz * sizeof(REAL), cudaMemcpyHostToDevice), "cudaMemcpy(val_dev)");
-    CUDA_RETURN_ON_ERR(cudaMemcpy(l_col_ptr_dev, &(A_sym.l_col_ptr[0]), n * sizeof(unsigned), cudaMemcpyHostToDevice),
-        "cudaMemcpy(l_col_ptr_dev)");
-    CUDA_RETURN_ON_ERR(cudaMemcpy(csr_r_ptr_dev, &(A_sym.csr_r_ptr[0]), (n + 1) * sizeof(unsigned), cudaMemcpyHostToDevice),
-        "cudaMemcpy(csr_r_ptr_dev)");
-    CUDA_RETURN_ON_ERR(cudaMemcpy(csr_c_idx_dev, &(A_sym.csr_c_idx[0]), nnz * sizeof(unsigned), cudaMemcpyHostToDevice),
-        "cudaMemcpy(csr_c_idx_dev)");
-    CUDA_RETURN_ON_ERR(cudaMemcpy(csr_diag_ptr_dev, &(A_sym.csr_diag_ptr[0]), n * sizeof(unsigned), cudaMemcpyHostToDevice),
-        "cudaMemcpy(csr_diag_ptr_dev)");
-    CUDA_RETURN_ON_ERR(cudaMemcpy(level_idx_dev, &(A_sym.level_idx[0]), n * sizeof(int), cudaMemcpyHostToDevice),
-        "cudaMemcpy(level_idx_dev)");
-
-    for (int j = 0; j < Nstreams; ++j) {
-        CUDA_RETURN_ON_ERR(cudaStreamCreate(&streams[j]), "cudaStreamCreate");
-        stream_created[j] = true;
-    }
-
-    size_t free_bytes = 0, total_bytes = 0;
-    CUDA_RETURN_ON_ERR(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
-    (void)total_bytes;
-
-    const size_t reserve_bytes = 4ull * 1024ull * 1024ull * 1024ull;
-    size_t max_tmp_mem_size = (free_bytes > reserve_bytes) ? (free_bytes - reserve_bytes) : (free_bytes / 2);
-    const unsigned first_level_cols = (A_sym.level_ptr.size() > 1) ?
-        static_cast<unsigned>(A_sym.level_ptr[1] - A_sym.level_ptr[0]) : 1u;
-    const size_t good_tmp_mem_choice = sizeof(REAL) * size_t(n) * size_t(first_level_cols);
-    const size_t bytes_per_column = sizeof(REAL) * size_t(n);
-    if (max_tmp_mem_size < bytes_per_column)
-        max_tmp_mem_size = bytes_per_column;
-
-    unsigned TMPMEMNUM = 0;
-    if (good_tmp_mem_choice <= max_tmp_mem_size)
-        TMPMEMNUM = first_level_cols;
-    else
-        TMPMEMNUM = static_cast<unsigned>(max_tmp_mem_size / bytes_per_column);
-    if (TMPMEMNUM == 0)
-        TMPMEMNUM = 1;
-
-    const int active_streams = std::min<unsigned>(Nstreams, TMPMEMNUM);
-
-    const size_t tmp_bytes = size_t(TMPMEMNUM) * size_t(n) * sizeof(REAL);
-    CUDA_RETURN_ON_ERR(cudaMalloc((void**)&tmpMem, tmp_bytes), "cudaMalloc(tmpMem)");
-    CUDA_RETURN_ON_ERR(cudaMemset(tmpMem, 0, tmp_bytes), "cudaMemset(tmpMem)");
-
-    // calculate 1-norm of A and perturbation value for perturbation
-    REAL pert = 0;
-    if (PERTURB)
+    Impl(const Symbolic_Matrix& a, unsigned requested_slots, bool use_perturb)
+        : n(a.n), nnz(a.nnz), slots(0), perturb(use_perturb),
+          levels(a.level_ptr), columns(a.level_idx), csr_rows(a.csr_r_ptr),
+          csr_diags(a.csr_diag_ptr), diagonals(a.l_col_ptr)
     {
-        REAL norm_A = 0;
-        for (unsigned i = 0; i < n; ++i)
-        {
-            REAL tmp = 0;
-            for (unsigned j = A_sym.sym_c_ptr[i]; j < A_sym.sym_c_ptr[i+1]; ++j)
-                tmp += fabs(A_sym.val[j]);
-            if (norm_A < tmp)
-                norm_A = tmp;
+        if (!n || !nnz || !requested_slots || levels.size() < 2)
+            throw std::invalid_argument("empty matrix or zero scratch slots");
+        int count = 0;
+        gpu_check(cudaGetDeviceCount(&count), "get device count");
+        if (!count) throw std::runtime_error("No GPU detected");
+        gpu_check(cudaSetDevice(0), "select device");
+        cudaDeviceProp prop;
+        gpu_check(cudaGetDeviceProperties(&prop, 0), "get device properties");
+        if ((prop.warpSize != 32 && prop.warpSize != 64) || prop.maxThreadsPerBlock < 1024)
+            throw std::runtime_error("requires warp32/wave64 and 1024-thread blocks");
+        device = prop.name;
+        unsigned needed = 1;
+        for (size_t i=1; i<levels.size(); ++i) {
+            const unsigned width = unsigned(levels[i]-levels[i-1]);
+            // Small levels execute serially in slot zero.
+            if (width > 16) needed = std::max(needed, width);
         }
-        pert = 3.45e-4f * norm_A;
-        out << "Gaussian elimination with static pivoting (GESP)..." << endl;
-        out << "1-Norm of A matrix is " << norm_A << ", Perturbation value is " << pert << endl;
+        slots = std::min(requested_slots, needed);
+        col.upload(a.sym_c_ptr); row.upload(a.sym_r_idx); diag.upload(a.l_col_ptr);
+        csr_row.upload(a.csr_r_ptr); csr_col.upload(a.csr_c_idx); csr_diag.upload(a.csr_diag_ptr);
+        level_idx.upload(a.level_idx);
+        input.allocate(nnz);
+        std::copy(a.val.begin(), a.val.end(), input.ptr);
+        if (perturb) {
+            for (unsigned j=0; j<n; ++j) {
+                REAL sum = 0;
+                for (unsigned p=a.sym_c_ptr[j]; p<a.sym_c_ptr[j+1]; ++p) sum += std::abs(a.val[p]);
+                threshold = std::max(threshold, sum);
+            }
+            threshold *= REAL(3.45e-4f);
+        }
     }
+};
 
-    auto launch_batched_level = [&](unsigned level_head, int level_size, unsigned warps_per_block) {
-        dim3 dimBlock(warps_per_block * GLU_GROUP_SIZE, 1);
-
-        int remaining = level_size;
-        unsigned chunk_idx = 0;
-        while (remaining > 0) {
-            unsigned rest_col = static_cast<unsigned>(remaining) > TMPMEMNUM ?
-                TMPMEMNUM : static_cast<unsigned>(remaining);
-            dim3 dimGrid(rest_col, 1);
-            int in_level_pos = static_cast<int>(chunk_idx * TMPMEMNUM);
-            if (!PERTURB)
-                RL<<<dimGrid, dimBlock>>>(sym_c_ptr_dev,
-                                                    sym_r_idx_dev,
-                                                    val_dev,
-                                                    l_col_ptr_dev,
-                                                    csr_r_ptr_dev,
-                                                    csr_c_idx_dev,
-                                                    csr_diag_ptr_dev,
-                                                    level_idx_dev,
-                                                    tmpMem,
-                                                    n,
-                                                    level_head,
-                                                    in_level_pos);
-            else
-                RL_perturb<<<dimGrid, dimBlock>>>(sym_c_ptr_dev,
-                                                            sym_r_idx_dev,
-                                                            val_dev,
-                                                            l_col_ptr_dev,
-                                                            csr_r_ptr_dev,
-                                                            csr_c_idx_dev,
-                                                            csr_diag_ptr_dev,
-                                                            level_idx_dev,
-                                                            tmpMem,
-                                                            n,
-                                                            level_head,
-                                                            in_level_pos,
-                                                            pert);
-            remaining -= static_cast<int>(rest_col);
-            ++chunk_idx;
+struct GpuTask::Impl {
+    std::shared_ptr<const GpuMatrix::Impl> matrix;
+    Buffer<REAL> values, scratch;
+    Buffer<REAL, true> output;
+    cudaStream_t stream = nullptr;
+    bool pending = false, ready = false, failed = false;
+    explicit Impl(std::shared_ptr<const GpuMatrix::Impl> m) : matrix(std::move(m)) {
+        values.allocate(matrix->nnz);
+        scratch.allocate(size_t(matrix->n)*matrix->slots);
+        output.allocate(matrix->nnz);
+        gpu_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create task stream");
+        try {
+            gpu_check(cudaMemsetAsync(scratch.ptr, 0, size_t(matrix->n)*matrix->slots*sizeof(REAL), stream),
+                "initialize scratch");
+            gpu_check(cudaStreamSynchronize(stream), "finish task preparation");
+        } catch (...) {
+            cudaStreamSynchronize(stream);
+            cudaStreamDestroy(stream);
+            throw;
         }
-    };
+    }
+    ~Impl() {
+        // Also drain partially submitted work after an exception, before any
+        // buffers (including the retained template) can be released.
+        if (stream) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); }
+    }
+};
 
-    for (unsigned i = 0; i < num_lev; ++i)
-    {
-        int lev_size = A_sym.level_ptr[i + 1] - A_sym.level_ptr[i];
-        if (lev_size <= 0)
-            continue;
+GpuMatrix::GpuMatrix(const Symbolic_Matrix& a, unsigned slots, bool perturb)
+    : impl_(std::make_shared<Impl>(a, slots, perturb)) {}
+GpuMatrix::~GpuMatrix() = default;
+unsigned GpuMatrix::tmp_slots() const { return impl_->slots; }
+size_t GpuMatrix::task_device_bytes() const {
+    const size_t scratch = size_t(impl_->n)*impl_->slots;
+    if (scratch > std::numeric_limits<size_t>::max()/sizeof(REAL)-impl_->nnz)
+        throw std::overflow_error("task memory size overflow");
+    return (size_t(impl_->nnz) + scratch)*sizeof(REAL);
+}
+size_t GpuMatrix::task_host_bytes() const { return size_t(impl_->nnz)*sizeof(REAL); }
+std::string GpuMatrix::device_name() const { return impl_->device; }
+size_t GpuMatrix::free_device_bytes() {
+    size_t free=0, total=0;
+    gpu_check(cudaMemGetInfo(&free, &total), "query device memory");
+    return free;
+}
+GpuTask::GpuTask(const GpuMatrix& matrix) : impl_(new Impl(matrix.impl_)) {}
+GpuTask::~GpuTask() = default;
 
-        if (lev_size > 896) {
-            launch_batched_level(A_sym.level_ptr[i], lev_size, 2);
-        }
-        else if (lev_size > 448) {
-            launch_batched_level(A_sym.level_ptr[i], lev_size, 4);
-        }
-        else if (lev_size > Nstreams) {
-            launch_batched_level(A_sym.level_ptr[i], lev_size, 32);
-        }
-        else {
-            // Small levels are mapped to one stream per column to reduce launch overhead.
-            for (int offset = 0; offset < lev_size; offset += active_streams) {
-                for (int j = 0; j < active_streams; j++) {
-                    if (j + offset < lev_size) {
-                        const unsigned currentCol = A_sym.level_idx[A_sym.level_ptr[i] + j + offset];
-                        const unsigned subMatSize = A_sym.csr_r_ptr[currentCol + 1]
-                            - A_sym.csr_diag_ptr[currentCol] - 1;
-
-                        if (!PERTURB)
-                            RL_onecol_factorizeCurrentCol<<<1, 1024, 0, streams[j]>>>(sym_c_ptr_dev,
-                                                                                        sym_r_idx_dev,
-                                                                                        val_dev,
-                                                                                        l_col_ptr_dev,
-                                                                                        currentCol,
-                                                                                        tmpMem,
-                                                                                        j,
-                                                                                        n);
-                        else
-                            RL_onecol_factorizeCurrentCol_perturb<<<1, 1024, 0, streams[j]>>>(sym_c_ptr_dev,
-                                                                                                sym_r_idx_dev,
-                                                                                                val_dev,
-                                                                                                l_col_ptr_dev,
-                                                                                                currentCol,
-                                                                                                tmpMem,
-                                                                                                j,
-                                                                                                n,
-                                                                                                pert);
-                        if (subMatSize > 0)
-                            RL_onecol_updateSubmat<<<subMatSize, 1024, 0, streams[j]>>>(sym_c_ptr_dev,
-                                                                                          sym_r_idx_dev,
-                                                                                          val_dev,
-                                                                                          csr_c_idx_dev,
-                                                                                          csr_diag_ptr_dev,
-                                                                                          currentCol,
-                                                                                          tmpMem,
-                                                                                          j,
-                                                                                          n);
-                        RL_onecol_cleartmpMem<<<1, 1024, 0, streams[j]>>>(sym_c_ptr_dev,
-                                                                           sym_r_idx_dev,
-                                                                           l_col_ptr_dev,
-                                                                           currentCol,
-                                                                           tmpMem,
-                                                                           j,
-                                                                           n);
+void GpuTask::enqueue()
+{
+    auto& t = *impl_;
+    const auto& a = *t.matrix;
+    if (t.failed) throw std::logic_error("failed task must be rebuilt");
+    if (t.pending) throw std::logic_error("wait for the task before reusing it");
+    t.pending = true;
+    t.ready = false;
+    try {
+        gpu_check(cudaMemcpyAsync(t.values.ptr, a.input.ptr, size_t(a.nnz)*sizeof(REAL),
+            cudaMemcpyHostToDevice, t.stream), "restore matrix values");
+        for (size_t lev=0; lev+1<a.levels.size(); ++lev) {
+            const int width = a.levels[lev+1]-a.levels[lev];
+            if (width > 16) {
+                const unsigned threads = width > 896 ? 64 : width > 448 ? 128 : 1024;
+                for (int offset=0; offset<width;) {
+                    const unsigned blocks = std::min(unsigned(width-offset), a.slots);
+                    if (!a.perturb)
+                        RL<<<blocks,threads,0,t.stream>>>(a.col.ptr,a.row.ptr,t.values.ptr,a.diag.ptr,
+                            a.csr_row.ptr,a.csr_col.ptr,a.csr_diag.ptr,a.level_idx.ptr,t.scratch.ptr,
+                            a.n,a.levels[lev],offset);
+                    else
+                        RL_perturb<<<blocks,threads,0,t.stream>>>(a.col.ptr,a.row.ptr,t.values.ptr,a.diag.ptr,
+                            a.csr_row.ptr,a.csr_col.ptr,a.csr_diag.ptr,a.level_idx.ptr,t.scratch.ptr,
+                            a.n,a.levels[lev],offset,a.threshold);
+                    gpu_check(cudaGetLastError(), "launch batched level");
+                    offset += int(blocks);
+                }
+            } else {
+                for (int p=a.levels[lev]; p<a.levels[lev+1]; ++p) {
+                    const unsigned column = a.columns[p];
+                    const unsigned targets = a.csr_rows[column+1]-a.csr_diags[column]-1;
+                    if (!a.perturb)
+                        RL_onecol_factorizeCurrentCol<<<1,1024,0,t.stream>>>(a.col.ptr,a.row.ptr,
+                            t.values.ptr,a.diag.ptr,column,t.scratch.ptr,0,a.n);
+                    else
+                        RL_onecol_factorizeCurrentCol_perturb<<<1,1024,0,t.stream>>>(a.col.ptr,a.row.ptr,
+                            t.values.ptr,a.diag.ptr,column,t.scratch.ptr,0,a.n,a.threshold);
+                    gpu_check(cudaGetLastError(), "launch column factorization");
+                    if (targets) {
+                        RL_onecol_updateSubmat<<<targets,1024,0,t.stream>>>(a.col.ptr,a.row.ptr,t.values.ptr,
+                            a.csr_col.ptr,a.csr_diag.ptr,column,t.scratch.ptr,0,a.n);
+                        gpu_check(cudaGetLastError(), "launch column update");
                     }
+                    RL_onecol_cleartmpMem<<<1,1024,0,t.stream>>>(a.col.ptr,a.row.ptr,a.diag.ptr,
+                        column,t.scratch.ptr,0,a.n);
+                    gpu_check(cudaGetLastError(), "launch scratch clear");
                 }
             }
         }
-        CUDA_RETURN_ON_ERR(cudaGetLastError(), "kernel launch");
-        CUDA_RETURN_ON_ERR(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+        gpu_check(cudaMemcpyAsync(t.output.ptr,t.values.ptr,size_t(a.nnz)*sizeof(REAL),
+            cudaMemcpyDeviceToHost,t.stream), "download factors");
+    } catch (...) {
+        t.failed = true;
+        throw;
     }
+}
 
-    CUDA_RETURN_ON_ERR(cudaMemcpy(&(A_sym.val[0]), val_dev, nnz * sizeof(REAL), cudaMemcpyDeviceToHost),
-        "cudaMemcpy(A_sym.val)");
-    CUDA_RETURN_ON_ERR(cudaEventRecord(stop, 0), "cudaEventRecord(stop)");
-    CUDA_RETURN_ON_ERR(cudaEventSynchronize(stop), "cudaEventSynchronize(stop)");
-    CUDA_RETURN_ON_ERR(cudaEventElapsedTime(&time, start, stop), "cudaEventElapsedTime");
-
-    out << "Total GPU time: " << time << " ms" << endl;
-
-    // Reject unusable factors even in release builds.
-    unsigned err_find = 0;
-    for(unsigned i = 0; i < nnz; i++)
-        if(isnan(A_sym.val[i]) || isinf(A_sym.val[i]))
-            err_find++;
-
-    if (err_find != 0)
-        err << "LU data check: NaN/Inf found." << endl;
-    for (unsigned column = 0; column < n; ++column) {
-        if (A_sym.val[A_sym.l_col_ptr[column]] == REAL(0)) {
-            err << "LU data check: zero diagonal at column " << column << endl;
-            ++err_find;
-            break;
+void GpuTask::wait() {
+    auto& t = *impl_;
+    if (t.pending) {
+        const auto status = cudaStreamSynchronize(t.stream);
+        t.pending = false;
+        if (status != cudaSuccess) {
+            t.failed = true;
+            gpu_check(status, "wait for task");
         }
+        if (!t.failed) t.ready = true;
     }
-    cleanup();
-    return err_find == 0;
-#undef CUDA_RETURN_ON_ERR
+    if (t.failed) throw std::runtime_error("task submission failed; rebuild task before reuse");
+}
+const REAL* GpuTask::factors() const {
+    if (impl_->failed || !impl_->ready) throw std::logic_error("task results are not ready");
+    return impl_->output.ptr;
+}
+void GpuTask::check() const {
+    const REAL* values = factors();
+    const auto& a = *impl_->matrix;
+    for (unsigned p=0; p<a.nnz; ++p)
+        if (!std::isfinite(values[p])) throw std::runtime_error("LU data check: NaN/Inf found");
+    for (unsigned j=0; j<a.n; ++j)
+        if (values[a.diagonals[j]] == REAL(0)) throw std::runtime_error("LU data check: zero diagonal");
+}
+
+bool LUonDevice(Symbolic_Matrix& a, ostream& out, ostream& err, bool perturb)
+{
+    try {
+        const auto start = std::chrono::steady_clock::now();
+        GpuMatrix matrix(a, 32, perturb);
+        GpuTask task(matrix);
+        task.enqueue(); task.wait(); task.check();
+        std::copy(task.factors(), task.factors()+a.nnz, a.val.begin());
+        const double ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        out << "Device 0: " << matrix.device_name() << "\nPrepare and factor: " << ms << " ms\n";
+        return true;
+    } catch (const std::exception& error) {
+        err << error.what() << '\n';
+        return false;
+    }
 }

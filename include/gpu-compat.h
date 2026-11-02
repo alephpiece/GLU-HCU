@@ -14,6 +14,8 @@ using cudaDeviceProp = hipDeviceProp_t;
 #define cudaEventRecord hipEventRecord
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaFree hipFree
+#define cudaFreeHost hipHostFree
+#define cudaMallocHost hipHostMalloc
 #define cudaGetDeviceCount hipGetDeviceCount
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaGetErrorString hipGetErrorString
@@ -21,11 +23,16 @@ using cudaDeviceProp = hipDeviceProp_t;
 #define cudaMalloc hipMalloc
 #define cudaMemGetInfo hipMemGetInfo
 #define cudaMemcpy hipMemcpy
+#define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemset hipMemset
+#define cudaMemsetAsync hipMemsetAsync
 #define cudaSetDevice hipSetDevice
 #define cudaStreamCreate hipStreamCreate
+#define cudaStreamCreateWithFlags hipStreamCreateWithFlags
+#define cudaStreamNonBlocking hipStreamNonBlocking
+#define cudaStreamSynchronize hipStreamSynchronize
 #define cudaStreamDestroy hipStreamDestroy
 #else
 #include <cuda_runtime.h>

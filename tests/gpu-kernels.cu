@@ -267,7 +267,7 @@ void test_one_column(const Matrix& matrix, bool perturb, const std::string& name
 
 void test_limited_slots()
 {
-    // The first level has one column, so LUonDevice allocates one scratch slot.
+    // Small levels use one scratch slot, even when a later level is wider.
     // The next level has three columns with nonempty L parts, all updating the
     // final diagonal. Reusing slot zero must serialize factor/update/clear.
     std::vector<unsigned> column{0, 5, 7, 9, 11, 15};
@@ -286,6 +286,61 @@ void test_limited_slots()
         throw std::runtime_error("limited-slot factorization failed: " + err.str());
     compare(matrix.val, expected, "limited-slot LU");
     std::cout << "PASS host/one-slot-three-columns\n";
+}
+
+
+void test_repeated_tasks()
+{
+    std::ostringstream out, err;
+    std::vector<std::unique_ptr<GpuTask>> tasks;
+    std::vector<std::vector<REAL>> expected;
+    for (unsigned variant=0; variant<2; ++variant) {
+        // 34 independent columns, then one dependent column. Exercises batched
+        // chunking with fewer slots than the level width, then the small path.
+        const unsigned n=35;
+        const double diagonal=4+variant;
+        std::vector<unsigned> col{0}, row;
+        std::vector<double> val;
+        std::vector<REAL> factors;
+        for (unsigned j=0; j<n-1; ++j) {
+            row.push_back(j); val.push_back(diagonal); factors.push_back(REAL(diagonal));
+            row.push_back(n-1); val.push_back(1); factors.push_back(REAL(1/diagonal));
+            col.push_back(unsigned(row.size()));
+        }
+        for (unsigned i=0; i<n; ++i) {
+            row.push_back(i); val.push_back(i==n-1 ? 50 : 1);
+            factors.push_back(i==n-1 ? REAL(50-(n-1)/diagonal) : REAL(1));
+        }
+        col.push_back(unsigned(row.size()));
+        Symbolic_Matrix a(n,out,err);
+        a.fill_in(row.data(),col.data()); a.csr();
+        a.predictLU(row.data(),col.data(),val.data()); a.leveling();
+        GpuMatrix matrix(a, variant ? 3 : 1);
+        if (matrix.tmp_slots() != (variant ? 3u : 1u)) throw std::runtime_error("wrong scratch cap");
+        for (unsigned copy=0; copy<2; ++copy) {
+            tasks.emplace_back(new GpuTask(matrix));
+            expected.push_back(factors);
+        }
+        // Both the host matrix and GpuMatrix wrapper die here. Tasks must retain
+        // all input, structure and launch metadata required by later enqueues.
+    }
+    for (unsigned loop=0; loop<4; ++loop) {
+        for (auto& task : tasks) task->enqueue();
+        if (loop == 0) {
+            bool rejected_read=false, rejected_reuse=false;
+            try { tasks[0]->factors(); } catch (const std::logic_error&) { rejected_read=true; }
+            try { tasks[0]->enqueue(); } catch (const std::logic_error&) { rejected_reuse=true; }
+            if (!rejected_read || !rejected_reuse)
+                throw std::runtime_error("pending task allowed read or reuse");
+        }
+        for (auto& task : tasks) task->wait();
+        for (size_t i=0; i<tasks.size(); ++i) {
+            tasks[i]->check();
+            compare(std::vector<REAL>(tasks[i]->factors(),tasks[i]->factors()+expected[i].size()),
+                expected[i], "repeated independent tasks");
+        }
+    }
+    std::cout << "PASS host/repeated-mixed-tasks-and-template-lifetime\n";
 }
 
 void test_invalid_factor(REAL value, const char* diagnostic)
@@ -324,9 +379,10 @@ int main()
         test_batched(empty_lower, 64, true, "RL_perturb/empty-lower");
         test_one_column(empty_lower, true, "one-column/empty-lower");
         test_limited_slots();
+        test_repeated_tasks();
         test_invalid_factor(REAL(0), "zero diagonal");
         test_invalid_factor(std::numeric_limits<REAL>::quiet_NaN(), "NaN/Inf");
-        std::cout << "All 13 GPU numeric cases passed.\n";
+        std::cout << "All 14 GPU numeric cases passed.\n";
         return 0;
     }
     catch (const std::exception& error) {

@@ -38,13 +38,18 @@ function(glu_configure_target target)
 endfunction()
 
 set_source_files_properties(src/numeric.cu PROPERTIES LANGUAGE ${GLU_BACKEND})
-add_executable(lu_cmd src/lu_cmd.cpp src/numeric.cu src/symbolic.cc
-    src/Timer.cpp src/preprocess/preprocess.c)
+set(GLU_COMMON_SOURCES src/numeric.cu src/symbolic.cc src/Timer.cpp src/preprocess/preprocess.c)
+add_executable(lu_cmd src/lu_cmd.cpp ${GLU_COMMON_SOURCES})
 glu_configure_target(lu_cmd)
+add_executable(glu_bench src/lu_bench.cpp ${GLU_COMMON_SOURCES})
+glu_configure_target(glu_bench)
 
 option(GLU_BUILD_TESTS "Build GPU numeric regression tests" OFF)
 if(GLU_BUILD_TESTS)
     enable_testing()
+    add_executable(factor-check-tests tests/factor-check.cpp src/symbolic.cc)
+    glu_configure_target(factor-check-tests)
+    add_test(NAME factor-check COMMAND factor-check-tests)
     set_source_files_properties(tests/gpu-kernels.cu PROPERTIES LANGUAGE ${GLU_BACKEND})
     add_executable(gpu-kernel-tests tests/gpu-kernels.cu src/symbolic.cc)
     glu_configure_target(gpu-kernel-tests)
@@ -55,5 +60,10 @@ if(GLU_BUILD_TESTS)
         -DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/cli-output-test
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli-output.cmake)
     set_tests_properties(cli-output PROPERTIES TIMEOUT 120)
+    add_test(NAME benchmark COMMAND ${CMAKE_COMMAND}
+        -DGLU_BENCH=$<TARGET_FILE:glu_bench>
+        -DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/benchmark-test
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark.cmake)
+    set_tests_properties(benchmark PROPERTIES TIMEOUT 120)
 endif()
 message(STATUS "GLU backend: ${GLU_BACKEND}; FP32: ${GLU_USE_FP32}")

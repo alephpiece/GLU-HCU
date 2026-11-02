@@ -5,7 +5,9 @@ Last update: March 19, 2026
 ## CUDA / HIP build
 
 This branch provides native CUDA and HIP builds of the command-line solver,
-using FP64 by default. See [BUILDING.md](BUILDING.md) for build and test commands
+using FP64 by default. It also provides `glu_bench` for repeatable single- and
+multi-matrix workloads with one stream per task, per-loop completion barriers,
+and full final-loop factor checks. See [BUILDING.md](BUILDING.md) for build and test commands
 and the optional FP32 configuration. The Python extension remains CUDA-only
 and has not been validated with this branch's FP64 default.
 

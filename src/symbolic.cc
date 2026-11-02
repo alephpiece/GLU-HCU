@@ -1,3 +1,4 @@
+#include <stdexcept>
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -199,6 +200,11 @@ void Symbolic_Matrix::ABFTCheckResult()
 
 vector<REAL> Symbolic_Matrix::solve(SNicsLU *nicslu, const vector<REAL> &rhs)
 {
+    return solve(nicslu, rhs, val.data());
+}
+
+vector<REAL> Symbolic_Matrix::solve(SNicsLU *nicslu, const vector<REAL> &rhs, const REAL* factors) const
+{
     vector<REAL> b(n);
     vector<REAL> x(n);
     if (n == 0)
@@ -225,16 +231,16 @@ vector<REAL> Symbolic_Matrix::solve(SNicsLU *nicslu, const vector<REAL> &rhs)
     //left-multiply inv(L)
     for (unsigned j = 0; j < n; ++j) {
         for (unsigned p = l_col_ptr[j] + 1; p < sym_c_ptr[j + 1]; ++p)
-            b[sym_r_idx[p]] -= val[p] * b[j];
+            b[sym_r_idx[p]] -= factors[p] * b[j];
     }
 
     //left-multiply inv(U)
     for (int jj = n - 1; jj >= 0; --jj) {
         unsigned diag = l_col_ptr[jj];
-        b[jj] /= val[diag];
+        b[jj] /= factors[diag];
 
         for (unsigned p = sym_c_ptr[jj]; p < l_col_ptr[jj]; ++p) {
-            b[sym_r_idx[p]] -= val[p] * b[jj];
+            b[sym_r_idx[p]] -= factors[p] * b[jj];
         }
     }
 
@@ -248,4 +254,39 @@ vector<REAL> Symbolic_Matrix::solve(SNicsLU *nicslu, const vector<REAL> &rhs)
 
 
     return x;
+}
+
+// Full ||B-LU||_inf / ||B||_inf, for the preprocessed FP matrix B.
+// Accumulate one sparse product column in long double; include product entries
+// outside B's pattern. No dense n*n matrix, sampling, or checksum substitution.
+double Symbolic_Matrix::factor_residual(const REAL* lu) const {
+    const auto& a = *this;
+    std::vector<long double> column(a.n,0), residual_rows(a.n,0), matrix_rows(a.n,0);
+    std::vector<unsigned> touched;
+    std::vector<int> mark(a.n,-1);
+    auto add = [&](unsigned row, unsigned col, long double value) {
+        if (mark[row] != int(col)) { mark[row]=int(col); touched.push_back(row); }
+        column[row] += value;
+    };
+    for (unsigned j=0; j<a.n; ++j) {
+        touched.clear();
+        for (unsigned p=a.sym_c_ptr[j]; p<=a.l_col_ptr[j]; ++p) {
+            const unsigned k=a.sym_r_idx[p];
+            const long double u=lu[p];
+            add(k,j,u); // implicit unit diagonal in L
+            for (unsigned q=a.l_col_ptr[k]+1; q<a.sym_c_ptr[k+1]; ++q)
+                add(a.sym_r_idx[q],j,static_cast<long double>(lu[q])*u);
+        }
+        for (unsigned p=a.sym_c_ptr[j]; p<a.sym_c_ptr[j+1]; ++p) {
+            add(a.sym_r_idx[p],j,-static_cast<long double>(a.val[p]));
+            matrix_rows[a.sym_r_idx[p]] += std::abs(static_cast<long double>(a.val[p]));
+        }
+        for (unsigned i : touched) {
+            if (!std::isfinite(column[i])) throw std::runtime_error("nonfinite LU product");
+            residual_rows[i] += std::abs(column[i]);
+            column[i]=0;
+        }
+    }
+    const long double denominator=*std::max_element(matrix_rows.begin(),matrix_rows.end());
+    return double(*std::max_element(residual_rows.begin(),residual_rows.end())/denominator);
 }
