@@ -1,3 +1,4 @@
+cmake_minimum_required(VERSION 3.19)
 file(MAKE_DIRECTORY "${TEST_DIRECTORY}")
 file(WRITE "${TEST_DIRECTORY}/a.mtx" "2 2 4\n1 1 3\n2 1 -1\n1 2 -1\n2 2 3\n")
 file(WRITE "${TEST_DIRECTORY}/b.mtx" "3 3 3\n1 1 2\n2 2 3\n3 3 4\n")
@@ -19,6 +20,54 @@ string(JSON first GET "${result}" templates 0 tasks)
 string(JSON second GET "${result}" templates 1 tasks)
 if(NOT count EQUAL 3 OR NOT first EQUAL 4 OR NOT second EQUAL 3)
     message(FATAL_ERROR "incorrect loops or task assignment")
+endif()
+execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" -i "${TEST_DIRECTORY}/b.mtx"
+    --tasks 7 --warmup 1 --loops 2 --check basic --diagnostics --output "${TEST_DIRECTORY}/basic.json"
+    RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 60)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "basic diagnostic run failed: ${output}${error}")
+endif()
+file(READ "${TEST_DIRECTORY}/basic.json" basic)
+string(JSON mode GET "${basic}" check_mode)
+string(JSON residual_type TYPE "${basic}" max_factor_residual)
+string(JSON submit_count LENGTH "${basic}" submit_ms)
+string(JSON drain_count LENGTH "${basic}" drain_ms)
+string(JSON launches GET "${basic}" launches_per_loop)
+string(JSON tolerance_type TYPE "${basic}" factor_residual_tolerance)
+string(JSON checked GET "${basic}" checked_tasks)
+# Dense 2x2: two factor/clear pairs + one update; diagonal 3x3: three pairs.
+if(NOT mode STREQUAL "basic" OR NOT residual_type STREQUAL "NULL" OR
+   NOT tolerance_type STREQUAL "NULL" OR NOT checked EQUAL 7 OR
+   NOT submit_count EQUAL 2 OR NOT drain_count EQUAL 2 OR NOT launches EQUAL 38)
+    message(FATAL_ERROR "incorrect basic validation or launch accounting")
+endif()
+# A wide diagonal level needs five batches at eight slots, with no one-column kernels.
+file(WRITE "${TEST_DIRECTORY}/wide.mtx" "33 33 33\n")
+foreach(i RANGE 1 33)
+    file(APPEND "${TEST_DIRECTORY}/wide.mtx" "${i} ${i} 2\n")
+endforeach()
+execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/wide.mtx"
+    --tmp-slots 8 --warmup 0 --loops 1 --output "${TEST_DIRECTORY}/wide.json" --diagnostics
+    RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 60)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "wide diagnostic run failed: ${output}${error}")
+endif()
+file(READ "${TEST_DIRECTORY}/wide.json" wide)
+string(JSON mode GET "${wide}" check_mode)
+string(JSON residual_type TYPE "${wide}" max_factor_residual)
+string(JSON launches GET "${wide}" launches_per_loop)
+string(JSON bits GET "${wide}" real_bits)
+string(JSON h2d GET "${wide}" h2d_bytes_per_loop)
+string(JSON d2h GET "${wide}" d2h_bytes_per_loop)
+math(EXPR bytes "33 * ${bits} / 8")
+if(NOT mode STREQUAL "full" OR NOT residual_type STREQUAL "NUMBER" OR
+   NOT launches EQUAL 5 OR NOT h2d EQUAL bytes OR NOT d2h EQUAL bytes)
+    message(FATAL_ERROR "incorrect full validation, wide launch count or transfer bytes")
+endif()
+execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" --check none
+    RESULT_VARIABLE status OUTPUT_QUIET ERROR_QUIET)
+if(status EQUAL 0)
+    message(FATAL_ERROR "accepted an invalid check mode")
 endif()
 foreach(bad -1 0 1x 18446744073709551615 184467440737095516160)
     execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" --tasks "${bad}"

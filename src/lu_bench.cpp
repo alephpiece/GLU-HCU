@@ -23,6 +23,8 @@ struct Options {
     size_t tasks = 0, warmup = 5, loops = 30;
     unsigned slots = 32;
     std::string output;
+    std::string check = "full";
+    bool diagnostics = false;
 };
 size_t number(const std::string& value, bool zero = false) {
     if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
@@ -40,6 +42,7 @@ Options parse(int argc, char** argv) {
     Options o;
     for (int i=1; i<argc; ++i) {
         const std::string key=argv[i];
+        if (key == "--diagnostics") { o.diagnostics=true; continue; }
         if (i+1 == argc) throw std::invalid_argument("missing value for " + key);
         const std::string value=argv[++i];
         if (key == "-i") o.inputs.push_back(value);
@@ -52,6 +55,10 @@ Options parse(int argc, char** argv) {
             o.slots=unsigned(slots);
         }
         else if (key == "--output") o.output=value;
+        else if (key == "--check") {
+            if (value != "full" && value != "basic") throw std::invalid_argument("check must be full or basic");
+            o.check=value;
+        }
         else throw std::invalid_argument("unknown option: " + key);
     }
     if (o.inputs.empty()) throw std::invalid_argument("at least one -i input is required");
@@ -114,6 +121,7 @@ int main(int argc, char** argv) {
     if (argc==2 && std::string(argv[1])=="--help") {
         std::cout << "Usage: glu_bench -i MATRIX [-i MATRIX ...] [--tasks N]\n"
                   << "  [--warmup 5] [--loops 30] [--tmp-slots 32] [--output result.json]\n"
+                  << "  [--check full|basic] [--diagnostics]\n"
                   << "One stream per task; round-robin templates; no perturbation.\n";
         return 0;
     }
@@ -143,11 +151,22 @@ int main(int argc, char** argv) {
             for (auto& t : tasks) t->wait();
         };
         for (size_t i=0; i<o.warmup; ++i) loop();
-        std::vector<double> loop_ms(o.loops);
+        std::vector<double> loop_ms(o.loops), submit_ms, drain_ms;
+        if (o.diagnostics) { submit_ms.resize(o.loops); drain_ms.resize(o.loops); }
         for (size_t i=0; i<o.loops; ++i) {
             const auto start=Clock::now();
-            loop();
-            loop_ms[i]=elapsed(start);
+            if (o.diagnostics) {
+                for (auto& t : tasks) t->enqueue();
+                const auto submitted=Clock::now();
+                for (auto& t : tasks) t->wait();
+                const auto finished=Clock::now();
+                submit_ms[i]=std::chrono::duration<double,std::milli>(submitted-start).count();
+                drain_ms[i]=std::chrono::duration<double,std::milli>(finished-submitted).count();
+                loop_ms[i]=std::chrono::duration<double,std::milli>(finished-start).count();
+            } else {
+                loop();
+                loop_ms[i]=elapsed(start);
+            }
         }
         const auto check_start=Clock::now();
         const double tolerance=sizeof(REAL)==8 ? 1e-10 : 1e-3;
@@ -157,14 +176,16 @@ int main(int argc, char** argv) {
                 tasks[i]->check();
                 auto& m=*matrices[i%matrices.size()];
                 const REAL* factors=tasks[i]->factors();
-                const double residual=m.symbolic->factor_residual(factors);
-                if (!std::isfinite(residual) || residual>tolerance) {
-                    std::ostringstream message;
-                    message << std::scientific << "factor residual " << residual
-                            << " exceeds tolerance " << tolerance;
-                    throw std::runtime_error(message.str());
+                if (o.check == "full") {
+                    const double residual=m.symbolic->factor_residual(factors);
+                    if (!std::isfinite(residual) || residual>tolerance) {
+                        std::ostringstream message;
+                        message << std::scientific << "factor residual " << residual
+                                << " exceeds tolerance " << tolerance;
+                        throw std::runtime_error(message.str());
+                    }
+                    max_residual=std::max(max_residual,residual);
                 }
-                max_residual=std::max(max_residual,residual);
                 const auto x=m.symbolic->solve(&m.nics.state,std::vector<REAL>(m.symbolic->n,REAL(1)),factors);
                 for (REAL value : x) if (!std::isfinite(value)) throw std::runtime_error("nonfinite solution");
             } catch (const std::exception& error) {
@@ -190,10 +211,53 @@ int main(int argc, char** argv) {
                << ",\n  \"task_device_bytes\": " << device_bytes << ", \"pinned_bytes\": " << pinned_bytes
                << ",\n  \"setup_ms\": " << setup_ms << ", \"validation_ms\": " << check_ms
                << ", \"ms_per_loop\": " << total_ms/o.loops
-               << ",\n  \"validation\": \"all-tasks-final-loop-full-factor-residual-and-finite-solve\","
-               << "\n  \"checked_tasks\": " << tasks.size() << ", \"max_factor_residual\": " << max_residual
-               << ", \"factor_residual_tolerance\": " << tolerance
-               << ",\n  \"templates\": [";
+               << ",\n  \"check_mode\": " << quoted(o.check)
+               << ",\n  \"validation\": " << quoted(o.check == "full"
+                   ? "all-tasks-final-loop-full-factor-residual-and-finite-solve"
+                   : "all-tasks-final-loop-finite-factors-nonzero-diagonal-and-finite-solve")
+               << ",\n  \"checked_tasks\": " << tasks.size() << ", \"max_factor_residual\": ";
+        if (o.check == "full") report << max_residual; else report << "null";
+        report << ", \"factor_residual_tolerance\": ";
+        if (o.check == "full") report << tolerance; else report << "null";
+        report << ",\n  \"diagnostics\": " << (o.diagnostics ? "true" : "false");
+        if (o.diagnostics) {
+            size_t launches=0, transfer_bytes=0;
+            report << ",\n  \"template_work\": [";
+            for (size_t i=0; i<matrices.size(); ++i) {
+                const auto& a=*matrices[i]->symbolic;
+                const unsigned slots=matrices[i]->gpu->tmp_slots();
+                size_t batched=0, factor=0, update=0, clear=0;
+                unsigned max_width=0, single_column_levels=0;
+                for (size_t lev=0; lev+1<a.level_ptr.size(); ++lev) {
+                    const unsigned width=unsigned(a.level_ptr[lev+1]-a.level_ptr[lev]);
+                    max_width=std::max(max_width,width);
+                    single_column_levels += width==1;
+                    if (width>16) batched+=(size_t(width)+slots-1)/slots;
+                    else for (int p=a.level_ptr[lev]; p<a.level_ptr[lev+1]; ++p) {
+                        const unsigned col=a.level_idx[p];
+                        ++factor; ++clear;
+                        update += a.csr_r_ptr[col+1]-a.csr_diag_ptr[col]-1>0;
+                    }
+                }
+                const size_t count=o.tasks/matrices.size()+(i<o.tasks%matrices.size());
+                add_bytes(launches,multiplied_bytes(count,batched+factor+update+clear));
+                add_bytes(transfer_bytes,multiplied_bytes(count,matrices[i]->gpu->task_host_bytes()));
+                if (i) report << ',';
+                report << "{\"levels\":" << a.num_lev << ",\"max_width\":" << max_width
+                       << ",\"single_column_levels\":" << single_column_levels
+                       << ",\"batched_launches\":" << batched << ",\"factor_launches\":" << factor
+                       << ",\"update_launches\":" << update << ",\"clear_launches\":" << clear << '}';
+            }
+            report << "],\n  \"launches_per_loop\": " << launches
+                   << ", \"h2d_bytes_per_loop\": " << transfer_bytes
+                   << ", \"d2h_bytes_per_loop\": " << transfer_bytes;
+            report << ",\n  \"submit_ms\": [";
+            for (size_t i=0; i<o.loops; ++i) { if(i) report << ','; report << submit_ms[i]; }
+            report << "],\n  \"drain_ms\": [";
+            for (size_t i=0; i<o.loops; ++i) { if(i) report << ','; report << drain_ms[i]; }
+            report << ']';
+        }
+        report << ",\n  \"templates\": [";
         for (size_t i=0; i<matrices.size(); ++i) {
             if (i) report << ',';
             const auto& m=*matrices[i];
