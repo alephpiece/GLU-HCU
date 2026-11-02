@@ -38,6 +38,11 @@ execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" --loops 1 --
 if(status EQUAL 0)
     message(FATAL_ERROR "failed output was accepted")
 endif()
+execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" --loops 1 --warmup 0
+    RESULT_VARIABLE status OUTPUT_FILE /dev/full ERROR_VARIABLE error)
+if(status EQUAL 0 OR NOT error MATCHES "failed to write standard output")
+    message(FATAL_ERROR "failed standard output was not reported: ${status}: ${error}")
+endif()
 set(ENV{CUDA_VISIBLE_DEVICES} "-1")
 set(ENV{HIP_VISIBLE_DEVICES} "-1")
 execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" --loops 1 --warmup 0

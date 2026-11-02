@@ -158,8 +158,12 @@ int main(int argc, char** argv) {
                 auto& m=*matrices[i%matrices.size()];
                 const REAL* factors=tasks[i]->factors();
                 const double residual=m.symbolic->factor_residual(factors);
-                if (!std::isfinite(residual) || residual>tolerance)
-                    throw std::runtime_error("factor residual exceeds tolerance: " + std::to_string(residual));
+                if (!std::isfinite(residual) || residual>tolerance) {
+                    std::ostringstream message;
+                    message << std::scientific << "factor residual " << residual
+                            << " exceeds tolerance " << tolerance;
+                    throw std::runtime_error(message.str());
+                }
                 max_residual=std::max(max_residual,residual);
                 const auto x=m.symbolic->solve(&m.nics.state,std::vector<REAL>(m.symbolic->n,REAL(1)),factors);
                 for (REAL value : x) if (!std::isfinite(value)) throw std::runtime_error("nonfinite solution");
@@ -207,6 +211,8 @@ int main(int argc, char** argv) {
             if (!file) throw std::runtime_error("failed to write result: " + o.output);
         }
         std::cout << report.str();
+        std::cout.flush();
+        if (!std::cout) throw std::runtime_error("failed to write standard output");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Benchmark failed: " << error.what() << '\n';
