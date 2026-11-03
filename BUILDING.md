@@ -88,7 +88,7 @@ cmake --build /path/to/build-hip -j64
 HIP_VISIBLE_DEVICES=0 ctest --test-dir /path/to/build-hip --output-on-failure
 ```
 
-CUDA 后端使用对应构建目录和 `CUDA_VISIBLE_DEVICES`。测试需要可用 GPU，包含 10 个 kernel 用例和 4 个主机调度、重复任务及失败返回用例。检查覆盖稀疏尾部、主元广播、并发列更新、扰动、临时槽不足时的复用、多模板多任务四轮执行、模板寿命，以及零主元和非有限因子的拒绝。CTest 还检查 CLI 正常输出、文件打开及写入失败，以及无可见 GPU 时的错误返回。
+CUDA 后端使用对应构建目录和 `CUDA_VISIBLE_DEVICES`。测试需要可用 GPU，包含 kernel、主机调度、批量与图重放回归。检查覆盖稀疏尾部、主元广播、并发列更新、扰动、临时槽不足时的复用、多模板多任务四轮执行、模板寿命、独立副本偏移、批量尾部、图准备与重复重放，以及零主元和非有限因子的拒绝。CTest 还检查 CLI 正常输出、文件打开及写入失败，以及无可见 GPU 时的错误返回。
 
 ## CUDA Makefile 入口
 
@@ -124,10 +124,13 @@ make -j64 CUDA_ARCH=sm_90
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `-i PATH` | 必填，可重复 | 按给定顺序组成模板列表，任务循环引用它们 |
-| `--tasks N` | 模板数 | 独立任务总数，必须至少覆盖全部模板；每任务一条 stream |
+| `-i PATH` | 与 `--workload` 二选一，可重复 | 按给定顺序组成模板列表，任务循环引用它们 |
+| `--workload FILE` | 与 `-i` 二选一 | 从显式清单读取模板与有序任务，不能同时指定 `--tasks` |
+| `--tasks N` | `-i` 模板数 | 仅用于 `-i` 模式；独立任务总数必须至少覆盖全部模板 |
 | `--warmup N` | 5 | 预热的全局 LOOP 数，允许 0 |
 | `--loops N` | 30 | 计时的全局 LOOP 数，必须大于 0 |
+| `--batch-size N` | 1 | 同模板独立副本的每批上限，每批一条 stream；必须大于 0 |
+| `--graph` | 关闭 | 在准备阶段捕获每批执行图，随后重放 |
 | `--tmp-slots N` | 32 | 每任务 scratch 槽数上限，必须大于 0 |
 | `--check full\|basic` | `full` | 完整残差验收或轻量有限性检查，见下文 |
 | `--diagnostics` | 关闭 | 输出提交/尾部等待时间、静态 launch 数及传输字节 |
@@ -135,15 +138,20 @@ make -j64 CUDA_ARCH=sm_90
 
 `mixed-2000` 是上述第三条命令的实验名称，程序没有硬编码场景。三个模板的重复
 按相同初值重复执行，不模拟逐轮变化的数值。不同输入可通过重复 `-i` 传入。
+加入 `--batch-size 512` 可将同模板副本合并为批，尾批保留实际数量；它不改变逻辑
+任务数。批大小与是否使用 `--graph` 应结合负载选择。
 
 ### 执行与计时
 
 每个模板只做一次预处理、符号分析和只读索引上传。任务共享模板的只读 pinned
-输入和设备结构，分别拥有数值区、scratch、pinned 输出和 nonblocking stream。
-模板实现由任务保持寿命；输出不共享。
+输入和设备结构，每个副本拥有独立数值区、scratch 和 pinned 输出；每批使用一条
+nonblocking stream。模板实现由任务保持寿命；副本之间不共享输出。批量减少
+stream 与分配次数，但不减少上述显式缓冲区总字节。
 
-每轮由一个主机线程按任务编号提交完整的 `H2D 初值 → 数值分解 → D2H 因子` 链，
-全部任务提交后逐流等待完成，然后才能开始下一轮。所有 kernel 显式使用任务流。
+batch>1 时，每轮由一个主机线程按模板交错提交各批的 `H2D 初值 → 数值分解 → D2H 因子` 链。
+每批先上传所有副本，再以 grid.y 区分副本执行共同 kernel 链，最后回传全部因子。
+全部批提交后逐流等待完成，然后才能开始下一轮；batch-size=1 保持逐任务提交顺序。
+所有 kernel 显式使用所属批的 stream。
 宽层沿用 batched RL，小层的 factor/update/clear 在任务流内按列顺序执行。
 `LUonDevice` 是同一执行接口的单任务封装。性能计时使用 `glu_bench` 的 LOOP 指标；
 求解 CLI 的准备与分解耗时不使用同一计时边界。
@@ -154,7 +162,9 @@ scratch 在准备阶段于任务流清零并等待完成；正常执行中 kerne
 必须固定它。显存预检查只检验全部任务的数值区和 scratch 能否放入剩余容量，不能
 保证驱动资源或 pinned host 分配一定成功；分配失败明确退出，不自动调整任务或槽数。
 
-`setup_ms` 包含预处理、资源分配和初始化。`loop_ms` 使用主机单调时钟，包含 H2D、
+`setup_ms` 包含预处理、资源分配、初始化和可选的图准备；`graph_setup_ms` 单列其中的
+捕获与实例化耗时。图捕获包含 H2D、计算和 D2H；准备时不执行分解。
+`warmup_ms` 单列全部预热时间，包括可能的首次重放开销。`loop_ms` 使用主机单调时钟，包含 H2D、
 计算提交、GPU 执行、D2H 和轮末等待；`ms_per_loop` 是这些完整轮次的算术平均。
 输出文件、检查、释放不在该区间。逻辑 stream 数不等于实际同时执行的任务数。
 
@@ -163,7 +173,8 @@ scratch 在准备阶段于任务流清零并等待完成；正常执行中 kerne
 
 `--diagnostics` 额外输出 `submit_ms`（提交全部任务）和 `drain_ms`（随后逐流等待）；
 两者之和为 `loop_ms`。提交可能包含运行时背压，不能直接解释为纯 CPU 时间；尾部等待
-也不是全部 GPU 时间。静态 launch 与传输字节统计不包含准备阶段，且不在计时区间内。
+也不是全部 GPU 时间。静态 launch 数表示底层 kernel 执行次数，按实际批数统计；图重放时不等于主机
+launch API 调用次数。传输字节仍按逻辑副本数统计。统计不包含准备阶段，且在计时区间外。
 
 ### 正确性与结果
 
@@ -190,9 +201,50 @@ JSON 记录检查模式、后端、精度、设备、调度方式、模板与任
 ### 代码边界
 
 `numeric.h` / `numeric.cu` 提供 `GpuMatrix`、`GpuTask` 和单任务兼容入口。
+`GpuTask(matrix, batch_size)` 表示同模板的一批独立副本；`factors(copy)` 读取对应输出。
+`prepare_graph()` 显式捕获并实例化图，可重复调用，且要求没有未完成的 enqueue。
 `GpuTask::enqueue()` 不分配、不全局等待、不计时；`wait()` 完成该任务并传播异步错误。
 只有 wait 成功后才能读取因子，前一次提交未完成时禁止重用 task。析构会等待尚未
 完成的任务，再释放资源，包括异常后的部分提交。`Symbolic_Matrix::solve` 的因子
 视图重载支持检查任务结果而不覆盖模板初值。
 
 `lu_bench.cpp` 负责参数、模板和任务组织、全局 LOOP、计时及检查。
+
+### 显式任务清单
+
+需要不均匀的模板频率或固定参考顺序时，使用 `--workload FILE` 替代 `-i` 和
+`--tasks`。其他计时、检查及诊断参数保持不变：
+
+```text
+glu-workload 1
+matrix light "inputs/light.mtx"
+matrix heavy "inputs/heavy.mtx"
+task light
+task heavy
+task light
+```
+
+```bash
+/path/to/build/glu_bench --workload /path/to/case.workload \
+  --warmup 2 --loops 10 --check full --diagnostics --output case.json
+```
+
+首条有效记录必须是版本头。随后定义全部 `matrix ID PATH`，再按参考顺序列出
+`task ID`；每条 task 是一个独立任务。同一 ID 只准备一次模板，任务保留独立数值区、
+scratch 和输出。ID 必须唯一、先定义后引用，全部模板都必须被使用；不会按文件路径
+或文件内容自动合并不同 ID。路径相对于清单目录解析，也可使用绝对路径；包含空格时
+用双引号，双引号和反斜杠可用反斜杠转义。允许空行和以 `#` 开头的整行注释。
+未知记录、额外字段、未定义 ID、重复 ID、未使用模板以及与 `-i` / `--tasks` 混用均报错。
+
+`--batch-size 1` 按清单顺序提交；更大的batch按模板定义顺序交错分批，尾批保留
+实际副本数。每轮仍等待全部任务完成。该顺序是独立任务的基线参考
+顺序，不表示任务依赖或到达时间。未来执行优化可以改变分组和提交顺序，但比较时
+应保留相同逻辑任务集合，并另行记录执行策略。
+
+JSON 的 `templates` 按定义顺序列出各模板及实际任务数；`task_templates` 按逻辑任务
+顺序记录零起始的模板索引。原 `-i` / `--tasks` 入口也输出这个数组，仍按原循环分配
+规则执行。诊断 launch 数、传输量及资源预检查按实际任务频率计算，检查覆盖全部任务。
+样本选择、频率、随机顺序和输入摘要由外部负载准备工具负责，执行器不生成负载。
+
+JSON 还输出 `batch_templates`、`batch_sizes` 与 `ordering`，记录实际批次
+的模板、独立副本数和提交策略；`task_templates` 始终表示原逻辑任务顺序。

@@ -5,6 +5,8 @@
 using cudaError_t = hipError_t;
 using cudaEvent_t = hipEvent_t;
 using cudaStream_t = hipStream_t;
+using cudaGraph_t = hipGraph_t;
+using cudaGraphExec_t = hipGraphExec_t;
 using cudaDeviceProp = hipDeviceProp_t;
 #define cudaSuccess hipSuccess
 #define cudaDeviceSynchronize hipDeviceSynchronize
@@ -34,6 +36,13 @@ using cudaDeviceProp = hipDeviceProp_t;
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaStreamSynchronize hipStreamSynchronize
 #define cudaStreamDestroy hipStreamDestroy
+#define cudaStreamBeginCapture hipStreamBeginCapture
+#define cudaStreamEndCapture hipStreamEndCapture
+#define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
+#define cudaGraphInstantiate hipGraphInstantiate
+#define cudaGraphDestroy hipGraphDestroy
+#define cudaGraphExecDestroy hipGraphExecDestroy
+#define cudaGraphLaunch hipGraphLaunch
 #else
 #include <cuda_runtime.h>
 #endif

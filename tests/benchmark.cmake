@@ -41,6 +41,27 @@ if(NOT mode STREQUAL "basic" OR NOT residual_type STREQUAL "NULL" OR
    NOT submit_count EQUAL 2 OR NOT drain_count EQUAL 2 OR NOT launches EQUAL 38)
     message(FATAL_ERROR "incorrect basic validation or launch accounting")
 endif()
+# Logical counts 4+3 with batches of three produce two full batches and one tail.
+foreach(execution direct graph)
+    set(graph_option)
+    if(execution STREQUAL "graph")
+        set(graph_option --graph)
+    endif()
+    execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" -i "${TEST_DIRECTORY}/b.mtx"
+        --tasks 7 --batch-size 3 --warmup 1 --loops 2 --diagnostics ${graph_option}
+        --output "${TEST_DIRECTORY}/batch-${execution}.json"
+        RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 60)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR "batch ${execution} failed: ${output}${error}")
+    endif()
+    file(READ "${TEST_DIRECTORY}/batch-${execution}.json" batch)
+    string(JSON checked GET "${batch}" checked_tasks)
+    string(JSON streams GET "${batch}" streams)
+    string(JSON launches GET "${batch}" launches_per_loop)
+    if(NOT checked EQUAL 7 OR NOT streams EQUAL 3 OR NOT launches EQUAL 16)
+        message(FATAL_ERROR "incorrect tail-batch task/stream/launch accounting")
+    endif()
+endforeach()
 # A wide diagonal level needs five batches at eight slots, with no one-column kernels.
 file(WRITE "${TEST_DIRECTORY}/wide.mtx" "33 33 33\n")
 foreach(i RANGE 1 33)
@@ -92,6 +113,105 @@ execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" --loops 1 --
 if(status EQUAL 0 OR NOT error MATCHES "failed to write standard output")
     message(FATAL_ERROR "failed standard output was not reported: ${status}: ${error}")
 endif()
+# Explicit workload: uneven counts, non-cyclic order and a relative path with spaces.
+file(COPY_FILE "${TEST_DIRECTORY}/a.mtx" "${TEST_DIRECTORY}/matrix a.mtx")
+file(WRITE "${TEST_DIRECTORY}/weighted.workload"
+    "# independent tasks\nglu-workload 1\nmatrix a \"matrix a.mtx\"\nmatrix b b.mtx\ntask b\ntask a\ntask a\ntask a\n")
+execute_process(COMMAND "${GLU_BENCH}" --workload "${TEST_DIRECTORY}/weighted.workload"
+    --warmup 1 --loops 2 --diagnostics --output "${TEST_DIRECTORY}/weighted.json"
+    RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 60)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "explicit workload failed: ${output}${error}")
+endif()
+file(READ "${TEST_DIRECTORY}/weighted.json" weighted)
+string(JSON first GET "${weighted}" task_templates 0)
+string(JSON last GET "${weighted}" task_templates 3)
+string(JSON count LENGTH "${weighted}" task_templates)
+string(JSON acount GET "${weighted}" templates 0 tasks)
+string(JSON bcount GET "${weighted}" templates 1 tasks)
+string(JSON checked GET "${weighted}" checked_tasks)
+string(JSON launches GET "${weighted}" launches_per_loop)
+string(JSON bits GET "${weighted}" real_bits)
+string(JSON h2d GET "${weighted}" h2d_bytes_per_loop)
+string(JSON d2h GET "${weighted}" d2h_bytes_per_loop)
+math(EXPR expected_bytes "(3 * 4 + 3) * ${bits} / 8")
+if(NOT first EQUAL 1 OR NOT last EQUAL 0 OR NOT count EQUAL 4 OR
+   NOT acount EQUAL 3 OR NOT bcount EQUAL 1 OR NOT checked EQUAL 4 OR
+   NOT launches EQUAL 21 OR NOT h2d EQUAL expected_bytes OR NOT d2h EQUAL expected_bytes)
+    message(FATAL_ERROR "workload mapping or weighted accounting incorrect")
+endif()
+# Workload integration: preserve logical order, regroup nonuniform counts and tails.
+string(JSON actual_order GET "${weighted}" batch_templates)
+string(JSON logical_order GET "${weighted}" task_templates)
+if(NOT actual_order STREQUAL logical_order)
+    message(FATAL_ERROR "batch1 changed explicit task order")
+endif()
+foreach(execution direct graph)
+    set(graph_option)
+    if(execution STREQUAL "graph")
+        set(graph_option --graph)
+    endif()
+    execute_process(COMMAND "${GLU_BENCH}" --workload "${TEST_DIRECTORY}/weighted.workload"
+        --batch-size 2 ${graph_option} --warmup 1 --loops 2 --diagnostics
+        --output "${TEST_DIRECTORY}/weighted-${execution}.json"
+        RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 60)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR "weighted batch ${execution} failed: ${output}${error}")
+    endif()
+    file(READ "${TEST_DIRECTORY}/weighted-${execution}.json" result)
+    string(JSON streams GET "${result}" streams)
+    string(JSON checked GET "${result}" checked_tasks)
+    string(JSON launches GET "${result}" launches_per_loop)
+    string(JSON order GET "${result}" task_templates)
+    if(NOT streams EQUAL 3 OR NOT checked EQUAL 4 OR NOT launches EQUAL 16 OR
+       NOT order STREQUAL logical_order)
+        message(FATAL_ERROR "weighted batch counts or logical identity changed")
+    endif()
+    foreach(field task_device_bytes pinned_bytes h2d_bytes_per_loop d2h_bytes_per_loop)
+        string(JSON before GET "${weighted}" ${field})
+        string(JSON after GET "${result}" ${field})
+        if(NOT before EQUAL after)
+            message(FATAL_ERROR "weighted batch changed ${field}")
+        endif()
+    endforeach()
+    foreach(i RANGE 0 2)
+        string(JSON templ GET "${result}" batch_templates ${i})
+        string(JSON size GET "${result}" batch_sizes ${i})
+        if(i EQUAL 0)
+            if(NOT templ EQUAL 0 OR NOT size EQUAL 2)
+                message(FATAL_ERROR "wrong first weighted batch")
+            endif()
+        elseif(i EQUAL 1)
+            if(NOT templ EQUAL 1 OR NOT size EQUAL 1)
+                message(FATAL_ERROR "wrong second weighted batch")
+            endif()
+        elseif(NOT templ EQUAL 0 OR NOT size EQUAL 1)
+            message(FATAL_ERROR "wrong weighted tail batch")
+        endif()
+    endforeach()
+endforeach()
+foreach(invalid
+    "glu-workload 2\n"
+    "glu-workload 1\nmatrix a a.mtx\ntask missing\n"
+    "glu-workload 1\nmatrix a a.mtx\nmatrix a b.mtx\ntask a\n"
+    "glu-workload 1\nmatrix a a.mtx\nmatrix b b.mtx\ntask a\n"
+    "glu-workload 1\nmatrix a a.mtx\ntask a extra\n"
+    "glu-workload 1\nmatrix a a.mtx\ntask a\nmatrix b b.mtx\n")
+    file(WRITE "${TEST_DIRECTORY}/invalid.workload" "${invalid}")
+    execute_process(COMMAND "${GLU_BENCH}" --workload "${TEST_DIRECTORY}/invalid.workload"
+        RESULT_VARIABLE status OUTPUT_QUIET ERROR_VARIABLE error TIMEOUT 10)
+    if(NOT status EQUAL 1 OR NOT error MATCHES "Benchmark failed:")
+        message(FATAL_ERROR "invalid workload not rejected: ${status}: ${error}")
+    endif()
+endforeach()
+foreach(extra -i --tasks)
+    execute_process(COMMAND "${GLU_BENCH}" --workload "${TEST_DIRECTORY}/weighted.workload" "${extra}" 1
+        RESULT_VARIABLE status OUTPUT_QUIET ERROR_VARIABLE error TIMEOUT 10)
+    if(NOT status EQUAL 1 OR NOT error MATCHES "cannot be combined")
+        message(FATAL_ERROR "conflicting workload arguments accepted")
+    endif()
+endforeach()
+
 set(ENV{CUDA_VISIBLE_DEVICES} "-1")
 set(ENV{HIP_VISIBLE_DEVICES} "-1")
 execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" --loops 1 --warmup 0

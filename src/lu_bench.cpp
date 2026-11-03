@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
+#include <map>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -20,11 +22,17 @@ double elapsed(Clock::time_point start) {
 }
 struct Options {
     std::vector<std::string> inputs;
+    std::vector<size_t> task_templates, counts;
+    std::string workload;
     size_t tasks = 0, warmup = 5, loops = 30;
-    unsigned slots = 32;
+    unsigned slots = 32, batch_size = 1;
     std::string output;
     std::string check = "full";
     bool diagnostics = false;
+    bool graph = false;
+    size_t template_index(size_t task) const {
+        return task_templates.empty() ? task%inputs.size() : task_templates[task];
+    }
 };
 size_t number(const std::string& value, bool zero = false) {
     if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
@@ -38,17 +46,66 @@ size_t number(const std::string& value, bool zero = false) {
     if (!zero && !result) throw std::invalid_argument("value must be positive");
     return result;
 }
+// The workload describes independent logical tasks, not a scheduling algorithm.
+void read_workload(Options& o) {
+    std::ifstream file(o.workload);
+    if (!file) throw std::invalid_argument("cannot open workload: " + o.workload);
+    const auto directory=std::filesystem::path(o.workload).parent_path();
+    std::map<std::string,size_t> ids;
+    std::string line;
+    size_t line_number=0;
+    bool header=false, tasks_started=false;
+    while (std::getline(file,line)) {
+        ++line_number;
+        std::istringstream in(line);
+        std::string kind, id, path, extra;
+        if (!(in >> kind) || kind[0]=='#') continue;
+        try {
+            if (!header) {
+                if (kind!="glu-workload" || !(in >> id) || id!="1" || (in >> extra))
+                    throw std::invalid_argument("expected glu-workload 1");
+                header=true;
+            } else if (kind=="matrix") {
+                if (tasks_started || !(in >> id >> std::quoted(path)) || path.empty() || (in >> extra))
+                    throw std::invalid_argument("expected matrix ID PATH before all tasks");
+                if (!ids.emplace(id,o.inputs.size()).second)
+                    throw std::invalid_argument("duplicate matrix ID: " + id);
+                o.inputs.push_back((directory/std::filesystem::path(path)).lexically_normal().string());
+            } else if (kind=="task") {
+                if (!(in >> id) || (in >> extra) || !ids.count(id))
+                    throw std::invalid_argument("expected task with a defined matrix ID");
+                tasks_started=true;
+                o.task_templates.push_back(ids.at(id));
+            } else throw std::invalid_argument("unknown workload record: " + kind);
+        } catch (const std::exception& error) {
+            throw std::invalid_argument(o.workload + ":" + std::to_string(line_number) + ": " + error.what());
+        }
+    }
+    if (file.bad()) throw std::runtime_error("failed reading workload: " + o.workload);
+    if (!header || o.task_templates.empty()) throw std::invalid_argument("empty workload");
+    o.tasks=o.task_templates.size();
+}
 Options parse(int argc, char** argv) {
     Options o;
     for (int i=1; i<argc; ++i) {
         const std::string key=argv[i];
         if (key == "--diagnostics") { o.diagnostics=true; continue; }
+        if (key == "--graph") { o.graph=true; continue; }
         if (i+1 == argc) throw std::invalid_argument("missing value for " + key);
         const std::string value=argv[++i];
         if (key == "-i") o.inputs.push_back(value);
+        else if (key == "--workload") {
+            if (value.empty()) throw std::invalid_argument("empty workload path");
+            o.workload=value;
+        }
         else if (key == "--tasks") o.tasks=number(value);
         else if (key == "--warmup") o.warmup=number(value,true);
         else if (key == "--loops") o.loops=number(value);
+        else if (key == "--batch-size") {
+            const size_t count=number(value);
+            if (count>std::numeric_limits<unsigned>::max()) throw std::invalid_argument("batch size overflow");
+            o.batch_size=unsigned(count);
+        }
         else if (key == "--tmp-slots") {
             const size_t slots=number(value);
             if (slots > std::numeric_limits<unsigned>::max()) throw std::invalid_argument("tmp slots overflow");
@@ -61,9 +118,19 @@ Options parse(int argc, char** argv) {
         }
         else throw std::invalid_argument("unknown option: " + key);
     }
-    if (o.inputs.empty()) throw std::invalid_argument("at least one -i input is required");
-    if (!o.tasks) o.tasks=o.inputs.size();
-    if (o.tasks < o.inputs.size()) throw std::invalid_argument("tasks must cover every input template");
+    if (!o.workload.empty()) {
+        if (!o.inputs.empty() || o.tasks) throw std::invalid_argument("--workload cannot be combined with -i or --tasks");
+        read_workload(o);
+    } else {
+        if (o.inputs.empty()) throw std::invalid_argument("at least one -i input is required");
+        if (!o.tasks) o.tasks=o.inputs.size();
+        if (o.tasks < o.inputs.size()) throw std::invalid_argument("tasks must cover every input template");
+    }
+    o.counts.assign(o.inputs.size(),0);
+    if (o.workload.empty()) {
+        for (size_t i=0; i<o.inputs.size(); ++i) o.counts[i]=o.tasks/o.inputs.size()+(i<o.tasks%o.inputs.size());
+    } else for (size_t index : o.task_templates) ++o.counts[index];
+    for (size_t count : o.counts) if (!count) throw std::invalid_argument("unused workload matrix");
     return o;
 }
 struct NicsState {
@@ -119,10 +186,10 @@ size_t multiplied_bytes(size_t count, size_t bytes) {
 
 int main(int argc, char** argv) {
     if (argc==2 && std::string(argv[1])=="--help") {
-        std::cout << "Usage: glu_bench -i MATRIX [-i MATRIX ...] [--tasks N]\n"
+        std::cout << "Usage: glu_bench (-i MATRIX [-i MATRIX ...] [--tasks N] | --workload FILE)\n"
                   << "  [--warmup 5] [--loops 30] [--tmp-slots 32] [--output result.json]\n"
-                  << "  [--check full|basic] [--diagnostics]\n"
-                  << "One stream per task; round-robin templates; no perturbation.\n";
+                  << "  [--check full|basic] [--diagnostics] [--graph] [--batch-size 1]\n"
+                  << "One stream per homogeneous batch; explicit logical workload or round-robin inputs; no perturbation.\n";
         return 0;
     }
     try {
@@ -134,7 +201,7 @@ int main(int argc, char** argv) {
         for (const auto& m : matrices) add_bytes(pinned_bytes,m->gpu->task_host_bytes());
         for (size_t i=0; i<matrices.size(); ++i) {
             const auto& g=*matrices[i]->gpu;
-            const size_t count=o.tasks/matrices.size()+(i<o.tasks%matrices.size());
+            const size_t count=o.counts[i];
             add_bytes(device_bytes,multiplied_bytes(count,g.task_device_bytes()));
             add_bytes(pinned_bytes,multiplied_bytes(count,g.task_host_bytes()));
         }
@@ -144,13 +211,35 @@ int main(int argc, char** argv) {
             throw std::runtime_error("task buffers exceed free device memory; explicitly reduce tasks or tmp slots");
         std::vector<std::unique_ptr<GpuTask>> tasks;
         tasks.reserve(o.tasks);
-        for (size_t i=0; i<o.tasks; ++i) tasks.emplace_back(new GpuTask(*matrices[i%matrices.size()]->gpu));
+        std::vector<size_t> task_template, template_batches(matrices.size(),0);
+        auto add_batch = [&](size_t index, unsigned copies) {
+            tasks.emplace_back(new GpuTask(*matrices[index]->gpu,copies));
+            task_template.push_back(index);
+            ++template_batches[index];
+        };
+        if (o.batch_size==1) {
+            // Preserve the reference task order when batching is disabled.
+            for (size_t i=0; i<o.tasks; ++i) add_batch(o.template_index(i),1);
+        } else {
+            const size_t max_count=*std::max_element(o.counts.begin(),o.counts.end());
+            for (size_t offset=0; offset<max_count; offset+=o.batch_size) {
+                for (size_t i=0; i<matrices.size(); ++i) {
+                    if (offset>=o.counts[i]) continue;
+                    add_batch(i,unsigned(std::min(size_t(o.batch_size),o.counts[i]-offset)));
+                }
+            }
+        }
+        const auto graph_start=Clock::now();
+        if (o.graph) for (auto& t : tasks) t->prepare_graph();
+        const double graph_setup_ms=o.graph ? elapsed(graph_start) : 0;
         const double setup_ms=elapsed(setup_start);
         auto loop = [&]() {
             for (auto& t : tasks) t->enqueue();
             for (auto& t : tasks) t->wait();
         };
+        const auto warmup_start=Clock::now();
         for (size_t i=0; i<o.warmup; ++i) loop();
+        const double warmup_ms=elapsed(warmup_start);
         std::vector<double> loop_ms(o.loops), submit_ms, drain_ms;
         if (o.diagnostics) { submit_ms.resize(o.loops); drain_ms.resize(o.loops); }
         for (size_t i=0; i<o.loops; ++i) {
@@ -171,27 +260,32 @@ int main(int argc, char** argv) {
         const auto check_start=Clock::now();
         const double tolerance=sizeof(REAL)==8 ? 1e-10 : 1e-3;
         double max_residual=0;
+        size_t checked_tasks=0;
         for (size_t i=0; i<tasks.size(); ++i) {
             try {
                 tasks[i]->check();
-                auto& m=*matrices[i%matrices.size()];
-                const REAL* factors=tasks[i]->factors();
-                if (o.check == "full") {
-                    const double residual=m.symbolic->factor_residual(factors);
-                    if (!std::isfinite(residual) || residual>tolerance) {
-                        std::ostringstream message;
-                        message << std::scientific << "factor residual " << residual
-                                << " exceeds tolerance " << tolerance;
-                        throw std::runtime_error(message.str());
+                auto& m=*matrices[task_template[i]];
+                for (unsigned copy=0; copy<tasks[i]->batch_size(); ++copy) {
+                    const REAL* factors=tasks[i]->factors(copy);
+                    if (o.check == "full") {
+                        const double residual=m.symbolic->factor_residual(factors);
+                        if (!std::isfinite(residual) || residual>tolerance) {
+                            std::ostringstream message;
+                            message << std::scientific << "factor residual " << residual
+                                    << " exceeds tolerance " << tolerance;
+                            throw std::runtime_error(message.str());
+                        }
+                        max_residual=std::max(max_residual,residual);
                     }
-                    max_residual=std::max(max_residual,residual);
+                    const auto x=m.symbolic->solve(&m.nics.state,std::vector<REAL>(m.symbolic->n,REAL(1)),factors);
+                    for (REAL value : x) if (!std::isfinite(value)) throw std::runtime_error("nonfinite solution");
+                    ++checked_tasks;
                 }
-                const auto x=m.symbolic->solve(&m.nics.state,std::vector<REAL>(m.symbolic->n,REAL(1)),factors);
-                for (REAL value : x) if (!std::isfinite(value)) throw std::runtime_error("nonfinite solution");
             } catch (const std::exception& error) {
-                throw std::runtime_error("task " + std::to_string(i) + ": " + error.what());
+                throw std::runtime_error("batch " + std::to_string(i) + ": " + error.what());
             }
         }
+        if (checked_tasks!=o.tasks) throw std::runtime_error("task coverage mismatch");
         const double check_ms=elapsed(check_start);
         double total_ms=0;
         for (double ms : loop_ms) total_ms+=ms;
@@ -204,18 +298,20 @@ int main(int argc, char** argv) {
 #endif
                << ", \"real_bits\": " << sizeof(REAL)*8
                << ", \"device\": " << quoted(matrices[0]->gpu->device_name())
-               << ",\n  \"schedule\": \"one-stream-per-task\", \"submission\": \"single-host-thread-task-order\","
-               << "\n  \"tasks\": " << o.tasks << ", \"streams\": " << o.tasks
+               << ",\n  \"schedule\": " << quoted(o.batch_size==1 ? "one-stream-per-task" : "one-stream-per-batch")
+               << ", \"submission\": " << quoted(o.graph ? "single-host-thread-graph" : "single-host-thread-direct") << ','
+               << "\n  \"tasks\": " << o.tasks << ", \"streams\": " << tasks.size()
                << ", \"warmup\": " << o.warmup << ", \"loops\": " << o.loops
-               << ", \"requested_tmp_slots\": " << o.slots
+               << ", \"requested_tmp_slots\": " << o.slots << ", \"batch_size\": " << o.batch_size
                << ",\n  \"task_device_bytes\": " << device_bytes << ", \"pinned_bytes\": " << pinned_bytes
                << ",\n  \"setup_ms\": " << setup_ms << ", \"validation_ms\": " << check_ms
+               << ", \"graph\": " << (o.graph ? "true" : "false") << ", \"graph_setup_ms\": " << graph_setup_ms << ", \"warmup_ms\": " << warmup_ms
                << ", \"ms_per_loop\": " << total_ms/o.loops
                << ",\n  \"check_mode\": " << quoted(o.check)
                << ",\n  \"validation\": " << quoted(o.check == "full"
                    ? "all-tasks-final-loop-full-factor-residual-and-finite-solve"
                    : "all-tasks-final-loop-finite-factors-nonzero-diagonal-and-finite-solve")
-               << ",\n  \"checked_tasks\": " << tasks.size() << ", \"max_factor_residual\": ";
+               << ",\n  \"checked_tasks\": " << checked_tasks << ", \"max_factor_residual\": ";
         if (o.check == "full") report << max_residual; else report << "null";
         report << ", \"factor_residual_tolerance\": ";
         if (o.check == "full") report << tolerance; else report << "null";
@@ -239,8 +335,8 @@ int main(int argc, char** argv) {
                         update += a.csr_r_ptr[col+1]-a.csr_diag_ptr[col]-1>0;
                     }
                 }
-                const size_t count=o.tasks/matrices.size()+(i<o.tasks%matrices.size());
-                add_bytes(launches,multiplied_bytes(count,batched+factor+update+clear));
+                const size_t count=o.counts[i];
+                add_bytes(launches,multiplied_bytes(template_batches[i],batched+factor+update+clear));
                 add_bytes(transfer_bytes,multiplied_bytes(count,matrices[i]->gpu->task_host_bytes()));
                 if (i) report << ',';
                 report << "{\"levels\":" << a.num_lev << ",\"max_width\":" << max_width
@@ -257,13 +353,26 @@ int main(int argc, char** argv) {
             for (size_t i=0; i<o.loops; ++i) { if(i) report << ','; report << drain_ms[i]; }
             report << ']';
         }
+        report << ",\n  \"ordering\": " << quoted(o.batch_size==1
+            ? "logical-task-order" : "template-interleaved-batches");
+        report << ",\n  \"batch_templates\": [";
+        for (size_t i=0; i<tasks.size(); ++i) { if(i) report << ','; report << task_template[i]; }
+        report << "],\n  \"batch_sizes\": [";
+        for (size_t i=0; i<tasks.size(); ++i) { if(i) report << ','; report << tasks[i]->batch_size(); }
+        report << ']';
+        report << ",\n  \"task_templates\": [";
+        for (size_t i=0; i<o.tasks; ++i) {
+            if (i) report << ',';
+            report << o.template_index(i);
+        }
+        report << ']';
         report << ",\n  \"templates\": [";
         for (size_t i=0; i<matrices.size(); ++i) {
             if (i) report << ',';
             const auto& m=*matrices[i];
             report << "{\"path\":" << quoted(o.inputs[i]) << ",\"n\":" << m.symbolic->n
-                   << ",\"factor_nnz\":" << m.symbolic->nnz << ",\"tasks\":" << o.tasks/matrices.size()+(i<o.tasks%matrices.size())
-                   << ",\"effective_tmp_slots\":" << m.gpu->tmp_slots() << '}';
+                   << ",\"factor_nnz\":" << m.symbolic->nnz << ",\"tasks\":" << o.counts[i]
+                   << ",\"batches\":" << template_batches[i] << ",\"effective_tmp_slots\":" << m.gpu->tmp_slots() << '}';
         }
         report << "],\n  \"loop_ms\": [";
         for (size_t i=0; i<loop_ms.size(); ++i) { if (i) report << ','; report << loop_ms[i]; }
