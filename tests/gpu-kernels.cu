@@ -302,6 +302,10 @@ void verify_template_bytes(const GpuMatrix& gpu, const Symbolic_Matrix& matrix, 
                    (matrix.csr_r_ptr[c+1]-matrix.csr_diag_ptr[c]-1);
     const size_t map = mode == UpdateMode::Mapped
         ? sizeof(uint64_t)*(size_t(matrix.n)+1)+sizeof(unsigned)*(size_t(updates)+matrix.csr_c_idx.size()) : 0;
+    const size_t task = sizeof(REAL)*(matrix.val.size()+
+        (mode == UpdateMode::Scan ? size_t(matrix.n)*gpu.tmp_slots() : 0));
+    if (gpu.task_device_bytes() != task)
+        throw std::runtime_error("incorrect task device byte accounting");
     if (gpu.update_map_bytes() != map || gpu.shared_device_bytes() != structure+map)
         throw std::runtime_error("incorrect template device byte accounting");
     if (!std::isfinite(gpu.update_map_setup_ms()) || gpu.update_map_setup_ms() < 0 ||
@@ -337,7 +341,8 @@ void test_repeated_tasks(bool graph = false, unsigned copies = 1, UpdateMode mod
         a.predictLU(row.data(),col.data(),val.data()); a.leveling();
         GpuMatrix matrix(a, variant ? 3 : 1, false, mode);
         verify_template_bytes(matrix, a, mode);
-        if (matrix.tmp_slots() != (variant ? 3u : 1u)) throw std::runtime_error("wrong scratch cap");
+        const unsigned expected_slots = mode == UpdateMode::Scan ? (variant ? 3u : 1u) : 0;
+        if (matrix.tmp_slots() != expected_slots) throw std::runtime_error("wrong effective scratch slots");
         for (unsigned copy=0; copy<2; ++copy) {
             tasks.emplace_back(new GpuTask(matrix, copies));
             if (graph) { tasks.back()->prepare_graph(); tasks.back()->prepare_graph(); }
@@ -529,53 +534,48 @@ void test_mapped(bool one_column, bool perturb, unsigned threads)
     DeviceBuffer<unsigned> map_destinations(destinations), map_pivots(pivots);
     // Nonzero levelHead plus a second chunk exercises both source-list offsets.
     DeviceBuffer<int> sources(std::vector<int>{0, 2, 5, 8, 11});
-    DeviceBuffer<REAL> values(input), scratch(stride*copies);
+    DeviceBuffer<REAL> values(input);
     Stream stream;
     for (unsigned repeat=0; repeat<2; ++repeat) {
-        // Restore values only: scratch must remain reusable without a memset.
+        // No scratch allocation: repeated mapped execution only restores values.
         check_gpu(cudaMemcpy(values.data(), input.data(), input.size()*sizeof(REAL),
                              cudaMemcpyHostToDevice), "restore mapped inputs");
         if (one_column) {
             for (int c : matrix.sources) {
                 if (perturb)
-                    RL_onecol_factorizeCurrentCol<true><<<dim3(1,copies),threads,0,stream.value>>>(
-                        column.data(), row.data(), values.data(), diagonal.data(), c, scratch.data(), 0,
+                    RL_onecol_factorizeCurrentCol<true, false><<<dim3(1,copies),threads,0,stream.value>>>(
+                        column.data(), row.data(), values.data(), diagonal.data(), c, nullptr, 0,
                         matrix.n, nnz, stride, threshold);
                 else
-                    RL_onecol_factorizeCurrentCol<><<<dim3(1,copies),threads,0,stream.value>>>(
-                        column.data(), row.data(), values.data(), diagonal.data(), c, scratch.data(), 0,
+                    RL_onecol_factorizeCurrentCol<false, false><<<dim3(1,copies),threads,0,stream.value>>>(
+                        column.data(), row.data(), values.data(), diagonal.data(), c, nullptr, 0,
                         matrix.n, nnz, stride);
                 check_gpu(cudaGetLastError(), "launch mapped source normalization");
                 const unsigned targets = matrix.csr_row[c+1]-matrix.csr_diagonal[c]-1;
                 RL_onecol_updateSubmat<UpdateMode::Mapped><<<dim3(targets,copies),threads,0,stream.value>>>(
                     column.data(), row.data(), values.data(), csr_column.data(), csr_diagonal.data(), c,
-                    scratch.data(), 0, matrix.n, nnz, stride, diagonal.data(), map_bases.data(),
+                    nullptr, 0, matrix.n, nnz, stride, diagonal.data(), map_bases.data(),
                     map_destinations.data(), map_pivots.data());
                 check_gpu(cudaGetLastError(), "launch mapped column update");
-                RL_onecol_cleartmpMem<<<dim3(1,copies),threads,0,stream.value>>>(
-                    column.data(),row.data(),diagonal.data(),c,scratch.data(),0,matrix.n,stride);
-                check_gpu(cudaGetLastError(), "launch mapped scratch clear");
             }
         } else {
             for (unsigned offset : {0u, 2u}) {
                 if (perturb)
                     RL<UpdateMode::Mapped, true><<<dim3(slots,copies),threads,0,stream.value>>>(
                         column.data(), row.data(), values.data(), diagonal.data(), csr_row.data(),
-                        csr_column.data(), csr_diagonal.data(), sources.data(), scratch.data(), matrix.n, 1,
+                        csr_column.data(), csr_diagonal.data(), sources.data(), nullptr, matrix.n, 1,
                         offset, nnz, stride, threshold, map_bases.data(), map_destinations.data(),
                         map_pivots.data());
                 else
                     RL<UpdateMode::Mapped><<<dim3(slots,copies),threads,0,stream.value>>>(
                         column.data(), row.data(), values.data(), diagonal.data(), csr_row.data(),
-                        csr_column.data(), csr_diagonal.data(), sources.data(), scratch.data(), matrix.n, 1,
+                        csr_column.data(), csr_diagonal.data(), sources.data(), nullptr, matrix.n, 1,
                         offset, nnz, stride, 0, map_bases.data(), map_destinations.data(), map_pivots.data());
                 check_gpu(cudaGetLastError(), "launch mapped level chunk");
             }
         }
         check_gpu(cudaStreamSynchronize(stream.value), "wait mapped kernels");
         compare(values.read(), expected, "mapped factors and distinct copies");
-        for (REAL value : scratch.read())
-            if (value != REAL(0)) throw std::runtime_error("mapped scratch was not cleared");
     }
     std::cout << "PASS mapped/" << (one_column ? "one-column/" : "RL/")
               << (perturb ? "perturb/" : "plain/") << threads << '\n';

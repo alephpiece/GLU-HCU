@@ -17,7 +17,7 @@ public:
     explicit GpuMatrix(const Symbolic_Matrix&, unsigned tmp_slots = 32, bool perturb = false,
                        UpdateMode update_mode = UpdateMode::Scan);
     ~GpuMatrix();
-    unsigned tmp_slots() const;
+    unsigned tmp_slots() const; // Effective scratch slots; zero for Mapped.
     size_t task_device_bytes() const;
     size_t task_host_bytes() const;
     // Device allocation payloads, excluding allocator/stream/Graph overhead.
@@ -37,7 +37,7 @@ private:
 class GpuTask {
 public:
     // Independent copies of one immutable template; each copy owns its values,
-    // scratch and output. One stream runs the entire batch.
+    // output and (only in scan mode) scratch. One stream runs the entire batch.
     explicit GpuTask(const GpuMatrix&, unsigned batch_size = 1);
     unsigned batch_size() const;
     ~GpuTask();

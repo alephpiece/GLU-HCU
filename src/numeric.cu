@@ -34,7 +34,8 @@ __global__ void RL(
         const unsigned* __restrict__ map_pivots = nullptr)
 {
     val_dev += size_t(blockIdx.y) * value_stride;
-    tmpMem += size_t(blockIdx.y) * scratch_stride;
+    if constexpr (Mode == UpdateMode::Scan)
+        tmpMem += size_t(blockIdx.y) * scratch_stride;
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
     const int wid = threadIdx.x / GLU_GROUP_SIZE;
@@ -59,13 +60,16 @@ __global__ void RL(
     {
         if (tid + offset < currentLColSize)
         {
-            unsigned ridx = sym_r_idx_dev[currentLPos + offset];
-
             val_dev[currentLPos + offset] /= val_dev[l_col_ptr_dev[currentCol]];
-            tmpMem[size_t(bid)*n + ridx]= val_dev[currentLPos + offset];
+            if constexpr (Mode == UpdateMode::Scan) {
+                const unsigned ridx = sym_r_idx_dev[currentLPos + offset];
+                tmpMem[size_t(bid)*n + ridx]= val_dev[currentLPos + offset];
+            }
         }
         offset += blockDim.x;
     }
+    // Same-level sources cannot update one another (symbolic U/L dependencies).
+    // Publish normalized L before the block reads it directly in mapped mode.
     __syncthreads();
 
     if constexpr (Mode == UpdateMode::Mapped) {
@@ -75,7 +79,7 @@ __global__ void RL(
             const uint64_t base = map_bases[currentCol] + uint64_t(q-first_target)*currentLColSize;
             for (unsigned i=tid % GLU_GROUP_SIZE; i<currentLColSize; i+=GLU_GROUP_SIZE) {
                 const unsigned source = l_col_ptr_dev[currentCol] + 1 + i;
-                const REAL factor = tmpMem[size_t(bid)*n + sym_r_idx_dev[source]];
+                const REAL factor = val_dev[source];
                 if (factor != REAL(0))
                     atomicAdd(&val_dev[map_destinations[base+i]], -factor*pivot);
             }
@@ -121,21 +125,23 @@ __global__ void RL(
         }
     }
 
-    __syncthreads();
-    //Clear tmpMem
-    offset = 0;
-    while (currentLColSize > offset)
-    {
-        if (tid + offset < currentLColSize)
+    if constexpr (Mode == UpdateMode::Scan) {
+        __syncthreads();
+        //Clear tmpMem
+        offset = 0;
+        while (currentLColSize > offset)
         {
-            unsigned ridx = sym_r_idx_dev[currentLPos + offset];
-            tmpMem[size_t(bid)*n + ridx]= 0;
+            if (tid + offset < currentLColSize)
+            {
+                unsigned ridx = sym_r_idx_dev[currentLPos + offset];
+                tmpMem[size_t(bid)*n + ridx]= 0;
+            }
+            offset += blockDim.x;
         }
-        offset += blockDim.x;
     }
 }
 
-template<bool Perturb = false>
+template<bool Perturb = false, bool UseScratch = true>
 __global__ void RL_onecol_factorizeCurrentCol(
         const unsigned* __restrict__ sym_c_ptr_dev,
         const unsigned* __restrict__ sym_r_idx_dev,
@@ -150,7 +156,8 @@ __global__ void RL_onecol_factorizeCurrentCol(
         const REAL pert = 0)
 {
     val_dev += size_t(blockIdx.y) * value_stride;
-    tmpMem += size_t(blockIdx.y) * scratch_stride;
+    if constexpr (UseScratch)
+        tmpMem += size_t(blockIdx.y) * scratch_stride;
     const int tid = threadIdx.x;
 
     const unsigned currentLColSize = sym_c_ptr_dev[currentCol + 1] - l_col_ptr_dev[currentCol] - 1;
@@ -169,10 +176,11 @@ __global__ void RL_onecol_factorizeCurrentCol(
     {
         if (tid + offset < currentLColSize)
         {
-            unsigned ridx = sym_r_idx_dev[currentLPos + offset];
-
             val_dev[currentLPos + offset] /= val_dev[l_col_ptr_dev[currentCol]];
-            tmpMem[size_t(stream) * n + ridx]= val_dev[currentLPos + offset];
+            if constexpr (UseScratch) {
+                const unsigned ridx = sym_r_idx_dev[currentLPos + offset];
+                tmpMem[size_t(stream) * n + ridx]= val_dev[currentLPos + offset];
+            }
         }
         offset += blockDim.x;
     }
@@ -197,7 +205,8 @@ __global__ void RL_onecol_updateSubmat(
         const unsigned* __restrict__ map_pivots = nullptr)
 {
     val_dev += size_t(blockIdx.y) * value_stride;
-    tmpMem += size_t(blockIdx.y) * scratch_stride;
+    if constexpr (Mode == UpdateMode::Scan)
+        tmpMem += size_t(blockIdx.y) * scratch_stride;
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
     __shared__ REAL s;
@@ -211,7 +220,7 @@ __global__ void RL_onecol_updateSubmat(
         if (tid == 0) s = val_dev[map_pivots[q]];
         __syncthreads();
         for (unsigned i=tid; i<count; i+=blockDim.x) {
-            const REAL factor = tmpMem[size_t(stream)*n + sym_r_idx_dev[lower+i]];
+            const REAL factor = val_dev[lower+i];
             if (factor != REAL(0))
                 atomicAdd(&val_dev[map_destinations[base+i]], -factor*s);
         }
@@ -361,10 +370,12 @@ struct GpuMatrix::Impl {
         unsigned needed = 1;
         for (size_t i=1; i<levels.size(); ++i) {
             const unsigned width = unsigned(levels[i]-levels[i-1]);
+            if (mode == UpdateMode::Mapped && width > 16 && width > unsigned(prop.maxGridSize[0]))
+                throw std::invalid_argument("mapped level width exceeds device grid limit");
             // Small levels execute serially in slot zero.
-            if (width > 16) needed = std::max(needed, width);
+            if (mode == UpdateMode::Scan && width > 16) needed = std::max(needed, width);
         }
-        slots = std::min(requested_slots, needed);
+        slots = mode == UpdateMode::Scan ? std::min(requested_slots, needed) : 0;
         col.upload(a.sym_c_ptr); row.upload(a.sym_r_idx); diag.upload(a.l_col_ptr);
         csr_row.upload(a.csr_r_ptr); csr_col.upload(a.csr_c_idx); csr_diag.upload(a.csr_diag_ptr);
         level_idx.upload(a.level_idx);
@@ -450,13 +461,16 @@ struct GpuTask::Impl {
     explicit Impl(std::shared_ptr<const GpuMatrix::Impl> m, unsigned batch) : matrix(std::move(m)), copies(batch) {
         if (!copies || copies > matrix->max_batch) throw std::invalid_argument("batch size exceeds device grid limit");
         values.allocate(matrix->nnz, copies);
-        scratch.allocate(size_t(matrix->n)*matrix->slots, copies);
+        if (matrix->update_mode == UpdateMode::Scan)
+            scratch.allocate(size_t(matrix->n)*matrix->slots, copies);
         output.allocate(matrix->nnz, copies);
         gpu_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create task stream");
         try {
-            gpu_check(cudaMemsetAsync(scratch.ptr, 0, size_t(matrix->n)*matrix->slots*copies*sizeof(REAL), stream),
-                "initialize scratch");
-            gpu_check(cudaStreamSynchronize(stream), "finish task preparation");
+            if (matrix->update_mode == UpdateMode::Scan) {
+                gpu_check(cudaMemsetAsync(scratch.ptr, 0, size_t(matrix->n)*matrix->slots*copies*sizeof(REAL), stream),
+                    "initialize scratch");
+                gpu_check(cudaStreamSynchronize(stream), "finish task preparation");
+            }
         } catch (...) {
             cudaStreamSynchronize(stream);
             cudaStreamDestroy(stream);
@@ -477,7 +491,9 @@ struct GpuTask::Impl {
                 const unsigned threads = t.copies >= 16
                     ? std::min(default_threads, 128u) : default_threads;
                 for (int offset=0; offset<width;) {
-                    const unsigned blocks = std::min(unsigned(width-offset), a.slots);
+                    // Mapped sources read L directly, so scratch slots impose no chunk limit.
+                    const unsigned blocks = Mode == UpdateMode::Mapped ? unsigned(width-offset)
+                        : std::min(unsigned(width-offset), a.slots);
                     if (!a.perturb)
                         RL<Mode><<<dim3(blocks,t.copies),threads,0,t.stream>>>(a.col.ptr,a.row.ptr,t.values.ptr,a.diag.ptr,
                             a.csr_row.ptr,a.csr_col.ptr,a.csr_diag.ptr,a.level_idx.ptr,t.scratch.ptr,
@@ -496,10 +512,10 @@ struct GpuTask::Impl {
                     const unsigned column = a.columns[p];
                     const unsigned targets = a.csr_rows[column+1]-a.csr_diags[column]-1;
                     if (!a.perturb)
-                        RL_onecol_factorizeCurrentCol<><<<dim3(1,t.copies),column_threads,0,t.stream>>>(a.col.ptr,a.row.ptr,
+                        RL_onecol_factorizeCurrentCol<false, Mode == UpdateMode::Scan><<<dim3(1,t.copies),column_threads,0,t.stream>>>(a.col.ptr,a.row.ptr,
                             t.values.ptr,a.diag.ptr,column,t.scratch.ptr,0,a.n,a.nnz,size_t(a.n)*a.slots);
                     else
-                        RL_onecol_factorizeCurrentCol<true><<<dim3(1,t.copies),column_threads,0,t.stream>>>(a.col.ptr,a.row.ptr,
+                        RL_onecol_factorizeCurrentCol<true, Mode == UpdateMode::Scan><<<dim3(1,t.copies),column_threads,0,t.stream>>>(a.col.ptr,a.row.ptr,
                             t.values.ptr,a.diag.ptr,column,t.scratch.ptr,0,a.n,a.nnz,size_t(a.n)*a.slots,a.threshold);
                     gpu_check(cudaGetLastError(), "launch column factorization");
                     if (targets) {
@@ -508,9 +524,11 @@ struct GpuTask::Impl {
                             a.diag.ptr,a.map_bases.ptr,a.map_destinations.ptr,a.map_pivots.ptr);
                         gpu_check(cudaGetLastError(), "launch column update");
                     }
-                    RL_onecol_cleartmpMem<<<dim3(1,t.copies),column_threads,0,t.stream>>>(a.col.ptr,a.row.ptr,a.diag.ptr,
-                        column,t.scratch.ptr,0,a.n,size_t(a.n)*a.slots);
-                    gpu_check(cudaGetLastError(), "launch scratch clear");
+                    if constexpr (Mode == UpdateMode::Scan) {
+                        RL_onecol_cleartmpMem<<<dim3(1,t.copies),column_threads,0,t.stream>>>(a.col.ptr,a.row.ptr,a.diag.ptr,
+                            column,t.scratch.ptr,0,a.n,size_t(a.n)*a.slots);
+                        gpu_check(cudaGetLastError(), "launch scratch clear");
+                    }
                 }
             }
         }

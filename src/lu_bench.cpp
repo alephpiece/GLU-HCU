@@ -235,7 +235,9 @@ int main(int argc, char** argv) {
         const size_t available=GpuMatrix::free_device_bytes();
         std::cout << "Task device buffers: " << device_bytes << " bytes; pinned buffers: " << pinned_bytes << " bytes\n";
         if (device_bytes > available)
-            throw std::runtime_error("task buffers exceed free device memory; explicitly reduce tasks or tmp slots");
+            throw std::runtime_error(o.updates == UpdateMode::Scan
+                ? "task buffers exceed free device memory; explicitly reduce tasks or tmp slots"
+                : "task buffers exceed free device memory; explicitly reduce tasks");
         std::vector<std::unique_ptr<GpuTask>> tasks;
         tasks.reserve(o.tasks);
         std::vector<size_t> task_template, template_batches(matrices.size(),0);
@@ -409,10 +411,11 @@ int main(int argc, char** argv) {
                     const unsigned width=unsigned(a.level_ptr[lev+1]-a.level_ptr[lev]);
                     max_width=std::max(max_width,width);
                     single_column_levels += width==1;
-                    if (width>16) batched+=(size_t(width)+slots-1)/slots;
+                    if (width>16) batched += o.updates == UpdateMode::Mapped ? 1 : (size_t(width)+slots-1)/slots;
                     else for (int p=a.level_ptr[lev]; p<a.level_ptr[lev+1]; ++p) {
                         const unsigned col=a.level_idx[p];
-                        ++factor; ++clear;
+                        ++factor;
+                        clear += o.updates == UpdateMode::Scan;
                         update += a.csr_r_ptr[col+1]-a.csr_diag_ptr[col]-1>0;
                     }
                 }

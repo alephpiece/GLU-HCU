@@ -95,7 +95,7 @@ foreach(execution direct graph)
     string(JSON bytes GET "${mapped}" update_map_bytes)
     string(JSON shared GET "${mapped}" shared_device_bytes)
     string(JSON ordering GET "${mapped}" ordering)
-    if(NOT checked EQUAL 7 OR NOT launches EQUAL 16 OR NOT threads EQUAL 3 OR
+    if(NOT checked EQUAL 7 OR NOT launches EQUAL 9 OR NOT threads EQUAL 3 OR
        NOT bytes GREATER 0 OR shared LESS bytes OR NOT ordering STREQUAL "parallel-batches")
         message(FATAL_ERROR "mapped parallel accounting incorrect")
     endif()
@@ -146,6 +146,21 @@ math(EXPR bytes "33 * ${bits} / 8")
 if(NOT mode STREQUAL "full" OR NOT residual_type STREQUAL "NUMBER" OR
    NOT launches EQUAL 5 OR NOT h2d EQUAL bytes OR NOT d2h EQUAL bytes)
     message(FATAL_ERROR "incorrect full validation, wide launch count or transfer bytes")
+endif()
+# Mapped uses one whole-level launch and no scratch, regardless of the slot cap.
+execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/wide.mtx"
+    --updates mapped --tmp-slots 8 --warmup 0 --loops 1 --diagnostics
+    --output "${TEST_DIRECTORY}/wide-mapped.json"
+    RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 60)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "wide mapped diagnostic failed: ${output}${error}")
+endif()
+file(READ "${TEST_DIRECTORY}/wide-mapped.json" mapped_wide)
+string(JSON launches GET "${mapped_wide}" launches_per_loop)
+string(JSON slots GET "${mapped_wide}" templates 0 effective_tmp_slots)
+string(JSON residual GET "${mapped_wide}" max_factor_residual)
+if(NOT launches EQUAL 1 OR NOT slots EQUAL 0 OR NOT residual EQUAL 0)
+    message(FATAL_ERROR "incorrect mapped wide-level launch/scratch accounting")
 endif()
 execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" --check none
     RESULT_VARIABLE status OUTPUT_QUIET ERROR_QUIET)
