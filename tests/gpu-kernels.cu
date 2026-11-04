@@ -221,13 +221,15 @@ void test_batched(const Matrix& matrix, unsigned threads, bool perturb, const st
     DeviceMatrix device(matrix);
     const unsigned blocks = matrix.sources.size();
     if (perturb)
-        RL_perturb<<<blocks, threads>>>(device.column.data(), device.row.data(), device.values.data(),
-            device.diagonal.data(), device.csr_row.data(), device.csr_column.data(), device.csr_diagonal.data(),
-            device.sources.data(), device.temporary.data(), matrix.n, 0, 0, threshold);
+        RL<UpdateMode::Scan, true><<<blocks, threads>>>(
+            device.column.data(), device.row.data(), device.values.data(), device.diagonal.data(),
+            device.csr_row.data(), device.csr_column.data(), device.csr_diagonal.data(), device.sources.data(),
+            device.temporary.data(), matrix.n, 0, 0, 0, 0, threshold);
     else
-        RL<<<blocks, threads>>>(device.column.data(), device.row.data(), device.values.data(),
-            device.diagonal.data(), device.csr_row.data(), device.csr_column.data(), device.csr_diagonal.data(),
-            device.sources.data(), device.temporary.data(), matrix.n, 0, 0);
+        RL<UpdateMode::Scan><<<blocks, threads>>>(
+            device.column.data(), device.row.data(), device.values.data(), device.diagonal.data(),
+            device.csr_row.data(), device.csr_column.data(), device.csr_diagonal.data(), device.sources.data(),
+            device.temporary.data(), matrix.n, 0, 0);
     check_gpu(cudaGetLastError(), "launch batched kernel");
     verify(device, matrix, perturb, threshold);
     std::cout << "PASS " << name << '\n';
@@ -241,17 +243,17 @@ void test_one_column(const Matrix& matrix, bool perturb, const std::string& name
     for (size_t slot = 0; slot < matrix.sources.size(); ++slot) {
         const unsigned source = matrix.sources[slot];
         if (perturb)
-            RL_onecol_factorizeCurrentCol_perturb<<<1, threads, 0, streams[slot].value>>>(
-                device.column.data(), device.row.data(), device.values.data(), device.diagonal.data(),
-                source, device.temporary.data(), slot, matrix.n, threshold);
+            RL_onecol_factorizeCurrentCol<true><<<1, threads, 0, streams[slot].value>>>(
+                device.column.data(), device.row.data(), device.values.data(), device.diagonal.data(), source,
+                device.temporary.data(), slot, matrix.n, 0, 0, threshold);
         else
-            RL_onecol_factorizeCurrentCol<<<1, threads, 0, streams[slot].value>>>(
-                device.column.data(), device.row.data(), device.values.data(), device.diagonal.data(),
-                source, device.temporary.data(), slot, matrix.n);
+            RL_onecol_factorizeCurrentCol<><<<1, threads, 0, streams[slot].value>>>(
+                device.column.data(), device.row.data(), device.values.data(), device.diagonal.data(), source,
+                device.temporary.data(), slot, matrix.n);
         check_gpu(cudaGetLastError(), "launch factor kernel");
         const unsigned targets = matrix.csr_row[source + 1] - matrix.csr_diagonal[source] - 1;
         if (targets) {
-            RL_onecol_updateSubmat<<<targets, threads, 0, streams[slot].value>>>(
+            RL_onecol_updateSubmat<UpdateMode::Scan><<<targets, threads, 0, streams[slot].value>>>(
                 device.column.data(), device.row.data(), device.values.data(), device.csr_column.data(),
                 device.csr_diagonal.data(), source, device.temporary.data(), slot, matrix.n);
             check_gpu(cudaGetLastError(), "launch update kernel");
@@ -289,7 +291,25 @@ void test_limited_slots()
 }
 
 
-void test_repeated_tasks(bool graph = false, unsigned copies = 1)
+void verify_template_bytes(const GpuMatrix& gpu, const Symbolic_Matrix& matrix, UpdateMode mode)
+{
+    const size_t structure = sizeof(unsigned)*(matrix.sym_c_ptr.size()+matrix.sym_r_idx.size()+
+        matrix.l_col_ptr.size()+matrix.csr_r_ptr.size()+matrix.csr_c_idx.size()+matrix.csr_diag_ptr.size())+
+        sizeof(int)*matrix.level_idx.size();
+    uint64_t updates = 0;
+    for (unsigned c=0; c<matrix.n; ++c)
+        updates += uint64_t(matrix.sym_c_ptr[c+1]-matrix.l_col_ptr[c]-1)*
+                   (matrix.csr_r_ptr[c+1]-matrix.csr_diag_ptr[c]-1);
+    const size_t map = mode == UpdateMode::Mapped
+        ? sizeof(uint64_t)*(size_t(matrix.n)+1)+sizeof(unsigned)*(size_t(updates)+matrix.csr_c_idx.size()) : 0;
+    if (gpu.update_map_bytes() != map || gpu.shared_device_bytes() != structure+map)
+        throw std::runtime_error("incorrect template device byte accounting");
+    if (!std::isfinite(gpu.update_map_setup_ms()) || gpu.update_map_setup_ms() < 0 ||
+        (mode == UpdateMode::Scan && gpu.update_map_setup_ms() != 0))
+        throw std::runtime_error("incorrect map setup timing");
+}
+
+void test_repeated_tasks(bool graph = false, unsigned copies = 1, UpdateMode mode = UpdateMode::Scan)
 {
     std::ostringstream out, err;
     std::vector<std::unique_ptr<GpuTask>> tasks;
@@ -315,7 +335,8 @@ void test_repeated_tasks(bool graph = false, unsigned copies = 1)
         Symbolic_Matrix a(n,out,err);
         a.fill_in(row.data(),col.data()); a.csr();
         a.predictLU(row.data(),col.data(),val.data()); a.leveling();
-        GpuMatrix matrix(a, variant ? 3 : 1, false);
+        GpuMatrix matrix(a, variant ? 3 : 1, false, mode);
+        verify_template_bytes(matrix, a, mode);
         if (matrix.tmp_slots() != (variant ? 3u : 1u)) throw std::runtime_error("wrong scratch cap");
         for (unsigned copy=0; copy<2; ++copy) {
             tasks.emplace_back(new GpuTask(matrix, copies));
@@ -343,7 +364,24 @@ void test_repeated_tasks(bool graph = false, unsigned copies = 1)
                     expected[i], "repeated independent tasks");
         }
     }
-    std::cout << "PASS host/repeated-mixed-tasks-and-template-lifetime\n";
+    std::cout << "PASS host/repeated-mixed-tasks-and-template-lifetime/"
+              << (mode == UpdateMode::Scan ? "scan" : "mapped") << '\n';
+}
+
+void test_zero_update_map()
+{
+    unsigned column[]{0, 1, 2}, row[]{0, 1};
+    double values[]{2, 4};
+    std::ostringstream out, err;
+    Symbolic_Matrix matrix(2, out, err);
+    matrix.fill_in(row, column); matrix.csr();
+    matrix.predictLU(row, column, values); matrix.leveling();
+    GpuMatrix gpu(matrix, 1, false, UpdateMode::Mapped);
+    verify_template_bytes(gpu, matrix, UpdateMode::Mapped);
+    GpuTask task(gpu);
+    task.prepare_graph(); task.enqueue(); task.wait(); task.check();
+    compare(std::vector<REAL>(task.factors(), task.factors()+2), {REAL(2),REAL(4)}, "empty update map");
+    std::cout << "PASS host/mapped-zero-update-entries\n";
 }
 
 void test_distinct_copies(bool one_column, bool perturb)
@@ -364,26 +402,183 @@ void test_distinct_copies(bool one_column, bool perturb)
     Stream stream;
     if (one_column) {
         if (perturb)
-            RL_onecol_factorizeCurrentCol_perturb<<<dim3(1,copies),1024,0,stream.value>>>(
-                col.data(),row.data(),values.data(),diag.data(),0,scratch.data(),1,n,REAL(2),nnz,n*slots);
+            RL_onecol_factorizeCurrentCol<true><<<dim3(1,copies),1024,0,stream.value>>>(
+                col.data(), row.data(), values.data(), diag.data(), 0, scratch.data(), 1, n, nnz, n*slots,
+                REAL(2));
         else
-            RL_onecol_factorizeCurrentCol<<<dim3(1,copies),1024,0,stream.value>>>(
-                col.data(),row.data(),values.data(),diag.data(),0,scratch.data(),1,n,nnz,n*slots);
-        RL_onecol_updateSubmat<<<dim3(1,copies),1024,0,stream.value>>>(
-            col.data(),row.data(),values.data(),csr_col.data(),csr_diag.data(),0,scratch.data(),1,n,nnz,n*slots);
+            RL_onecol_factorizeCurrentCol<><<<dim3(1,copies),1024,0,stream.value>>>(
+                col.data(), row.data(), values.data(), diag.data(), 0, scratch.data(), 1, n, nnz, n*slots);
+        RL_onecol_updateSubmat<UpdateMode::Scan><<<dim3(1,copies),1024,0,stream.value>>>(
+            col.data(), row.data(), values.data(), csr_col.data(), csr_diag.data(), 0, scratch.data(), 1, n, nnz,
+            n*slots);
         RL_onecol_cleartmpMem<<<dim3(1,copies),1024,0,stream.value>>>(
             col.data(),row.data(),diag.data(),0,scratch.data(),1,n,n*slots);
     } else if (perturb)
-        RL_perturb<<<dim3(1,copies),64,0,stream.value>>>(col.data(),row.data(),values.data(),diag.data(),
-            csr_row.data(),csr_col.data(),csr_diag.data(),levels.data(),scratch.data(),n,0,0,REAL(2),nnz,n*slots);
+        RL<UpdateMode::Scan, true><<<dim3(1,copies),64,0,stream.value>>>(
+            col.data(), row.data(), values.data(), diag.data(), csr_row.data(), csr_col.data(), csr_diag.data(),
+            levels.data(), scratch.data(), n, 0, 0, nnz, n*slots, REAL(2));
     else
-        RL<<<dim3(1,copies),64,0,stream.value>>>(col.data(),row.data(),values.data(),diag.data(),
-            csr_row.data(),csr_col.data(),csr_diag.data(),levels.data(),scratch.data(),n,0,0,nnz,n*slots);
+        RL<UpdateMode::Scan><<<dim3(1,copies),64,0,stream.value>>>(
+            col.data(), row.data(), values.data(), diag.data(), csr_row.data(), csr_col.data(), csr_diag.data(),
+            levels.data(), scratch.data(), n, 0, 0, nnz, n*slots);
     check_gpu(cudaGetLastError(), "launch distinct-copy kernels");
     check_gpu(cudaStreamSynchronize(stream.value), "wait distinct copies");
     compare(values.read(),expected,"distinct batch values");
     compare(scratch.read(),std::vector<REAL>(n*slots*copies,REAL(0)),"distinct batch scratch cleanup");
     std::cout << "PASS distinct batch copies " << one_column << ' ' << perturb << '\n';
+}
+
+// Unlike make_matrix(), this pattern contains every source L row in each of
+// its targets. Sources are independent and have unequal L lengths (65/33/1/0),
+// but update overlapping target entries. The empty source still has targets.
+Matrix make_mapped_matrix(bool perturb, unsigned copy)
+{
+    Matrix matrix;
+    matrix.n = 100;
+    matrix.sources = {2, 5, 8, 11};
+    const unsigned lengths[] = {65, 33, 1, 0};
+    const unsigned targets[] = {5, 3, 4, 2};
+    std::vector<std::vector<std::pair<unsigned, REAL>>> columns(matrix.n);
+    for (unsigned c=0; c<matrix.n; ++c)
+        columns[c].emplace_back(c, REAL(4));
+    for (unsigned s=0; s<matrix.sources.size(); ++s) {
+        const unsigned c = matrix.sources[s];
+        columns[c][0].second = perturb ? (s % 2 ? REAL(-1e-12) : REAL(0))
+                                      : REAL(2u << (s+copy));
+        for (unsigned i=0; i<lengths[s]; ++i)
+            columns[c].emplace_back(20+i, REAL(int(i % 7)-3)*REAL(copy+1)/REAL(8));
+    }
+    for (unsigned t=0; t<5; ++t) {
+        const unsigned c = 90+t;
+        std::vector<unsigned> rows{0, 6, 87, c};
+        for (unsigned s=0; s<matrix.sources.size(); ++s) {
+            if (t >= targets[s]) continue;
+            rows.push_back(matrix.sources[s]);
+            for (unsigned i=0; i<lengths[s]; ++i) rows.push_back(20+i);
+        }
+        std::sort(rows.begin(), rows.end());
+        rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+        columns[c].clear();
+        for (unsigned row : rows)
+            columns[c].emplace_back(row, REAL(0.5)+REAL(row % 7)/REAL(16)+
+                                         REAL(t)/REAL(32)+REAL(copy)/REAL(8));
+    }
+    matrix.column.push_back(0);
+    matrix.diagonal.resize(matrix.n);
+    std::vector<std::vector<unsigned>> rows(matrix.n);
+    for (unsigned c=0; c<matrix.n; ++c) {
+        for (const auto& entry : columns[c]) {
+            if (entry.first == c) matrix.diagonal[c] = matrix.row.size();
+            matrix.row.push_back(entry.first);
+            matrix.values.push_back(entry.second);
+            rows[entry.first].push_back(c);
+        }
+        matrix.column.push_back(matrix.row.size());
+    }
+    matrix.csr_row.push_back(0);
+    matrix.csr_diagonal.resize(matrix.n);
+    for (unsigned row=0; row<matrix.n; ++row) {
+        for (unsigned c : rows[row]) {
+            if (c == row) matrix.csr_diagonal[row] = matrix.csr_column.size();
+            matrix.csr_column.push_back(c);
+        }
+        matrix.csr_row.push_back(matrix.csr_column.size());
+    }
+    return matrix;
+}
+
+void test_mapped(bool one_column, bool perturb, unsigned threads)
+{
+    const unsigned copies = 3, slots = 2;
+    const REAL threshold = REAL(0.5);
+    const Matrix matrix = make_mapped_matrix(perturb, 0);
+    const size_t nnz = matrix.values.size(), stride = size_t(matrix.n)*slots;
+    // Use a dense coordinate lookup as an independent map oracle, rather than
+    // duplicating the production builder's sorted-column merge.
+    const unsigned missing = std::numeric_limits<unsigned>::max();
+    std::vector<unsigned> positions(size_t(matrix.n)*matrix.n, missing);
+    for (unsigned c=0; c<matrix.n; ++c)
+        for (unsigned p=matrix.column[c]; p<matrix.column[c+1]; ++p)
+            positions[size_t(c)*matrix.n+matrix.row[p]] = p;
+    std::vector<uint64_t> bases(matrix.n+1);
+    std::vector<unsigned> destinations, pivots(matrix.csr_column.size(), missing);
+    for (unsigned c=0; c<matrix.n; ++c) {
+        bases[c] = destinations.size();
+        for (unsigned q=matrix.csr_diagonal[c]+1; q<matrix.csr_row[c+1]; ++q) {
+            const unsigned target = matrix.csr_column[q];
+            pivots[q] = positions[size_t(target)*matrix.n+c];
+            if (pivots[q] == missing) throw std::runtime_error("mapped fixture missing U entry");
+            for (unsigned p=matrix.diagonal[c]+1; p<matrix.column[c+1]; ++p) {
+                const unsigned destination = positions[size_t(target)*matrix.n+matrix.row[p]];
+                if (destination == missing) throw std::runtime_error("mapped fixture is not closed");
+                destinations.push_back(destination);
+            }
+        }
+    }
+    bases[matrix.n] = destinations.size();
+    std::vector<REAL> input, expected;
+    for (unsigned copy=0; copy<copies; ++copy) {
+        const Matrix distinct = make_mapped_matrix(perturb, copy);
+        input.insert(input.end(), distinct.values.begin(), distinct.values.end());
+        const auto result = reference_update(distinct, perturb, threshold);
+        expected.insert(expected.end(), result.begin(), result.end());
+    }
+    DeviceBuffer<unsigned> column(matrix.column), row(matrix.row), diagonal(matrix.diagonal);
+    DeviceBuffer<unsigned> csr_row(matrix.csr_row), csr_column(matrix.csr_column), csr_diagonal(matrix.csr_diagonal);
+    DeviceBuffer<uint64_t> map_bases(bases);
+    DeviceBuffer<unsigned> map_destinations(destinations), map_pivots(pivots);
+    // Nonzero levelHead plus a second chunk exercises both source-list offsets.
+    DeviceBuffer<int> sources(std::vector<int>{0, 2, 5, 8, 11});
+    DeviceBuffer<REAL> values(input), scratch(stride*copies);
+    Stream stream;
+    for (unsigned repeat=0; repeat<2; ++repeat) {
+        // Restore values only: scratch must remain reusable without a memset.
+        check_gpu(cudaMemcpy(values.data(), input.data(), input.size()*sizeof(REAL),
+                             cudaMemcpyHostToDevice), "restore mapped inputs");
+        if (one_column) {
+            for (int c : matrix.sources) {
+                if (perturb)
+                    RL_onecol_factorizeCurrentCol<true><<<dim3(1,copies),threads,0,stream.value>>>(
+                        column.data(), row.data(), values.data(), diagonal.data(), c, scratch.data(), 0,
+                        matrix.n, nnz, stride, threshold);
+                else
+                    RL_onecol_factorizeCurrentCol<><<<dim3(1,copies),threads,0,stream.value>>>(
+                        column.data(), row.data(), values.data(), diagonal.data(), c, scratch.data(), 0,
+                        matrix.n, nnz, stride);
+                check_gpu(cudaGetLastError(), "launch mapped source normalization");
+                const unsigned targets = matrix.csr_row[c+1]-matrix.csr_diagonal[c]-1;
+                RL_onecol_updateSubmat<UpdateMode::Mapped><<<dim3(targets,copies),threads,0,stream.value>>>(
+                    column.data(), row.data(), values.data(), csr_column.data(), csr_diagonal.data(), c,
+                    scratch.data(), 0, matrix.n, nnz, stride, diagonal.data(), map_bases.data(),
+                    map_destinations.data(), map_pivots.data());
+                check_gpu(cudaGetLastError(), "launch mapped column update");
+                RL_onecol_cleartmpMem<<<dim3(1,copies),threads,0,stream.value>>>(
+                    column.data(),row.data(),diagonal.data(),c,scratch.data(),0,matrix.n,stride);
+                check_gpu(cudaGetLastError(), "launch mapped scratch clear");
+            }
+        } else {
+            for (unsigned offset : {0u, 2u}) {
+                if (perturb)
+                    RL<UpdateMode::Mapped, true><<<dim3(slots,copies),threads,0,stream.value>>>(
+                        column.data(), row.data(), values.data(), diagonal.data(), csr_row.data(),
+                        csr_column.data(), csr_diagonal.data(), sources.data(), scratch.data(), matrix.n, 1,
+                        offset, nnz, stride, threshold, map_bases.data(), map_destinations.data(),
+                        map_pivots.data());
+                else
+                    RL<UpdateMode::Mapped><<<dim3(slots,copies),threads,0,stream.value>>>(
+                        column.data(), row.data(), values.data(), diagonal.data(), csr_row.data(),
+                        csr_column.data(), csr_diagonal.data(), sources.data(), scratch.data(), matrix.n, 1,
+                        offset, nnz, stride, 0, map_bases.data(), map_destinations.data(), map_pivots.data());
+                check_gpu(cudaGetLastError(), "launch mapped level chunk");
+            }
+        }
+        check_gpu(cudaStreamSynchronize(stream.value), "wait mapped kernels");
+        compare(values.read(), expected, "mapped factors and distinct copies");
+        for (REAL value : scratch.read())
+            if (value != REAL(0)) throw std::runtime_error("mapped scratch was not cleared");
+    }
+    std::cout << "PASS mapped/" << (one_column ? "one-column/" : "RL/")
+              << (perturb ? "perturb/" : "plain/") << threads << '\n';
 }
 
 void test_invalid_factor(REAL value, const char* diagnostic)
@@ -406,7 +601,7 @@ void test_invalid_factor(REAL value, const char* diagnostic)
 int main()
 {
     try {
-        check_gpu(cudaSetDevice(0), "select device");
+        GpuMatrix::select_device();
         cudaDeviceProp properties;
         check_gpu(cudaGetDeviceProperties(&properties, 0), "inspect device");
         std::cout << "Device: " << properties.name << ", warp size: " << properties.warpSize
@@ -424,14 +619,21 @@ int main()
         test_batched(empty_lower, 64, true, "RL_perturb/empty-lower");
         test_one_column(empty_lower, true, "one-column/empty-lower");
         test_limited_slots();
-        test_repeated_tasks();
-        test_repeated_tasks(true);
-        test_repeated_tasks(false,3);
-        test_repeated_tasks(true,3);
-        test_repeated_tasks(false,16);
-        test_repeated_tasks(true,16);
+        for (UpdateMode mode : {UpdateMode::Scan, UpdateMode::Mapped}) {
+            test_repeated_tasks(false,1,mode);
+            test_repeated_tasks(true,1,mode);
+            test_repeated_tasks(false,3,mode);
+            test_repeated_tasks(true,3,mode);
+            test_repeated_tasks(false,16,mode);
+            test_repeated_tasks(true,16,mode);
+        }
+        test_zero_update_map();
         for (bool one_column : {false,true})
             for (bool perturb : {false,true}) test_distinct_copies(one_column,perturb);
+        for (bool perturb : {false,true}) {
+            for (unsigned threads : {64u, 128u, 1024u}) test_mapped(false,perturb,threads);
+            for (unsigned threads : {64u, 256u, 1024u}) test_mapped(true,perturb,threads);
+        }
         test_invalid_factor(REAL(0), "zero diagonal");
         test_invalid_factor(std::numeric_limits<REAL>::quiet_NaN(), "NaN/Inf");
         std::cout << "All GPU numeric cases passed.\n";

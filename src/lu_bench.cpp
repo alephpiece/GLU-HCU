@@ -2,6 +2,8 @@
 #include "preprocess.h"
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
+#include <ctime>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -13,12 +15,22 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
+#include <atomic>
+#include <future>
+#include <utility>
 
 namespace {
 using Clock = std::chrono::steady_clock;
 double elapsed(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now()-start).count();
+}
+double thread_cpu_ms() {
+    timespec time{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) != 0)
+        throw std::system_error(errno, std::generic_category(), "read submitting thread CPU time");
+    return double(time.tv_sec)*1000.0 + double(time.tv_nsec)*1e-6;
 }
 struct Options {
     std::vector<std::string> inputs;
@@ -26,6 +38,8 @@ struct Options {
     std::string workload;
     size_t tasks = 0, warmup = 5, loops = 30;
     unsigned slots = 32, batch_size = 1;
+    size_t submit_threads = 1;
+    UpdateMode updates = UpdateMode::Scan;
     std::string output;
     std::string check = "full";
     bool diagnostics = false;
@@ -101,6 +115,12 @@ Options parse(int argc, char** argv) {
         else if (key == "--tasks") o.tasks=number(value);
         else if (key == "--warmup") o.warmup=number(value,true);
         else if (key == "--loops") o.loops=number(value);
+        else if (key == "--submit-threads") o.submit_threads=number(value);
+        else if (key == "--updates") {
+            if (value == "scan") o.updates=UpdateMode::Scan;
+            else if (value == "mapped") o.updates=UpdateMode::Mapped;
+            else throw std::invalid_argument("updates must be scan or mapped");
+        }
         else if (key == "--batch-size") {
             const size_t count=number(value);
             if (count>std::numeric_limits<unsigned>::max()) throw std::invalid_argument("batch size overflow");
@@ -147,7 +167,7 @@ struct Matrix {
     NicsState nics;
     std::unique_ptr<Symbolic_Matrix> symbolic;
     std::unique_ptr<GpuMatrix> gpu;
-    Matrix(const std::string& path, unsigned slots) {
+    Matrix(const std::string& path, unsigned slots, UpdateMode updates) {
         InputArrays a;
         if (preprocess(path.c_str(), &nics.state, &a.values, &a.rows, &a.columns))
             throw std::runtime_error("preprocess failed: " + path);
@@ -157,7 +177,7 @@ struct Matrix {
         symbolic->csr();
         symbolic->predictLU(a.rows,a.columns,a.values);
         symbolic->leveling();
-        gpu.reset(new GpuMatrix(*symbolic,slots));
+        gpu.reset(new GpuMatrix(*symbolic,slots,false,updates));
     }
 };
 
@@ -189,6 +209,7 @@ int main(int argc, char** argv) {
         std::cout << "Usage: glu_bench (-i MATRIX [-i MATRIX ...] [--tasks N] | --workload FILE)\n"
                   << "  [--warmup 5] [--loops 30] [--tmp-slots 32] [--output result.json]\n"
                   << "  [--check full|basic] [--diagnostics] [--graph] [--batch-size 1]\n"
+                  << "  [--updates scan|mapped] [--submit-threads 1]\n"
                   << "One stream per homogeneous batch; explicit logical workload or round-robin inputs; no perturbation.\n";
         return 0;
     }
@@ -196,8 +217,14 @@ int main(int argc, char** argv) {
         const Options o=parse(argc,argv);
         const auto setup_start=Clock::now();
         std::vector<std::unique_ptr<Matrix>> matrices;
-        for (const auto& path : o.inputs) matrices.emplace_back(new Matrix(path,o.slots));
-        size_t device_bytes=0, pinned_bytes=0;
+        for (const auto& path : o.inputs) matrices.emplace_back(new Matrix(path,o.slots,o.updates));
+        size_t device_bytes=0, pinned_bytes=0, shared_device_bytes=0, update_map_bytes=0;
+        double update_map_setup_ms=0;
+        for (const auto& m : matrices) {
+            add_bytes(shared_device_bytes,m->gpu->shared_device_bytes());
+            add_bytes(update_map_bytes,m->gpu->update_map_bytes());
+            update_map_setup_ms+=m->gpu->update_map_setup_ms();
+        }
         for (const auto& m : matrices) add_bytes(pinned_bytes,m->gpu->task_host_bytes());
         for (size_t i=0; i<matrices.size(); ++i) {
             const auto& g=*matrices[i]->gpu;
@@ -233,22 +260,72 @@ int main(int argc, char** argv) {
         if (o.graph) for (auto& t : tasks) t->prepare_graph();
         const double graph_setup_ms=o.graph ? elapsed(graph_start) : 0;
         const double setup_ms=elapsed(setup_start);
+        const size_t submit_threads=std::min(o.submit_threads,tasks.size());
+        double worker_cpu_ms=0, worker_max_wall_ms=0;
+        auto submit = [&]() {
+            worker_cpu_ms=0; worker_max_wall_ms=0;
+            if (submit_threads==1) {
+                for (auto& task : tasks) task->enqueue();
+                return;
+            }
+            // Each task has one submitting worker. All workers finish before
+            // the main thread starts the stream waits or the next LOOP.
+            std::atomic<size_t> next{0};
+            std::vector<std::future<std::pair<double,double>>> futures;
+            futures.reserve(submit_threads);
+            for (size_t worker=0; worker<submit_threads; ++worker) {
+                futures.push_back(std::async(std::launch::async,[&]() {
+                    const auto start=Clock::now();
+                    const double cpu_start=o.diagnostics ? thread_cpu_ms() : 0;
+                    GpuMatrix::select_device();
+                    for (;;) {
+                        const size_t index=next.fetch_add(1,std::memory_order_relaxed);
+                        if (index>=tasks.size()) break;
+                        tasks[index]->enqueue();
+                    }
+                    return std::make_pair(o.diagnostics ? thread_cpu_ms()-cpu_start : 0,
+                                          o.diagnostics ? elapsed(start) : 0);
+                }));
+            }
+            std::exception_ptr failure;
+            for (auto& future : futures) {
+                try {
+                    const auto sample=future.get();
+                    worker_cpu_ms+=sample.first;
+                    worker_max_wall_ms=std::max(worker_max_wall_ms,sample.second);
+                } catch (...) { if (!failure) failure=std::current_exception(); }
+            }
+            if (failure) std::rethrow_exception(failure);
+        };
         auto loop = [&]() {
-            for (auto& t : tasks) t->enqueue();
+            submit();
             for (auto& t : tasks) t->wait();
         };
         const auto warmup_start=Clock::now();
         for (size_t i=0; i<o.warmup; ++i) loop();
         const double warmup_ms=elapsed(warmup_start);
         std::vector<double> loop_ms(o.loops), submit_ms, drain_ms;
-        if (o.diagnostics) { submit_ms.resize(o.loops); drain_ms.resize(o.loops); }
+        std::vector<double> submit_thread_cpu_ms, drain_thread_cpu_ms;
+        std::vector<double> submit_workers_cpu_ms, submit_worker_max_wall_ms;
+        if (o.diagnostics) {
+            submit_ms.resize(o.loops); drain_ms.resize(o.loops);
+            submit_thread_cpu_ms.resize(o.loops); drain_thread_cpu_ms.resize(o.loops);
+            submit_workers_cpu_ms.resize(o.loops); submit_worker_max_wall_ms.resize(o.loops);
+        }
         for (size_t i=0; i<o.loops; ++i) {
             const auto start=Clock::now();
             if (o.diagnostics) {
-                for (auto& t : tasks) t->enqueue();
+                const double cpu_start=thread_cpu_ms();
+                submit();
                 const auto submitted=Clock::now();
+                const double cpu_submitted=thread_cpu_ms();
                 for (auto& t : tasks) t->wait();
                 const auto finished=Clock::now();
+                const double cpu_finished=thread_cpu_ms();
+                submit_workers_cpu_ms[i]=worker_cpu_ms;
+                submit_worker_max_wall_ms[i]=worker_max_wall_ms;
+                submit_thread_cpu_ms[i]=cpu_submitted-cpu_start;
+                drain_thread_cpu_ms[i]=cpu_finished-cpu_submitted;
                 submit_ms[i]=std::chrono::duration<double,std::milli>(submitted-start).count();
                 drain_ms[i]=std::chrono::duration<double,std::milli>(finished-submitted).count();
                 loop_ms[i]=std::chrono::duration<double,std::milli>(finished-start).count();
@@ -299,11 +376,15 @@ int main(int argc, char** argv) {
                << ", \"real_bits\": " << sizeof(REAL)*8
                << ", \"device\": " << quoted(matrices[0]->gpu->device_name())
                << ",\n  \"schedule\": " << quoted(o.batch_size==1 ? "one-stream-per-task" : "one-stream-per-batch")
-               << ", \"submission\": " << quoted(o.graph ? "single-host-thread-graph" : "single-host-thread-direct") << ','
+               << ", \"submission\": " << quoted(submit_threads>1 ? (o.graph ? "parallel-host-thread-graph" : "parallel-host-thread-direct") : (o.graph ? "single-host-thread-graph" : "single-host-thread-direct")) << ','
                << "\n  \"tasks\": " << o.tasks << ", \"streams\": " << tasks.size()
+               << ", \"updates\": " << quoted(o.updates==UpdateMode::Mapped ? "mapped" : "scan")
+               << ", \"submit_threads\": " << o.submit_threads << ", \"actual_submit_threads\": " << submit_threads
                << ", \"warmup\": " << o.warmup << ", \"loops\": " << o.loops
                << ", \"requested_tmp_slots\": " << o.slots << ", \"batch_size\": " << o.batch_size
                << ",\n  \"task_device_bytes\": " << device_bytes << ", \"pinned_bytes\": " << pinned_bytes
+               << ", \"shared_device_bytes\": " << shared_device_bytes << ", \"update_map_bytes\": " << update_map_bytes
+               << ", \"update_map_setup_ms\": " << update_map_setup_ms
                << ",\n  \"setup_ms\": " << setup_ms << ", \"validation_ms\": " << check_ms
                << ", \"graph\": " << (o.graph ? "true" : "false") << ", \"graph_setup_ms\": " << graph_setup_ms << ", \"warmup_ms\": " << warmup_ms
                << ", \"ms_per_loop\": " << total_ms/o.loops
@@ -351,10 +432,18 @@ int main(int argc, char** argv) {
             for (size_t i=0; i<o.loops; ++i) { if(i) report << ','; report << submit_ms[i]; }
             report << "],\n  \"drain_ms\": [";
             for (size_t i=0; i<o.loops; ++i) { if(i) report << ','; report << drain_ms[i]; }
+            report << "],\n  \"submit_thread_cpu_ms\": [";
+            for (size_t i=0; i<o.loops; ++i) { if(i) report << ','; report << submit_thread_cpu_ms[i]; }
+            report << "],\n  \"submit_workers_cpu_ms\": [";
+            for (size_t i=0; i<o.loops; ++i) { if(i) report << ','; report << submit_workers_cpu_ms[i]; }
+            report << "],\n  \"submit_worker_max_wall_ms\": [";
+            for (size_t i=0; i<o.loops; ++i) { if(i) report << ','; report << submit_worker_max_wall_ms[i]; }
+            report << "],\n  \"drain_thread_cpu_ms\": [";
+            for (size_t i=0; i<o.loops; ++i) { if(i) report << ','; report << drain_thread_cpu_ms[i]; }
             report << ']';
         }
-        report << ",\n  \"ordering\": " << quoted(o.batch_size==1
-            ? "logical-task-order" : "template-interleaved-batches");
+        report << ",\n  \"ordering\": " << quoted(submit_threads>1 ? "parallel-batches" : (o.batch_size==1
+            ? "logical-task-order" : "template-interleaved-batches"));
         report << ",\n  \"batch_templates\": [";
         for (size_t i=0; i<tasks.size(); ++i) { if(i) report << ','; report << task_template[i]; }
         report << "],\n  \"batch_sizes\": [";
