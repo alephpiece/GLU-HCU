@@ -48,6 +48,15 @@ struct Options {
         return task_templates.empty() ? task%inputs.size() : task_templates[task];
     }
 };
+const char* update_name(UpdateMode mode) {
+    switch(mode) {
+        case UpdateMode::Scan:return "scan";
+        case UpdateMode::Mapped:return "mapped";
+        case UpdateMode::Panel:return "panel";
+        case UpdateMode::PanelMmac:return "mmac";
+    }
+    throw std::invalid_argument("invalid update mode");
+}
 size_t number(const std::string& value, bool zero = false) {
     if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
         throw std::invalid_argument("expected an unsigned integer: " + value);
@@ -119,7 +128,9 @@ Options parse(int argc, char** argv) {
         else if (key == "--updates") {
             if (value == "scan") o.updates=UpdateMode::Scan;
             else if (value == "mapped") o.updates=UpdateMode::Mapped;
-            else throw std::invalid_argument("updates must be scan or mapped");
+            else if (value == "panel") o.updates=UpdateMode::Panel;
+            else if (value == "mmac") o.updates=UpdateMode::PanelMmac;
+            else throw std::invalid_argument("updates must be scan, mapped, panel or mmac");
         }
         else if (key == "--batch-size") {
             const size_t count=number(value);
@@ -209,7 +220,7 @@ int main(int argc, char** argv) {
         std::cout << "Usage: glu_bench (-i MATRIX [-i MATRIX ...] [--tasks N] | --workload FILE)\n"
                   << "  [--warmup 5] [--loops 30] [--tmp-slots 32] [--output result.json]\n"
                   << "  [--check full|basic] [--diagnostics] [--graph] [--batch-size 1]\n"
-                  << "  [--updates scan|mapped] [--submit-threads 1]\n"
+                  << "  [--updates scan|mapped|panel|mmac] [--submit-threads 1]\n"
                   << "One stream per homogeneous batch; explicit logical workload or round-robin inputs; no perturbation.\n";
         return 0;
     }
@@ -218,12 +229,14 @@ int main(int argc, char** argv) {
         const auto setup_start=Clock::now();
         std::vector<std::unique_ptr<Matrix>> matrices;
         for (const auto& path : o.inputs) matrices.emplace_back(new Matrix(path,o.slots,o.updates));
-        size_t device_bytes=0, pinned_bytes=0, shared_device_bytes=0, update_map_bytes=0;
-        double update_map_setup_ms=0;
+        size_t device_bytes=0, pinned_bytes=0, shared_device_bytes=0, update_map_bytes=0,update_plan_bytes=0;
+        double update_map_setup_ms=0,update_plan_setup_ms=0;
         for (const auto& m : matrices) {
             add_bytes(shared_device_bytes,m->gpu->shared_device_bytes());
             add_bytes(update_map_bytes,m->gpu->update_map_bytes());
             update_map_setup_ms+=m->gpu->update_map_setup_ms();
+            add_bytes(update_plan_bytes,m->gpu->update_plan_bytes());
+            update_plan_setup_ms+=m->gpu->update_plan_setup_ms();
         }
         for (const auto& m : matrices) add_bytes(pinned_bytes,m->gpu->task_host_bytes());
         for (size_t i=0; i<matrices.size(); ++i) {
@@ -386,13 +399,15 @@ int main(int argc, char** argv) {
                << ",\n  \"schedule\": " << quoted(o.batch_size==1 ? "one-stream-per-task" : "one-stream-per-batch")
                << ", \"submission\": " << quoted(submit_threads>1 ? (o.graph ? "parallel-host-thread-graph" : "parallel-host-thread-direct") : (o.graph ? "single-host-thread-graph" : "single-host-thread-direct")) << ','
                << "\n  \"tasks\": " << o.tasks << ", \"streams\": " << tasks.size()
-               << ", \"updates\": " << quoted(o.updates==UpdateMode::Mapped ? "mapped" : "scan")
+               << ", \"updates\": " << quoted(update_name(o.updates))
                << ", \"submit_threads\": " << o.submit_threads << ", \"actual_submit_threads\": " << submit_threads
                << ", \"warmup\": " << o.warmup << ", \"loops\": " << o.loops
                << ", \"requested_tmp_slots\": " << o.slots << ", \"batch_size\": " << o.batch_size
                << ",\n  \"task_device_bytes\": " << device_bytes << ", \"pinned_bytes\": " << pinned_bytes
                << ", \"shared_device_bytes\": " << shared_device_bytes << ", \"update_map_bytes\": " << update_map_bytes
                << ", \"update_map_setup_ms\": " << update_map_setup_ms
+               << ", \"update_plan_bytes\": " << update_plan_bytes << ", \"update_plan_setup_ms\": " << update_plan_setup_ms
+               << ", \"native_mmac\": " << (std::any_of(matrices.begin(),matrices.end(),[](const auto& m){return m->gpu->uses_native_mmac();}) ? "true" : "false")
                << ",\n  \"setup_ms\": " << setup_ms << ", \"validation_ms\": " << check_ms
                << ", \"graph\": " << (o.graph ? "true" : "false") << ", \"graph_setup_ms\": " << graph_setup_ms << ", \"warmup_ms\": " << warmup_ms
                << ", \"ms_per_loop\": " << total_ms/o.loops
@@ -410,14 +425,12 @@ int main(int argc, char** argv) {
             report << ",\n  \"template_work\": [";
             for(size_t i=0;i<matrices.size();++i) {
                 const auto& a=*matrices[i]->symbolic;
-                const unsigned slots=matrices[i]->gpu->tmp_slots();
-                size_t wide=0,wide_levels=0,wide_columns=0,wide_target_levels=0,wide_targets=0,small=0,updates=0,factor=0,clear=0;
+                size_t wide_levels=0,wide_columns=0,wide_target_levels=0,wide_targets=0,small=0,updates=0,factor=0,clear=0;
                 unsigned max_width=0;
                 for(size_t lev=0;lev+1<a.level_ptr.size();++lev) {
                     const unsigned width=unsigned(a.level_ptr[lev+1]-a.level_ptr[lev]);
                     max_width=std::max(max_width,width);
                     if(width>16) {
-                        wide+=o.updates==UpdateMode::Mapped ? 1 : (size_t(width)+slots-1)/slots;
                         ++wide_levels;wide_columns+=width;
                         size_t targets=0;
                         for(int p=a.level_ptr[lev];p<a.level_ptr[lev+1];++p) {
@@ -436,28 +449,25 @@ int main(int argc, char** argv) {
                             } else targets|=a.sym_c_ptr[col+1]>a.l_col_ptr[col]+1 &&
                                            a.csr_r_ptr[col+1]-a.csr_diag_ptr[col]-1>0;
                         }
-                        if(o.updates==UpdateMode::Mapped) updates+=targets;
+                        if(o.updates!=UpdateMode::Scan) updates+=targets;
                     }
                 }
                 for(size_t batch=0;batch<tasks.size();++batch) {
                     if(task_template[batch]!=i) continue;
                     const auto& t=*tasks[batch];
                     const unsigned copies=t.batch_size();
-                    const bool soa=t.soa_value_stride()!=0;
-                    const size_t normalization=o.updates==UpdateMode::Mapped ?
-                        (t.normalizes_each_level() ? small : size_t(small!=0)) : 0;
-                    add_bytes(launches,wide+updates+factor+clear+normalization+(soa ? 2+wide_target_levels : 0));
-                    const size_t copy_tiles=(copies+t.wide_copy_tile_size()-1)/t.wide_copy_tile_size();
-                    add_bytes(wide_blocks,multiplied_bytes(wide_columns+(soa ? wide_targets : 0),copy_tiles));
+                    add_bytes(launches,t.numeric_launches());
+                    add_bytes(wide_blocks,t.numeric_wide_blocks());
                     add_bytes(h2d_ops,copies);
                 }
                 add_bytes(transfer_bytes,multiplied_bytes(o.counts[i],matrices[i]->gpu->task_host_bytes()));
                 if(i) report << ',';
+                const bool panel=o.updates==UpdateMode::Panel || o.updates==UpdateMode::PanelMmac;
                 report << "{\"levels\":" << a.num_lev << ",\"max_width\":" << max_width
                        << ",\"wide_levels\":" << wide_levels << ",\"wide_source_columns\":" << wide_columns
                        << ",\"wide_target_levels\":" << wide_target_levels << ",\"wide_target_pairs\":" << wide_targets
-                       << ",\"small_levels\":" << small << ",\"update_launches\":" << updates
-                       << ",\"factor_launches\":" << factor << ",\"clear_launches\":" << clear << '}';
+                       << ",\"small_levels\":" << small << ",\"update_launches\":" << (panel ? "null" : std::to_string(updates))
+                       << ",\"factor_launches\":" << (panel ? "null" : std::to_string(factor)) << ",\"clear_launches\":" << (panel ? "null" : std::to_string(clear)) << '}';
             }
             report << "],\n  \"launches_per_loop\": " << launches
                    << ", \"wide_blocks_per_loop\": " << wide_blocks

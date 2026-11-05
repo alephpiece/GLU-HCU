@@ -787,6 +787,283 @@ void test_small_level(bool graph,unsigned copies,bool perturb) {
     }
 }
 
+void test_dense_updates() {
+    // Independent coordinate fixture: no production planner or factorization
+    // oracle. Four views cover a partial 17x19 rectangle and a partial K=5.
+    constexpr unsigned nr=17,nc=19,length=5,stride=8;
+    constexpr unsigned dst_base=7,lower_base=dst_base+nr*nc+3;
+    constexpr unsigned pivot_base=lower_base+nr*length+3;
+    constexpr unsigned positions=pivot_base+nc*length+7;
+    const auto hole=[](unsigned r,unsigned c) {
+        return (r==3 && c==2) || (r==5 && c==17) || (r==16 && c==18);
+    };
+    // Prefix guards also exercise nonzero index-array offsets.
+    std::vector<unsigned> indices(3,UINT32_MAX);
+    const unsigned dst_begin=unsigned(indices.size());
+    for(unsigned c=0;c<nc;++c)for(unsigned r=0;r<nr;++r)
+        indices.push_back(hole(r,c) ? UINT32_MAX : dst_base+c*nr+r);
+    const unsigned lower_begin=unsigned(indices.size());
+    for(unsigned q=0;q<length;++q)for(unsigned r=0;r<nr;++r)
+        indices.push_back(lower_base+q*nr+r);
+    const unsigned pivot_begin=unsigned(indices.size());
+    for(unsigned q=0;q<length;++q)for(unsigned c=0;c<nc;++c)
+        indices.push_back(pivot_base+q*nc+c);
+    std::vector<DenseUpdateTile> tiles;
+    for(unsigned c=0;c<nc;c+=16)for(unsigned r=0;r<nr;r+=16)
+        tiles.push_back({dst_begin,lower_begin,pivot_begin,nr,nc,length,r,c});
+    if(tiles.size()!=4)throw std::logic_error("dense fixture tile count");
+    DeviceBuffer<unsigned> device_indices(indices);
+    DeviceBuffer<DenseUpdateTile> device_tiles(tiles);
+    Stream stream;
+    for(unsigned copies:{1u,3u,5u})for(bool nonfinite:{false,true}) {
+        std::vector<REAL> input(size_t(positions)*stride);
+        for(size_t i=0;i<input.size();++i)input[i]=REAL(-32)-REAL(i%31)/REAL(32);
+        for(unsigned copy=0;copy<copies;++copy) {
+            for(unsigned c=0;c<nc;++c)for(unsigned r=0;r<nr;++r)
+                if(!hole(r,c))input[size_t(dst_base+c*nr+r)*stride+copy]=
+                    REAL(2)+REAL(r)/REAL(16)+REAL(c)/REAL(32)+REAL(copy)/REAL(8);
+            for(unsigned q=0;q<length;++q)for(unsigned r=0;r<nr;++r) {
+                REAL factor=REAL(int((3*r+5*q+7*copy)%17)-8)/REAL(64);
+                if(q==1)factor=REAL(1)+REAL(r+copy)/REAL(64); // Always a real update.
+                if(nonfinite && q==0)factor=REAL(0);
+                input[size_t(lower_base+q*nr+r)*stride+copy]=factor;
+            }
+            for(unsigned q=0;q<length;++q)for(unsigned c=0;c<nc;++c) {
+                REAL pivot=REAL(1)+REAL(2*c+q+3*copy)/REAL(64);
+                if(nonfinite && q==0 && copy%2==0) {
+                    if(c==1)pivot=std::numeric_limits<REAL>::infinity();
+                    if(c==17)pivot=std::numeric_limits<REAL>::quiet_NaN();
+                }
+                input[size_t(pivot_base+q*nc+c)*stride+copy]=pivot;
+            }
+        }
+        std::vector<long double> expected(input.size(),0);
+        std::vector<unsigned char> writable(input.size(),0);
+        for(unsigned copy=0;copy<copies;++copy)
+            for(unsigned c=0;c<nc;++c)for(unsigned r=0;r<nr;++r) {
+                if(hole(r,c))continue;
+                const size_t dst=size_t(dst_base+c*nr+r)*stride+copy;
+                long double acc=input[dst];
+                for(unsigned q=0;q<length;++q) {
+                    const REAL factor=input[size_t(lower_base+q*nr+r)*stride+copy];
+                    // In particular, never evaluate zero times Inf or NaN.
+                    if(factor!=REAL(0))acc-=static_cast<long double>(factor)*
+                        static_cast<long double>(input[size_t(pivot_base+q*nc+c)*stride+copy]);
+                }
+                if(!std::isfinite(acc))throw std::logic_error("dense oracle must remain finite");
+                expected[dst]=acc;writable[dst]=1;
+            }
+        unsigned bits=0;while((1u<<bits)<copies)++bits;
+        for(bool mmac:{false,true}) {
+            DeviceBuffer<REAL> values(input);
+            if(mmac)mapped_dense_mmac<<<dim3(4,(copies+3)/4),256,0,stream.value>>>(
+                values.data(),copies,stride,device_tiles.data(),device_indices.data(),0);
+            else mapped_dense_scalar<<<dim3(4,(copies+(1u<<bits)-1)/(1u<<bits)),256,0,stream.value>>>(
+                values.data(),copies,stride,bits,device_tiles.data(),device_indices.data(),0);
+            check_gpu(cudaGetLastError(),"launch independent dense oracle");
+            check_gpu(cudaStreamSynchronize(stream.value),"wait independent dense oracle");
+            const auto actual=values.read();
+            for(size_t i=0;i<actual.size();++i) {
+                bool valid=true;
+                if(writable[i]) {
+                    const long double tolerance=64*static_cast<long double>(std::numeric_limits<REAL>::epsilon())*
+                        std::max(1.0L,std::fabs(expected[i]));
+                    valid=std::isfinite(actual[i]) && std::fabs(static_cast<long double>(actual[i])-expected[i])<=tolerance;
+                } else {
+                    // Bitwise preservation handles NaN operands as well as all
+                    // L/U, physical D holes, padding copies and outside guards.
+                    const auto* before=reinterpret_cast<const unsigned char*>(&input[i]);
+                    const auto* after=reinterpret_cast<const unsigned char*>(&actual[i]);
+                    for(size_t b=0;b<sizeof(REAL);++b)if(before[b]!=after[b])valid=false;
+                }
+                if(!valid) {
+                    std::ostringstream error;
+                    error<<"dense "<<(mmac ? "mmac-or-fallback" : "scalar")<<" copies="<<copies
+                         <<" nonfinite="<<nonfinite<<" position="<<i
+                         <<(writable[i] ? " output mismatch" : " unexpected write");
+                    throw std::runtime_error(error.str());
+                }
+            }
+        }
+    }
+    std::cout<<"PASS dense/independent-coordinate-oracle-holes-tail-and-nonfinite\n";
+}
+
+void test_panel_boundaries() {
+    // Dense, well-conditioned known L/U: >2 windows, a partial tail, and
+    // trailing D/L/U positions consumed only after an earlier panel drains.
+    constexpr unsigned n=67;
+    std::vector<unsigned> columns{0},rows;
+    std::vector<double> input,expected;
+    auto l=[](unsigned r,unsigned c){return r==c ? 1.0 : r>c ? double((r+2*c)%7+1)/128.0 : 0.0;};
+    auto u=[](unsigned r,unsigned c){return r==c ? 8.0+double(r%3) : r<c ? double((2*r+c)%5-0u)/32.0 : 0.0;};
+    for(unsigned c=0;c<n;++c) {
+        for(unsigned r=0;r<n;++r) {
+            double value=0;for(unsigned k=0;k<n;++k)value+=l(r,k)*u(k,c);
+            rows.push_back(r);input.push_back(value);expected.push_back(r>c ? l(r,c) : u(r,c));
+        }
+        columns.push_back(unsigned(rows.size()));
+    }
+    std::ostringstream out,err;Symbolic_Matrix matrix(n,out,err);
+    matrix.fill_in(rows.data(),columns.data());matrix.csr();matrix.predictLU(rows.data(),columns.data(),input.data());matrix.leveling();
+    if(matrix.num_lev!=int(n))throw std::runtime_error("panel chain fixture changed");
+    for(UpdateMode mode:{UpdateMode::Panel,UpdateMode::PanelMmac})
+        for(unsigned copies:{1u,3u,33u})for(bool graph:{false,true})for(bool perturb:{false,true}) {
+        GpuMatrix gpu(matrix,1,perturb,mode);GpuTask task(gpu,copies);if(graph)task.prepare_graph();
+        for(unsigned repeat=0;repeat<2;++repeat) {
+            task.enqueue();task.wait();task.check();
+            for(unsigned copy=0;copy<copies;++copy) {
+                compare(std::vector<REAL>(task.factors(copy),task.factors(copy)+matrix.nnz),std::vector<REAL>(expected.begin(),expected.end()),"known LU across panels");
+                if(matrix.factor_residual(task.factors(copy))>(sizeof(REAL)==8 ? 1e-12 : 1e-5))throw std::runtime_error("panel full residual");
+            }
+        }
+    }
+}
+
+template <typename Exception, typename Operation>
+void expect_task_rejection(Operation operation, const char* diagnostic)
+{
+    bool rejected=false;
+    try { operation(); }
+    catch(const Exception&) { rejected=true; }
+    if(!rejected) throw std::runtime_error(diagnostic);
+}
+
+void test_fresh_inputs()
+{
+    // A small closed pattern keeps every round in the same factor-slot layout.
+    // L/U are independent known factors; both round and copy affect their values.
+    constexpr unsigned n=9;
+    const auto make_values=[](unsigned round,unsigned copy) {
+        const auto l=[=](unsigned r,unsigned c) {
+            return r==c ? 1.0 : r>c
+                ? double((r+2*c+3*round+5*copy)%7+1)/128.0+
+                    double(round+1)/512.0+double(copy+1)/8192.0
+                : 0.0;
+        };
+        const auto u=[=](unsigned r,unsigned c) {
+            return r==c ? 8.0+double(r%3)+double(round)/4.0+double(copy)/64.0 : r<c
+                ? double((2*r+c+round+2*copy)%5)/32.0+
+                    double(round+1)/128.0+double(copy+1)/2048.0
+                : 0.0;
+        };
+        std::vector<double> input;
+        std::vector<REAL> expected;
+        for(unsigned c=0;c<n;++c) for(unsigned r=0;r<n;++r) {
+            double value=0;
+            for(unsigned k=0;k<n;++k) value+=l(r,k)*u(k,c);
+            input.push_back(value);
+            expected.push_back(REAL(r>c ? l(r,c) : u(r,c)));
+        }
+        return std::make_pair(std::move(input),std::move(expected));
+    };
+    auto initial=make_values(0,0);
+    std::vector<unsigned> columns{0},rows;
+    for(unsigned c=0;c<n;++c) {
+        for(unsigned r=0;r<n;++r) rows.push_back(r);
+        columns.push_back(unsigned(rows.size()));
+    }
+    std::ostringstream out,err;
+    Symbolic_Matrix matrix(n,out,err);
+    matrix.fill_in(rows.data(),columns.data());matrix.csr();
+    matrix.predictLU(rows.data(),columns.data(),initial.first.data());matrix.leveling();
+    if(matrix.sym_c_ptr!=columns || matrix.sym_r_idx!=rows)
+        throw std::runtime_error("fresh input fixture changed factor-slot layout");
+
+    for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped,UpdateMode::Panel,UpdateMode::PanelMmac})
+        for(unsigned copies:{1u,3u,33u}) for(bool graph:{false,true}) {
+        try {
+            GpuMatrix gpu(matrix,1,false,mode);
+            GpuTask task(gpu,copies);
+            if(graph) task.prepare_graph(); // Once, before every subsequent fresh input.
+            const size_t elements=size_t(matrix.nnz)*copies;
+            std::vector<REAL> default_input,default_factors;
+            for(unsigned copy=0;copy<copies;++copy) {
+                default_input.insert(default_input.end(),matrix.val.begin(),matrix.val.end());
+                default_factors.insert(default_factors.end(),initial.second.begin(),initial.second.end());
+            }
+            const auto check_values=[&](GpuTask& candidate,const std::vector<REAL>& input,
+                                        const std::vector<REAL>& expected) {
+                candidate.check();
+                Symbolic_Matrix oracle(matrix);
+                for(unsigned copy=0;copy<copies;++copy) {
+                    const size_t begin=size_t(copy)*matrix.nnz;
+                    compare(std::vector<REAL>(candidate.factors(copy),candidate.factors(copy)+matrix.nnz),
+                        std::vector<REAL>(expected.begin()+begin,expected.begin()+begin+matrix.nnz),
+                        "fresh input known LU");
+                    oracle.val.assign(input.begin()+begin,input.begin()+begin+matrix.nnz);
+                    const double residual=oracle.factor_residual(candidate.factors(copy));
+                    if(!std::isfinite(residual) || residual>(sizeof(REAL)==8 ? 1e-12 : 1e-5))
+                        throw std::runtime_error("fresh input full factor residual");
+                }
+            };
+            task.enqueue();task.wait();
+            check_values(task,default_input,default_factors);
+            expect_task_rejection<std::invalid_argument>([&] { task.upload_input(nullptr,elements); },
+                "fresh input accepted null source");
+            expect_task_rejection<std::invalid_argument>([&] { task.upload_input(default_input.data(),elements-1); },
+                "fresh input accepted incorrect element count");
+            // Argument errors must preserve both usability and the previous result.
+            check_values(task,default_input,default_factors);
+
+            for(unsigned round=1;round<=3;++round) {
+                std::vector<REAL> input,expected;
+                for(unsigned copy=0;copy<copies;++copy) {
+                    const auto fresh=make_values(round,copy);
+                    input.insert(input.end(),fresh.first.begin(),fresh.first.end());
+                    expected.insert(expected.end(),fresh.second.begin(),fresh.second.end());
+                }
+                task.upload_input(input.data(),input.size());
+                if(round==1) {
+                    expect_task_rejection<std::logic_error>([&] { task.factors(); },
+                        "upload-only fresh input allowed result access");
+                    expect_task_rejection<std::logic_error>([&] { task.upload_input(); },
+                        "upload-only fresh input accepted default reupload");
+                    expect_task_rejection<std::logic_error>([&] { task.upload_input(input.data(),elements); },
+                        "upload-only fresh input accepted another fresh upload");
+                    expect_task_rejection<std::logic_error>([&] { task.prepare_graph(); },
+                        "upload-only fresh input allowed graph preparation");
+                    expect_task_rejection<std::logic_error>([&] { task.wait(); },
+                        "upload-only fresh input allowed wait without numeric work");
+                }
+                task.enqueue();
+                if(round==1) {
+                    expect_task_rejection<std::logic_error>([&] { task.factors(); },
+                        "pending fresh input allowed result access");
+                    expect_task_rejection<std::logic_error>([&] { task.upload_input(); },
+                        "pending fresh input accepted default reupload");
+                    expect_task_rejection<std::logic_error>([&] { task.upload_input(input.data(),elements); },
+                        "pending fresh input accepted another fresh upload");
+                    expect_task_rejection<std::logic_error>([&] { task.enqueue(); },
+                        "pending fresh input allowed another enqueue");
+                    expect_task_rejection<std::logic_error>([&] { task.prepare_graph(); },
+                        "pending fresh input allowed graph preparation");
+                }
+                // Keep the caller's AoS source alive and unchanged until wait.
+                task.wait();
+                check_values(task,input,expected);
+            }
+            task.enqueue();task.wait();
+            check_values(task,default_input,default_factors);
+            if(copies==3) {
+                GpuMatrix perturbed(matrix,1,true,mode);
+                GpuTask rejected(perturbed,copies);
+                if(graph) rejected.prepare_graph();
+                expect_task_rejection<std::invalid_argument>([&] {
+                    rejected.upload_input(default_input.data(),elements);
+                },"perturbed task accepted fresh input");
+                rejected.enqueue();rejected.wait();
+                check_values(rejected,default_input,default_factors);
+            }
+        } catch(const std::exception& error) {
+            std::ostringstream context;
+            context<<"fresh input mode="<<unsigned(mode)<<" copies="<<copies<<" graph="<<graph<<": "<<error.what();
+            throw std::runtime_error(context.str());
+        }
+    }
+    std::cout<<"PASS host/fresh-input-fixed-structure-known-LU-and-state-contract\n";
+}
+
 void test_invalid_factor(REAL value, const char* diagnostic)
 {
     unsigned column[]{0, 1}, row[]{0};
@@ -836,6 +1113,9 @@ int main()
             for(unsigned variant=0;variant<5;++variant)
                 for(bool perturb : {false,true})
                     for(unsigned path=0;path<3;++path) test_layout(copies,variant,perturb,path);
+        test_dense_updates();
+        test_panel_boundaries();
+        test_fresh_inputs();
         test_zero_update_map();
         for (bool one_column : {false,true})
             for (bool perturb : {false,true}) test_distinct_copies(one_column,perturb);

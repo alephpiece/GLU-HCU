@@ -1,5 +1,7 @@
 #include "gpu-compat.h"
 #include "numeric.h"
+#include "update-plan.h"
+#include <cstdlib>
 #include <iostream>
 #include "symbolic.h"
 #include <cmath>
@@ -347,7 +349,7 @@ __global__ void mapped_level_update_soa(
         if constexpr(Perturb) if(fabs(divisor)<threshold) divisor=threshold;
     }
     const REAL pivot=values[size_t(pivot_position)*step+copy_base];
-    for(unsigned i=threadIdx.x>>copy_bits;i<count;i+=row_slots) {
+    for(unsigned i=(threadIdx.x>>copy_bits)+blockIdx.z*row_slots;i<count;i+=row_slots*gridDim.z) {
         REAL factor=values[size_t(lower+i)*step+copy_base];
         if constexpr(!Normalized) factor/=divisor;
         if(factor!=REAL(0)) {
@@ -356,6 +358,23 @@ __global__ void mapped_level_update_soa(
         }
     }
 }
+
+// Each destination/copy has one writer; preserve zero-factor skipping.
+__global__ void mapped_group_update(REAL* values,unsigned copies,unsigned stride,unsigned copy_bits,
+        const UpdateGroup* groups,const NormalizedUpdatePair* pairs,unsigned begin,unsigned end) {
+    const unsigned lanes=1u<<copy_bits,rows=blockDim.x>>copy_bits;
+    const unsigned copy=blockIdx.y*lanes+(threadIdx.x&(lanes-1));
+    const size_t index=size_t(begin)+size_t(blockIdx.x)*rows+(threadIdx.x>>copy_bits);
+    if(copy>=copies || index>=end)return;
+    const auto g=groups[index];REAL acc=values[size_t(g.destination)*stride+copy];
+    for(unsigned p=g.begin;p<g.end;++p) {
+        const auto u=pairs[p];const REAL factor=values[size_t(u.lower)*stride+copy];
+        if(factor!=REAL(0))acc-=factor*values[size_t(u.pivot)*stride+copy];
+    }
+    values[size_t(g.destination)*stride+copy]=acc;
+}
+
+#include "update-tiles.cuh"
 
 template<bool Perturb = false>
 __global__ void mapped_normalize_level_soa(REAL* values,unsigned copies,
@@ -493,8 +512,10 @@ struct GpuMatrix::Impl {
     unsigned deferred_columns_count=0;
     bool perturb;
     UpdateMode update_mode;
-    size_t shared_bytes = 0, map_bytes = 0;
-    double map_setup_ms = 0;
+    size_t shared_bytes = 0, map_bytes = 0, plan_bytes = 0;
+    double map_setup_ms = 0, plan_setup_ms = 0;
+    bool panel_mode=false,native_mmac=false;
+    unsigned row_splits=1;
     REAL threshold = 0;
     std::string device;
     std::vector<int> levels, columns;
@@ -505,11 +526,16 @@ struct GpuMatrix::Impl {
     std::vector<uint64_t> target_prefix;
     Buffer<uint64_t> map_bases;
     Buffer<unsigned> map_destinations, map_pivots;
+    std::vector<UpdateRange> panel_immediate,panel_deferred,panel_dense;
+    Buffer<UpdateGroup> panel_groups;
+    Buffer<NormalizedUpdatePair> panel_pairs;
+    Buffer<DenseUpdateTile> dense_tiles;
+    Buffer<unsigned> dense_indices;
     Buffer<REAL, true> input;
 
     unsigned value_pitch(unsigned copies) const {
         if(!copies || copies>max_batch) throw std::invalid_argument("batch size exceeds device grid limit");
-        if(update_mode!=UpdateMode::Mapped || copies==1) return 0;
+        if(update_mode==UpdateMode::Scan || copies==1) return 0;
         const unsigned lanes=1u<<filled_copy_bits(copies,5);
         const uint64_t pitch=(uint64_t(copies)+lanes-1)/lanes*lanes;
         if(pitch>std::numeric_limits<unsigned>::max()) throw std::overflow_error("SoA leading dimension overflow");
@@ -523,8 +549,9 @@ struct GpuMatrix::Impl {
     {
         if (!n || !nnz || !requested_slots || levels.size() < 2)
             throw std::invalid_argument("empty matrix or zero scratch slots");
-        if (mode != UpdateMode::Scan && mode != UpdateMode::Mapped)
+        if (mode != UpdateMode::Scan && mode != UpdateMode::Mapped && mode != UpdateMode::Panel && mode != UpdateMode::PanelMmac)
             throw std::invalid_argument("invalid update mode");
+        panel_mode=mode==UpdateMode::Panel || mode==UpdateMode::PanelMmac;
         GpuMatrix::select_device();
         cudaDeviceProp prop;
         gpu_check(cudaGetDeviceProperties(&prop, 0), "get device properties");
@@ -533,19 +560,42 @@ struct GpuMatrix::Impl {
         device = prop.name;
         max_batch = unsigned(prop.maxGridSize[1]);
         max_grid_x = unsigned(prop.maxGridSize[0]);
+#if defined(GLU_USE_HIP) && !defined(GLU_USE_FP32)
+        native_mmac=mode==UpdateMode::PanelMmac && std::string(prop.gcnArchName).rfind("gfx936",0)==0;
+#endif
+        if(mode==UpdateMode::Mapped)if(const char* split=std::getenv("GLU_PROBE_ROW_SPLIT")) {
+            if(std::string(split)!="1" && std::string(split)!="2")throw std::invalid_argument("row split probe must be 1 or 2");
+            row_splits=std::string(split)=="2" ? 2 : 1;
+        }
+        if(row_splits>unsigned(prop.maxGridSize[2]))throw std::invalid_argument("row split grid exceeds device limit");
         unsigned needed = 1;
         for (size_t i=1; i<levels.size(); ++i) {
             const unsigned width = unsigned(levels[i]-levels[i-1]);
-            if (mode == UpdateMode::Mapped && width > 16 && width > unsigned(prop.maxGridSize[0]))
+            if (mode != UpdateMode::Scan && width > unsigned(prop.maxGridSize[0]))
                 throw std::invalid_argument("mapped level width exceeds device grid limit");
             // Small levels execute serially in slot zero.
             if (mode == UpdateMode::Scan && width > 16) needed = std::max(needed, width);
         }
         slots = mode == UpdateMode::Scan ? std::min(requested_slots, needed) : 0;
         col.upload(a.sym_c_ptr); diag.upload(a.l_col_ptr);
-        csr_row.upload(a.csr_r_ptr); csr_diag.upload(a.csr_diag_ptr);
-        if(mode==UpdateMode::Scan) { row.upload(a.sym_r_idx); csr_col.upload(a.csr_c_idx); }
+        if(!panel_mode) { csr_row.upload(a.csr_r_ptr);csr_diag.upload(a.csr_diag_ptr); }
+        if(mode==UpdateMode::Scan) { row.upload(a.sym_r_idx);csr_col.upload(a.csr_c_idx); }
         level_idx.upload(a.level_idx);
+        if(panel_mode) {
+            const auto begin=std::chrono::steady_clock::now();
+            auto plan=make_panel_update_plan(a,32,mode==UpdateMode::PanelMmac);
+            for(size_t bytes:{checked_bytes(plan.groups.size(),sizeof(UpdateGroup)),checked_bytes(plan.pairs.size(),sizeof(NormalizedUpdatePair)),
+                              checked_bytes(plan.dense_tiles.size(),sizeof(DenseUpdateTile)),checked_bytes(plan.dense_indices.size(),sizeof(unsigned))})
+                plan_bytes=checked_sum(plan_bytes,bytes);
+            if(plan_bytes>GpuMatrix::free_device_bytes())throw std::runtime_error("panel plan exceeds free device memory");
+            for(const auto range:plan.immediate)if(range.end-range.begin>max_grid_x)throw std::invalid_argument("panel group grid exceeds device limit");
+            for(const auto range:plan.deferred)if(range.end-range.begin>max_grid_x)throw std::invalid_argument("panel group grid exceeds device limit");
+            for(const auto range:plan.dense_ranges)if(range.end-range.begin>max_grid_x)throw std::invalid_argument("dense tile grid exceeds device limit");
+            panel_immediate=std::move(plan.immediate);panel_deferred=std::move(plan.deferred);panel_dense=std::move(plan.dense_ranges);
+            panel_groups.upload(plan.groups);panel_pairs.upload(plan.pairs);
+            dense_tiles.upload(plan.dense_tiles);dense_indices.upload(plan.dense_indices);
+            plan_setup_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+        }
         if (mode == UpdateMode::Mapped) {
             const auto begin = std::chrono::steady_clock::now();
             build_update_map(a);
@@ -571,7 +621,7 @@ struct GpuMatrix::Impl {
             map_setup_ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
         }
         for (size_t bytes : {col.bytes, row.bytes, diag.bytes, csr_row.bytes,
-                             csr_col.bytes, csr_diag.bytes, level_idx.bytes, map_bytes, level_targets.bytes, deferred_columns.bytes})
+                             csr_col.bytes, csr_diag.bytes, level_idx.bytes, map_bytes, level_targets.bytes, deferred_columns.bytes,plan_bytes})
             shared_bytes = checked_sum(shared_bytes, bytes);
         input.allocate(nnz);
         std::copy(a.val.begin(), a.val.end(), input.ptr);
@@ -647,7 +697,7 @@ struct GpuTask::Impl {
     unsigned copy_tiles(unsigned bits) const { return (copies+(1u<<bits)-1)>>bits; }
     explicit Impl(std::shared_ptr<const GpuMatrix::Impl> m,unsigned batch)
         : matrix(std::move(m)),copies(batch),copy_bits(filled_copy_bits(batch,5)),soa_stride(matrix->value_pitch(batch)) {
-        if(soa_stride)for(size_t lev=0;lev+1<matrix->levels.size();++lev)
+        if(soa_stride && !matrix->panel_mode)for(size_t lev=0;lev+1<matrix->levels.size();++lev)
             if(matrix->target_prefix[matrix->levels[lev+1]]-matrix->target_prefix[matrix->levels[lev]]>matrix->max_grid_x)
                 throw std::invalid_argument("mapped level targets exceed device grid limit");
         values.allocate(matrix->nnz,copies);
@@ -666,9 +716,9 @@ struct GpuTask::Impl {
             }
         } catch(...) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); throw; }
     }
-    void enqueue_input() {
+    void enqueue_input(const REAL* input=nullptr) {
         for(unsigned copy=0;copy<copies;++copy)
-            gpu_check(cudaMemcpyAsync(values.ptr+size_t(copy)*matrix->nnz,matrix->input.ptr,
+            gpu_check(cudaMemcpyAsync(values.ptr+size_t(copy)*matrix->nnz,input ? input+size_t(copy)*matrix->nnz : matrix->input.ptr,
                 size_t(matrix->nnz)*sizeof(REAL),cudaMemcpyHostToDevice,stream),"upload matrix input");
     }
     void transpose(bool to_interleaved) {
@@ -685,6 +735,31 @@ struct GpuTask::Impl {
         const unsigned column_threads=copies>=16 ? 256 : 1024;
         const bool soa=soa_stride!=0;
         if(soa) transpose(true);
+        if constexpr(Mode==UpdateMode::Mapped)if(a.panel_mode) {
+            REAL* data=soa ? interleaved_values.ptr : values.ptr;
+            const unsigned bits=soa ? copy_bits : 0,stride=soa ? soa_stride : 1,rows=256u>>bits;
+            auto update=[&](UpdateRange range) {
+                if(range.end>range.begin)
+                    mapped_group_update<<<dim3((range.end-range.begin+rows-1)/rows,copy_tiles(bits)),256,0,stream>>>(
+                        data,copies,stride,bits,a.panel_groups.ptr,a.panel_pairs.ptr,range.begin,range.end);
+            };
+            for(size_t lev=0;lev+1<a.levels.size();++lev) {
+                const unsigned begin=a.levels[lev],width=a.levels[lev+1]-begin;
+                mapped_normalize_level_soa<Perturb><<<dim3(width,copy_tiles(bits)),256,0,stream>>>(
+                    data,copies,a.col.ptr,a.diag.ptr,a.level_idx.ptr,begin,bits,a.threshold,stride);
+                gpu_check(cudaGetLastError(),"normalize panel sources");
+                update(a.panel_immediate[lev]);gpu_check(cudaGetLastError(),"panel immediate update");
+                update(a.panel_deferred[lev]);gpu_check(cudaGetLastError(),"panel deferred update");
+                const auto range=a.panel_dense[lev];
+                if(range.end>range.begin) {
+                    mapped_dense_mmac<<<dim3(range.end-range.begin,(copies+3)/4),256,0,stream>>>(
+                        data,copies,stride,a.dense_tiles.ptr,a.dense_indices.ptr,range.begin);
+                    gpu_check(cudaGetLastError(),"panel dense update");
+                }
+            }
+            if(soa)transpose(false);
+            return;
+        }
         for(size_t lev=0;lev+1<a.levels.size();++lev) {
             const int begin=a.levels[lev],end=a.levels[lev+1],width=end-begin;
             if constexpr(Mode==UpdateMode::Mapped) {
@@ -697,7 +772,7 @@ struct GpuTask::Impl {
                     const uint64_t targets=a.target_prefix[end]-a.target_prefix[begin];
                     if(targets) {
                         if(soa)
-                            mapped_level_update_soa<Perturb,normalize_soa_levels><<<dim3(unsigned(targets),copy_tiles(copy_bits)),256,0,stream>>>(
+                            mapped_level_update_soa<Perturb,normalize_soa_levels><<<dim3(unsigned(targets),copy_tiles(copy_bits),a.row_splits),256,0,stream>>>(
                                 interleaved_values.ptr,copies,a.col.ptr,a.diag.ptr,a.csr_diag.ptr,a.level_idx.ptr,a.level_targets.ptr,
                                 begin,end,a.map_bases.ptr,a.map_destinations.ptr,a.map_pivots.ptr,a.threshold,soa_stride,copy_bits);
                         else
@@ -715,7 +790,7 @@ struct GpuTask::Impl {
                         interleaved_values.ptr,copies,a.col.ptr,a.diag.ptr,a.level_idx.ptr,begin,copy_bits,a.threshold,soa_stride);
                     gpu_check(cudaGetLastError(),"normalize wide mapped level");
                     const uint64_t targets=a.target_prefix[end]-a.target_prefix[begin];
-                    if(targets) mapped_level_update_soa<Perturb,true><<<dim3(unsigned(targets),copy_tiles(copy_bits)),256,0,stream>>>(
+                    if(targets) mapped_level_update_soa<Perturb,true><<<dim3(unsigned(targets),copy_tiles(copy_bits),a.row_splits),256,0,stream>>>(
                         interleaved_values.ptr,copies,a.col.ptr,a.diag.ptr,a.csr_diag.ptr,a.level_idx.ptr,a.level_targets.ptr,
                         begin,end,a.map_bases.ptr,a.map_destinations.ptr,a.map_pivots.ptr,a.threshold,soa_stride,copy_bits);
                     gpu_check(cudaGetLastError(),"update wide mapped targets");
@@ -782,7 +857,7 @@ struct GpuTask::Impl {
         }
     }
     void enqueue_work(bool graph_output) {
-        if(matrix->update_mode==UpdateMode::Mapped) {
+        if(matrix->update_mode!=UpdateMode::Scan) {
             if(matrix->perturb) enqueue_numeric<UpdateMode::Mapped,true>();
             else enqueue_numeric<UpdateMode::Mapped,false>();
         } else {
@@ -818,6 +893,9 @@ size_t GpuMatrix::task_host_bytes() const { return size_t(impl_->nnz)*sizeof(REA
 size_t GpuMatrix::shared_device_bytes() const { return impl_->shared_bytes; }
 size_t GpuMatrix::update_map_bytes() const { return impl_->map_bytes; }
 double GpuMatrix::update_map_setup_ms() const { return impl_->map_setup_ms; }
+size_t GpuMatrix::update_plan_bytes() const { return impl_->plan_bytes; }
+double GpuMatrix::update_plan_setup_ms() const { return impl_->plan_setup_ms; }
+bool GpuMatrix::uses_native_mmac() const { return impl_->native_mmac && impl_->dense_tiles.bytes!=0; }
 void GpuMatrix::select_device() {
     int count = 0;
     gpu_check(cudaGetDeviceCount(&count), "get device count");
@@ -837,7 +915,40 @@ GpuTask::~GpuTask() = default;
 unsigned GpuTask::update_copy_tile_size() const { return impl_->soa_stride ? 1u<<impl_->copy_bits : 1; }
 unsigned GpuTask::wide_copy_tile_size() const { return update_copy_tile_size(); }
 unsigned GpuTask::soa_value_stride() const { return impl_->soa_stride; }
-bool GpuTask::normalizes_each_level() const { return impl_->soa_stride && normalize_soa_levels; }
+bool GpuTask::normalizes_each_level() const { return impl_->matrix->panel_mode || (impl_->soa_stride && normalize_soa_levels); }
+
+size_t GpuTask::numeric_launches() const {
+    const auto& t=*impl_;const auto& a=*t.matrix;
+    size_t count=t.soa_stride ? 2 : 0;
+    if(a.panel_mode) {
+        count+=a.levels.size()-1;
+        for(const auto r:a.panel_immediate)count+=r.end>r.begin;
+        for(const auto r:a.panel_deferred)count+=r.end>r.begin;
+        for(const auto r:a.panel_dense)count+=r.end>r.begin;
+        return count;
+    }
+    for(size_t lev=0;lev+1<a.levels.size();++lev) {
+        const unsigned width=unsigned(a.levels[lev+1]-a.levels[lev]);
+        if(a.update_mode==UpdateMode::Mapped) {
+            const bool targets=a.target_prefix[a.levels[lev+1]]>a.target_prefix[a.levels[lev]];
+            if(width>16)count+=t.soa_stride ? 1+targets : 1;
+            else count+=targets+(t.soa_stride && normalize_soa_levels);
+        } else if(width>16)count+=(width+a.slots-1)/a.slots;
+        else for(int p=a.levels[lev];p<a.levels[lev+1];++p)
+            count+=2+(a.csr_rows[a.columns[p]+1]>a.csr_diags[a.columns[p]]+1);
+    }
+    if(a.update_mode==UpdateMode::Mapped && a.deferred_columns_count && !(t.soa_stride && normalize_soa_levels))++count;
+    return count;
+}
+size_t GpuTask::numeric_wide_blocks() const {
+    const auto& t=*impl_;const auto& a=*t.matrix;if(a.panel_mode)return 0;
+    uint64_t columns=0;
+    for(size_t lev=0;lev+1<a.levels.size();++lev)if(a.levels[lev+1]-a.levels[lev]>16) {
+        columns+=a.levels[lev+1]-a.levels[lev];
+        if(t.soa_stride)columns+=(a.target_prefix[a.levels[lev+1]]-a.target_prefix[a.levels[lev]])*a.row_splits;
+    }
+    return checked_bytes(columns,t.soa_stride ? t.copy_tiles(t.copy_bits) : t.copies);
+}
 
 void GpuTask::prepare_graph() {
     auto& t=*impl_;
@@ -867,6 +978,15 @@ void GpuTask::upload_input() {
     t.ready=false;
     try { t.enqueue_input();t.input_queued=true; }
     catch(...) { t.failed=true;throw; }
+}
+void GpuTask::upload_input(const REAL* values,size_t elements) {
+    auto& t=*impl_;
+    if(!values || elements!=size_t(t.matrix->nnz)*t.copies)throw std::invalid_argument("input must contain factor_nnz * copies values");
+    if(t.matrix->perturb)throw std::invalid_argument("fresh input requires an explicit perturbation threshold policy");
+    if(t.failed || t.pending || t.input_queued)throw std::logic_error("cannot queue task input in this state");
+    t.ready=false;
+    try {t.enqueue_input(values);t.input_queued=true;}
+    catch(...) {t.failed=true;throw;}
 }
 void GpuTask::enqueue() {
     auto& t=*impl_;

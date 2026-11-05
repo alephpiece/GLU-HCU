@@ -6,9 +6,9 @@
 
 using namespace std;
 
-// Scan uses only the sparse structure. Mapped additionally stores the target
-// position of every structural update, shared by all copies of the template.
-enum class UpdateMode { Scan, Mapped };
+// Each strategy owns only its execution representation, shared by value copies.
+// PanelMmac extracts dense rectangles; unsupported devices/precisions use scalar.
+enum class UpdateMode { Scan, Mapped, Panel, PanelMmac };
 
 // Single-device execution. Templates own immutable input/structure; tasks retain
 // their template and own all mutable buffers. GPU errors throw runtime_error.
@@ -21,10 +21,13 @@ public:
     size_t task_device_bytes(unsigned batch_size = 1) const; // Exact buffers for one batch.
     size_t task_host_bytes() const; // Bytes of one pinned input/output vector.
     // Device allocation payloads, excluding allocator/stream/Graph overhead.
-    // shared_device_bytes includes update_map_bytes; it is paid once per template.
+    // Shared bytes include map or panel-plan bytes, paid once per template.
     size_t shared_device_bytes() const;
     size_t update_map_bytes() const;
     double update_map_setup_ms() const; // Counting, construction and upload; zero for Scan.
+    size_t update_plan_bytes() const; // Panel groups/pairs and optional dense indices.
+    double update_plan_setup_ms() const;
+    bool uses_native_mmac() const;
     std::string device_name() const;
     static size_t free_device_bytes();
     static void select_device(); // Select visible GPU 0 for the calling host thread.
@@ -50,11 +53,13 @@ public:
     unsigned wide_copy_tile_size() const;
     unsigned soa_value_stride() const;
     bool normalizes_each_level() const;
+    size_t numeric_launches() const;
+    size_t numeric_wide_blocks() const;
     ~GpuTask();
     GpuTask(const GpuTask&) = delete;
     GpuTask& operator=(const GpuTask&) = delete;
-    // Capture numeric work and output. Each enqueue restores host input outside
-    // the graph, preserving stream ordering. Input is immutable for task lifetime.
+    // Capture numeric work and output, preserving stable device addresses.
+    // Each enqueue uploads the default input unless explicit input is queued.
     // Explicit preparation, outside measured work; no queued input or outstanding enqueue.
     // Repeated calls in this state reuse the prepared graph without recapturing.
     void prepare_graph();
@@ -64,6 +69,12 @@ public:
     // Queue at most once before enqueue; this invalidates previous factor results.
     // An upload alone is not a result: enqueue, then wait before reading factors.
     void upload_input();
+    // Explicit values in fixed symbolic factor-slot order, AoS across copies.
+    // Exactly factor_nnz * batch_size elements. Keep host storage readable and
+    // unchanged through enqueue()+wait(); pinned storage permits async upload.
+    // Reuses the prepared Graph and does not replace the template's default.
+    // Not available with perturbation (whose threshold belongs to the snapshot).
+    void upload_input(const REAL* values, size_t elements);
     // Complete submitted work and propagate asynchronous errors. Upload-only
     // state is rejected because numeric work and output have not been enqueued.
     void wait();
