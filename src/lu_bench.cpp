@@ -419,14 +419,12 @@ int main(int argc, char** argv) {
                     if(width>16) {
                         wide+=o.updates==UpdateMode::Mapped ? 1 : (size_t(width)+slots-1)/slots;
                         ++wide_levels;wide_columns+=width;
-                        if(o.updates==UpdateMode::Mapped) {
-                            size_t targets=0;
-                            for(int p=a.level_ptr[lev];p<a.level_ptr[lev+1];++p) {
-                                const unsigned c=a.level_idx[p];
-                                if(a.sym_c_ptr[c+1]>a.l_col_ptr[c]+1)add_bytes(targets,a.csr_r_ptr[c+1]-a.csr_diag_ptr[c]-1);
-                            }
-                            wide_target_levels+=targets!=0;add_bytes(wide_targets,targets);
+                        size_t targets=0;
+                        for(int p=a.level_ptr[lev];p<a.level_ptr[lev+1];++p) {
+                            const unsigned c=a.level_idx[p];
+                            if(a.sym_c_ptr[c+1]>a.l_col_ptr[c]+1)add_bytes(targets,a.csr_r_ptr[c+1]-a.csr_diag_ptr[c]-1);
                         }
+                        wide_target_levels+=targets!=0;add_bytes(wide_targets,targets);
                     } else {
                         ++small;
                         bool targets=false;

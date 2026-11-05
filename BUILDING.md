@@ -174,7 +174,7 @@ task light
 
 scan 使用每副本独立的 scratch，`--tmp-slots` 控制其槽数上限，实际槽数可能小于请求值。mapped 预计算并共享更新位置，不分配 scratch。mapped 多副本使用额外的交错 values buffer 和行补齐，计时内包含双向布局转换，单副本不做布局转换。
 
-程序预检映射和任务缓冲能否放入当前空闲显存，失败时明确退出，不自动调整任务、批量或槽数。预检不包含运行时内部开销，也不保证后续设备或 pinned host 分配成功。
+程序预检映射和任务缓冲能否放入当前空闲显存，失败时明确退出，不自动调整任务、批量或槽数。mapped 多副本要求每层的有效 source-target 对数不超过设备 `grid.x` 上限，超限时明确报错。预检不包含运行时内部开销，也不保证后续设备或 pinned host 分配成功。
 
 ### 计时与结果
 
@@ -206,7 +206,7 @@ scan 使用每副本独立的 scratch，`--tmp-slots` 控制其槽数上限，�
 | `submit_worker_max_wall_ms` | 最慢提交工作线程的墙钟耗时。单线程时为 0 |
 | `launches_per_loop` | 每轮底层 GPU kernel 次数，Graph 重放时不等于主机 launch API 次数 |
 | `wide_blocks_per_loop` | 每轮宽层数值 kernel 的线程块总数，包含适用路径的归一化与目标更新 |
-| `template_work` | 每模板的层宽及结构目标数量，各批的实际启动次数另计 |
+| `template_work` | 每模板的层宽及 L 非空源列的结构目标数量，各批的实际启动次数另计 |
 | `h2d_bytes_per_loop` / `d2h_bytes_per_loop` | 每轮按逻辑副本数统计的传输字节 |
 | `h2d_copy_ops_per_loop` / `d2h_copy_ops_per_loop` | 每轮 H2D/D2H 操作次数，字节相同不代表操作次数相同 |
 
