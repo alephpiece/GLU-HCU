@@ -13,11 +13,6 @@ __device__ void scalar_dense_outputs(REAL* values,const DenseUpdateTile& tile,co
         values[size_t(dst)*stride+copy]=acc;
     }
 }
-__global__ void mapped_dense_scalar(REAL* values,unsigned copies,unsigned stride,unsigned bits,
-        const DenseUpdateTile* tiles,const unsigned* indices,unsigned begin) {
-    const unsigned lanes=1u<<bits,copy=blockIdx.y*lanes+(threadIdx.x&(lanes-1));
-    if(copy<copies)scalar_dense_outputs(values,tiles[begin+blockIdx.x],indices,copy,stride,threadIdx.x>>bits,blockDim.x>>bits);
-}
 #if defined(__gfx936__) && !defined(GLU_USE_FP32)
 using DenseMmacVector=double __attribute__((ext_vector_type(4)));
 __device__ __forceinline__ DenseMmacVector dense_mmac(double a,double b,DenseMmacVector c) {
@@ -25,14 +20,12 @@ __device__ __forceinline__ DenseMmacVector dense_mmac(double a,double b,DenseMma
     return c;
 }
 #endif
-template<bool Native=true>
 __global__ void mapped_dense_mmac(REAL* values,unsigned copies,unsigned stride,
         const DenseUpdateTile* tiles,const unsigned* indices,unsigned begin) {
     const unsigned lane=threadIdx.x%64,copy=blockIdx.y*4+threadIdx.x/64;
     if(copy>=copies)return;
     const auto tile=tiles[begin+blockIdx.x];
 #if defined(__gfx936__) && !defined(GLU_USE_FP32)
-    if constexpr(!Native) {scalar_dense_outputs(values,tile,indices,copy,stride,lane,64);return;}
     const unsigned r=tile.row_begin+lane%16,cbase=tile.col_begin;
     DenseMmacVector acc{};bool invalid=false;
     for(unsigned part=0;part<4;++part) {

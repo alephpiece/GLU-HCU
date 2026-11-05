@@ -787,6 +787,13 @@ void test_small_level(bool graph,unsigned copies,bool perturb) {
     }
 }
 
+// Test-only scalar geometry control; production uses MMAC or its wave fallback.
+__global__ void mapped_dense_scalar(REAL* values,unsigned copies,unsigned stride,unsigned bits,
+        const DenseUpdateTile* tiles,const unsigned* indices,unsigned begin) {
+    const unsigned lanes=1u<<bits,copy=blockIdx.y*lanes+(threadIdx.x&(lanes-1));
+    if(copy<copies)scalar_dense_outputs(values,tiles[begin+blockIdx.x],indices,copy,stride,threadIdx.x>>bits,blockDim.x>>bits);
+}
+
 void test_dense_updates() {
     // Independent coordinate fixture: no production planner or factorization
     // oracle. Four views cover a partial 17x19 rectangle and a partial K=5.

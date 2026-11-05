@@ -1,7 +1,6 @@
 #include "gpu-compat.h"
 #include "numeric.h"
 #include "update-plan.h"
-#include <cstdlib>
 #include <iostream>
 #include "symbolic.h"
 #include <cmath>
@@ -349,7 +348,7 @@ __global__ void mapped_level_update_soa(
         if constexpr(Perturb) if(fabs(divisor)<threshold) divisor=threshold;
     }
     const REAL pivot=values[size_t(pivot_position)*step+copy_base];
-    for(unsigned i=(threadIdx.x>>copy_bits)+blockIdx.z*row_slots;i<count;i+=row_slots*gridDim.z) {
+    for(unsigned i=threadIdx.x>>copy_bits;i<count;i+=row_slots) {
         REAL factor=values[size_t(lower+i)*step+copy_base];
         if constexpr(!Normalized) factor/=divisor;
         if(factor!=REAL(0)) {
@@ -515,7 +514,6 @@ struct GpuMatrix::Impl {
     size_t shared_bytes = 0, map_bytes = 0, plan_bytes = 0;
     double map_setup_ms = 0, plan_setup_ms = 0;
     bool panel_mode=false,native_mmac=false;
-    unsigned row_splits=1,aos_update_threads=1024;
     REAL threshold = 0;
     std::string device;
     std::vector<int> levels, columns;
@@ -563,15 +561,6 @@ struct GpuMatrix::Impl {
 #if defined(GLU_USE_HIP) && !defined(GLU_USE_FP32)
         native_mmac=mode==UpdateMode::PanelMmac && std::string(prop.gcnArchName).rfind("gfx936",0)==0;
 #endif
-        if(mode==UpdateMode::Mapped)if(const char* split=std::getenv("GLU_PROBE_ROW_SPLIT")) {
-            if(std::string(split)!="1" && std::string(split)!="2")throw std::invalid_argument("row split probe must be 1 or 2");
-            row_splits=std::string(split)=="2" ? 2 : 1;
-        }
-        if(mode==UpdateMode::Mapped)if(const char* threads=std::getenv("GLU_PROBE_AOS_THREADS")) {
-            if(std::string(threads)!="1024" && std::string(threads)!="256")throw std::invalid_argument("AoS update probe must be 1024 or 256");
-            aos_update_threads=std::string(threads)=="256" ? 256 : 1024;
-        }
-        if(row_splits>unsigned(prop.maxGridSize[2]))throw std::invalid_argument("row split grid exceeds device limit");
         unsigned needed = 1;
         for (size_t i=1; i<levels.size(); ++i) {
             const unsigned width = unsigned(levels[i]-levels[i-1]);
@@ -776,11 +765,11 @@ struct GpuTask::Impl {
                     const uint64_t targets=a.target_prefix[end]-a.target_prefix[begin];
                     if(targets) {
                         if(soa)
-                            mapped_level_update_soa<Perturb,normalize_soa_levels><<<dim3(unsigned(targets),copy_tiles(copy_bits),a.row_splits),256,0,stream>>>(
+                            mapped_level_update_soa<Perturb,normalize_soa_levels><<<dim3(unsigned(targets),copy_tiles(copy_bits)),256,0,stream>>>(
                                 interleaved_values.ptr,copies,a.col.ptr,a.diag.ptr,a.csr_diag.ptr,a.level_idx.ptr,a.level_targets.ptr,
                                 begin,end,a.map_bases.ptr,a.map_destinations.ptr,a.map_pivots.ptr,a.threshold,soa_stride,copy_bits);
                         else
-                            mapped_level_update<Perturb><<<dim3(unsigned(targets),copies),a.aos_update_threads,0,stream>>>(
+                            mapped_level_update<Perturb><<<dim3(unsigned(targets),copies),256,0,stream>>>(
                                 values.ptr,a.nnz,a.col.ptr,a.diag.ptr,a.csr_diag.ptr,a.level_idx.ptr,a.level_targets.ptr,
                                 begin,end,a.map_bases.ptr,a.map_destinations.ptr,a.map_pivots.ptr,a.threshold);
                         gpu_check(cudaGetLastError(),"update mapped level");
@@ -794,7 +783,7 @@ struct GpuTask::Impl {
                         interleaved_values.ptr,copies,a.col.ptr,a.diag.ptr,a.level_idx.ptr,begin,copy_bits,a.threshold,soa_stride);
                     gpu_check(cudaGetLastError(),"normalize wide mapped level");
                     const uint64_t targets=a.target_prefix[end]-a.target_prefix[begin];
-                    if(targets) mapped_level_update_soa<Perturb,true><<<dim3(unsigned(targets),copy_tiles(copy_bits),a.row_splits),256,0,stream>>>(
+                    if(targets) mapped_level_update_soa<Perturb,true><<<dim3(unsigned(targets),copy_tiles(copy_bits)),256,0,stream>>>(
                         interleaved_values.ptr,copies,a.col.ptr,a.diag.ptr,a.csr_diag.ptr,a.level_idx.ptr,a.level_targets.ptr,
                         begin,end,a.map_bases.ptr,a.map_destinations.ptr,a.map_pivots.ptr,a.threshold,soa_stride,copy_bits);
                     gpu_check(cudaGetLastError(),"update wide mapped targets");
@@ -949,7 +938,7 @@ size_t GpuTask::numeric_wide_blocks() const {
     uint64_t columns=0;
     for(size_t lev=0;lev+1<a.levels.size();++lev)if(a.levels[lev+1]-a.levels[lev]>16) {
         columns+=a.levels[lev+1]-a.levels[lev];
-        if(t.soa_stride)columns+=(a.target_prefix[a.levels[lev+1]]-a.target_prefix[a.levels[lev]])*a.row_splits;
+        if(t.soa_stride)columns+=a.target_prefix[a.levels[lev+1]]-a.target_prefix[a.levels[lev]];
     }
     return checked_bytes(columns,t.soa_stride ? t.copy_tiles(t.copy_bits) : t.copies);
 }

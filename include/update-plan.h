@@ -9,8 +9,8 @@
 #include <stdexcept>
 #include <vector>
 
-// Exploratory CPU plan. Every entry is a structural multiply-subtract;
-// stable destination sorting changes ownership, never the contribution set.
+// Structural panel plan. Every entry is a multiply-subtract; stable destination
+// sorting changes ownership, never the contribution set.
 struct UpdateContribution { unsigned destination, lower, pivot, diagonal; };
 struct NormalizedUpdatePair { unsigned lower, pivot; };
 struct UpdateGroup { unsigned destination, begin, end; };

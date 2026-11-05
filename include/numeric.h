@@ -17,14 +17,14 @@ public:
     explicit GpuMatrix(const Symbolic_Matrix&, unsigned tmp_slots = 32, bool perturb = false,
                        UpdateMode update_mode = UpdateMode::Scan);
     ~GpuMatrix();
-    unsigned tmp_slots() const; // Effective scratch slots; zero for Mapped.
+    unsigned tmp_slots() const; // Effective scratch slots; zero outside Scan.
     size_t task_device_bytes(unsigned batch_size = 1) const; // Exact buffers for one batch.
     size_t task_host_bytes() const; // Bytes of one pinned input/output vector.
     // Device allocation payloads, excluding allocator/stream/Graph overhead.
     // Shared bytes include map or panel-plan bytes, paid once per template.
     size_t shared_device_bytes() const;
     size_t update_map_bytes() const;
-    double update_map_setup_ms() const; // Counting, construction and upload; zero for Scan.
+    double update_map_setup_ms() const; // Counting, construction and upload; zero outside Mapped.
     size_t update_plan_bytes() const; // Panel groups/pairs and optional dense indices.
     double update_plan_setup_ms() const;
     bool uses_native_mmac() const;
