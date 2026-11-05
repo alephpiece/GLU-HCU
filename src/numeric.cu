@@ -383,57 +383,6 @@ __global__ void mapped_normalize_level_soa(REAL* values,unsigned copies,
         values[size_t(lower+i)*value_stride+copy]/=divisor;
 }
 
-// A wide level keeps source columns independent. Within a source, adjacent
-// lanes own copies; the remaining slots divide rows and independent targets.
-template<bool Perturb = false>
-__global__ void mapped_wide_soa(
-        REAL* values,unsigned copies,const unsigned* col,const unsigned* diag,
-        const unsigned* csr_row,const unsigned* csr_diag,const int* order,int begin,
-        const uint64_t* bases,const unsigned* destinations,const unsigned* pivots,REAL threshold,unsigned copy_bits=5,
-        unsigned value_stride=0)
-{
-    if(!value_stride) value_stride=copies;
-    __shared__ REAL divisors[32];
-    const unsigned source=unsigned(order[begin+blockIdx.x]);
-    const unsigned diagonal=diag[source],lower=diagonal+1,count=col[source+1]-lower;
-    const unsigned copy_lanes=1u<<copy_bits,row_slots=blockDim.x>>copy_bits;
-    const unsigned copy_lane=threadIdx.x&(copy_lanes-1),slot=threadIdx.x>>copy_bits;
-    const unsigned copy=blockIdx.y*copy_lanes+copy_lane;
-    const bool valid=copy<copies;
-    if(slot==0 && valid) {
-        REAL divisor=values[size_t(diagonal)*value_stride+copy];
-        if constexpr(Perturb) {
-            if(fabs(divisor)<threshold) {
-                divisor=threshold;
-                values[size_t(diagonal)*value_stride+copy]=divisor;
-            }
-        }
-        divisors[copy_lane]=divisor;
-    }
-    __syncthreads();
-    unsigned row_bits=0;
-    while((1u<<row_bits)<count && (1u<<row_bits)<row_slots) ++row_bits;
-    const unsigned row_lanes=1u<<row_bits;
-    if(valid && slot<row_lanes)
-        for(unsigned i=slot;i<count;i+=row_lanes)
-            values[size_t(lower+i)*value_stride+copy]/=divisors[copy_lane];
-    // Invalid copy lanes also participate. Every consumer sees the normalized
-    // lower values, including consumers in a different target group.
-    __syncthreads();
-    if(!valid || !count) return;
-    const unsigned row_lane=slot&(row_lanes-1),target_lane=slot>>row_bits;
-    const unsigned target_groups=row_slots>>row_bits,first=csr_diag[source]+1;
-    for(unsigned q=first+target_lane;q<csr_row[source+1];q+=target_groups) {
-        const REAL pivot=values[size_t(pivots[q])*value_stride+copy];
-        const uint64_t base=bases[source]+uint64_t(q-first)*count;
-        for(unsigned i=row_lane;i<count;i+=row_lanes) {
-            const REAL factor=values[size_t(lower+i)*value_stride+copy];
-            if(factor!=REAL(0))
-                atomicAdd(&values[size_t(destinations[base+i])*value_stride+copy],-factor*pivot);
-        }
-    }
-}
-
 // Ordinary tiled matrix transpose. Linear tile grid avoids a new grid.y limit
 // for a large symbolic payload. Both input and output include partial tiles.
 __global__ void transpose_task_values(const REAL* input,REAL* output,unsigned rows,unsigned columns,
@@ -693,12 +642,14 @@ struct GpuTask::Impl {
     Buffer<REAL, true> output;
     cudaStream_t stream = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
-    unsigned copies,copy_bits,wide_copy_bits,soa_stride;
+    unsigned copies,copy_bits,soa_stride;
     bool pending=false,ready=false,failed=false,input_queued=false;
     unsigned copy_tiles(unsigned bits) const { return (copies+(1u<<bits)-1)>>bits; }
     explicit Impl(std::shared_ptr<const GpuMatrix::Impl> m,unsigned batch)
-        : matrix(std::move(m)),copies(batch),copy_bits(filled_copy_bits(batch,5)),
-          wide_copy_bits(filled_copy_bits(batch,3)),soa_stride(matrix->value_pitch(batch)) {
+        : matrix(std::move(m)),copies(batch),copy_bits(filled_copy_bits(batch,5)),soa_stride(matrix->value_pitch(batch)) {
+        if(soa_stride)for(size_t lev=0;lev+1<matrix->levels.size();++lev)
+            if(matrix->target_prefix[matrix->levels[lev+1]]-matrix->target_prefix[matrix->levels[lev]]>matrix->max_grid_x)
+                throw std::invalid_argument("mapped level targets exceed device grid limit");
         values.allocate(matrix->nnz,copies);
         if(soa_stride) {
             const uint64_t tiles=uint64_t(matrix->nnz/32+(matrix->nnz%32!=0))*(copies/32+(copies%32!=0));
@@ -758,10 +709,16 @@ struct GpuTask::Impl {
                     continue;
                 }
                 if(soa) {
-                    mapped_wide_soa<Perturb><<<dim3(width,copy_tiles(wide_copy_bits)),256,0,stream>>>(
-                        interleaved_values.ptr,copies,a.col.ptr,a.diag.ptr,a.csr_row.ptr,a.csr_diag.ptr,a.level_idx.ptr,begin,
-                        a.map_bases.ptr,a.map_destinations.ptr,a.map_pivots.ptr,a.threshold,wide_copy_bits,soa_stride);
-                    gpu_check(cudaGetLastError(),"update wide mapped level");
+                    // Normalize each source once, then expose its independent
+                    // targets as separate blocks in the same copy layout.
+                    mapped_normalize_level_soa<Perturb><<<dim3(width,copy_tiles(copy_bits)),256,0,stream>>>(
+                        interleaved_values.ptr,copies,a.col.ptr,a.diag.ptr,a.level_idx.ptr,begin,copy_bits,a.threshold,soa_stride);
+                    gpu_check(cudaGetLastError(),"normalize wide mapped level");
+                    const uint64_t targets=a.target_prefix[end]-a.target_prefix[begin];
+                    if(targets) mapped_level_update_soa<Perturb,true><<<dim3(unsigned(targets),copy_tiles(copy_bits)),256,0,stream>>>(
+                        interleaved_values.ptr,copies,a.col.ptr,a.diag.ptr,a.csr_diag.ptr,a.level_idx.ptr,a.level_targets.ptr,
+                        begin,end,a.map_bases.ptr,a.map_destinations.ptr,a.map_pivots.ptr,a.threshold,soa_stride,copy_bits);
+                    gpu_check(cudaGetLastError(),"update wide mapped targets");
                     continue;
                 }
             }
@@ -878,7 +835,7 @@ unsigned GpuTask::batch_size() const { return impl_->copies; }
 GpuTask::~GpuTask() = default;
 
 unsigned GpuTask::update_copy_tile_size() const { return impl_->soa_stride ? 1u<<impl_->copy_bits : 1; }
-unsigned GpuTask::wide_copy_tile_size() const { return impl_->soa_stride ? 1u<<impl_->wide_copy_bits : 1; }
+unsigned GpuTask::wide_copy_tile_size() const { return update_copy_tile_size(); }
 unsigned GpuTask::soa_value_stride() const { return impl_->soa_stride; }
 bool GpuTask::normalizes_each_level() const { return impl_->soa_stride && normalize_soa_levels; }
 

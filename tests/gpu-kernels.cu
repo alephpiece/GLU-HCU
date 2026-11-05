@@ -665,8 +665,8 @@ Matrix make_layout_matrix(bool perturb, unsigned copy,unsigned variant = 0)
 }
 
 void test_layout(unsigned copies,unsigned variant,bool perturb,unsigned path) {
-    const bool soa=path!=0,wide=path==3,normalized=path==2;
-    const unsigned bits=filled_copy_bits(copies,wide ? 3 : 5),lanes=1u<<bits;
+    const bool soa=path!=0,normalized=path==2;
+    const unsigned bits=filled_copy_bits(copies,5),lanes=1u<<bits;
     const unsigned alignment=1u<<filled_copy_bits(copies,5);
     const unsigned pitch=(copies+alignment-1)/alignment*alignment,tiles_y=(copies+lanes-1)/lanes;
     const REAL threshold=REAL(0.5);
@@ -726,30 +726,21 @@ void test_layout(unsigned copies,unsigned variant,bool perturb,unsigned path) {
         check_gpu(cudaMemcpy(values.data(),input.data(),input.size()*sizeof(REAL),cudaMemcpyHostToDevice),"restore oracle inputs");
         const unsigned tiles=unsigned((nnz/32+(nnz%32!=0))*(copies/32+(copies%32!=0)));
         if(soa) transpose_task_values<<<tiles,dim3(32,8),0,stream.value>>>(values.data(),interleaved.data(),copies,unsigned(nnz),unsigned(nnz),pitch);
-        if(wide) {
-            if(perturb)
-                mapped_wide_soa<true><<<dim3(4,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),
-                    csr_row.data(),csr_diagonal.data(),sources.data(),1,map_bases.data(),map_destinations.data(),map_pivots.data(),threshold,bits,pitch);
-            else
-                mapped_wide_soa<false><<<dim3(4,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),
-                    csr_row.data(),csr_diagonal.data(),sources.data(),1,map_bases.data(),map_destinations.data(),map_pivots.data(),0,bits,pitch);
+        if(normalized) {
+            if(perturb) mapped_normalize_level_soa<true><<<dim3(4,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),sources.data(),1,bits,threshold,pitch);
+            else mapped_normalize_level_soa<false><<<dim3(4,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),sources.data(),1,bits,0,pitch);
+        }
+        const unsigned targets=unsigned(target_prefix.back()-7);
+        if(soa) {
+            if(normalized) mapped_level_update_soa<false,true><<<dim3(targets,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),0,pitch,bits);
+            else if(perturb) mapped_level_update_soa<true><<<dim3(targets,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),threshold,pitch,bits);
+            else mapped_level_update_soa<false><<<dim3(targets,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),0,pitch,bits);
         } else {
-            if(normalized) {
-                if(perturb) mapped_normalize_level_soa<true><<<dim3(4,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),sources.data(),1,bits,threshold,pitch);
-                else mapped_normalize_level_soa<false><<<dim3(4,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),sources.data(),1,bits,0,pitch);
-            }
-            const unsigned targets=unsigned(target_prefix.back()-7);
-            if(soa) {
-                if(normalized) mapped_level_update_soa<false,true><<<dim3(targets,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),0,pitch,bits);
-                else if(perturb) mapped_level_update_soa<true><<<dim3(targets,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),threshold,pitch,bits);
-                else mapped_level_update_soa<false><<<dim3(targets,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),0,pitch,bits);
-            } else {
-                if(perturb) mapped_level_update<true><<<dim3(targets,copies),256,0,stream.value>>>(values.data(),nnz,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),threshold);
-                else mapped_level_update<false><<<dim3(targets,copies),256,0,stream.value>>>(values.data(),nnz,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),0);
-            }
+            if(perturb) mapped_level_update<true><<<dim3(targets,copies),256,0,stream.value>>>(values.data(),nnz,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),threshold);
+            else mapped_level_update<false><<<dim3(targets,copies),256,0,stream.value>>>(values.data(),nnz,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),0);
         }
         if(soa) transpose_task_values<<<tiles,dim3(32,8),0,stream.value>>>(interleaved.data(),values.data(),unsigned(nnz),copies,pitch,unsigned(nnz));
-        if(!wide && !normalized) {
+        if(!normalized) {
             if(perturb) RL_onecol_factorizeCurrentCol<true,false,true><<<dim3(4,copies),256,0,stream.value>>>(column.data(),row.data(),values.data(),diagonal.data(),0,nullptr,0,matrix.n,nnz,0,threshold,sources.data(),1);
             else RL_onecol_factorizeCurrentCol<false,false,true><<<dim3(4,copies),256,0,stream.value>>>(column.data(),row.data(),values.data(),diagonal.data(),0,nullptr,0,matrix.n,nnz,0,0,sources.data(),1);
         }
@@ -844,7 +835,7 @@ int main()
         for(unsigned copies : {1u,2u,3u,7u,8u,9u,31u,32u,33u,42u})
             for(unsigned variant=0;variant<5;++variant)
                 for(bool perturb : {false,true})
-                    for(unsigned path=0;path<4;++path) test_layout(copies,variant,perturb,path);
+                    for(unsigned path=0;path<3;++path) test_layout(copies,variant,perturb,path);
         test_zero_update_map();
         for (bool one_column : {false,true})
             for (bool perturb : {false,true}) test_distinct_copies(one_column,perturb);

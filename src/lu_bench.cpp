@@ -411,14 +411,22 @@ int main(int argc, char** argv) {
             for(size_t i=0;i<matrices.size();++i) {
                 const auto& a=*matrices[i]->symbolic;
                 const unsigned slots=matrices[i]->gpu->tmp_slots();
-                size_t wide=0,wide_columns=0,small=0,updates=0,factor=0,clear=0;
+                size_t wide=0,wide_levels=0,wide_columns=0,wide_target_levels=0,wide_targets=0,small=0,updates=0,factor=0,clear=0;
                 unsigned max_width=0;
                 for(size_t lev=0;lev+1<a.level_ptr.size();++lev) {
                     const unsigned width=unsigned(a.level_ptr[lev+1]-a.level_ptr[lev]);
                     max_width=std::max(max_width,width);
                     if(width>16) {
                         wide+=o.updates==UpdateMode::Mapped ? 1 : (size_t(width)+slots-1)/slots;
-                        wide_columns+=width;
+                        ++wide_levels;wide_columns+=width;
+                        if(o.updates==UpdateMode::Mapped) {
+                            size_t targets=0;
+                            for(int p=a.level_ptr[lev];p<a.level_ptr[lev+1];++p) {
+                                const unsigned c=a.level_idx[p];
+                                if(a.sym_c_ptr[c+1]>a.l_col_ptr[c]+1)add_bytes(targets,a.csr_r_ptr[c+1]-a.csr_diag_ptr[c]-1);
+                            }
+                            wide_target_levels+=targets!=0;add_bytes(wide_targets,targets);
+                        }
                     } else {
                         ++small;
                         bool targets=false;
@@ -440,15 +448,16 @@ int main(int argc, char** argv) {
                     const bool soa=t.soa_value_stride()!=0;
                     const size_t normalization=o.updates==UpdateMode::Mapped ?
                         (t.normalizes_each_level() ? small : size_t(small!=0)) : 0;
-                    add_bytes(launches,wide+updates+factor+clear+normalization+(soa ? 2 : 0));
+                    add_bytes(launches,wide+updates+factor+clear+normalization+(soa ? 2+wide_target_levels : 0));
                     const size_t copy_tiles=(copies+t.wide_copy_tile_size()-1)/t.wide_copy_tile_size();
-                    add_bytes(wide_blocks,multiplied_bytes(wide_columns,copy_tiles));
+                    add_bytes(wide_blocks,multiplied_bytes(wide_columns+(soa ? wide_targets : 0),copy_tiles));
                     add_bytes(h2d_ops,copies);
                 }
                 add_bytes(transfer_bytes,multiplied_bytes(o.counts[i],matrices[i]->gpu->task_host_bytes()));
                 if(i) report << ',';
                 report << "{\"levels\":" << a.num_lev << ",\"max_width\":" << max_width
-                       << ",\"wide_launches\":" << wide << ",\"wide_source_columns\":" << wide_columns
+                       << ",\"wide_levels\":" << wide_levels << ",\"wide_source_columns\":" << wide_columns
+                       << ",\"wide_target_levels\":" << wide_target_levels << ",\"wide_target_pairs\":" << wide_targets
                        << ",\"small_levels\":" << small << ",\"update_launches\":" << updates
                        << ",\"factor_launches\":" << factor << ",\"clear_launches\":" << clear << '}';
             }

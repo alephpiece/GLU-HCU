@@ -205,6 +205,8 @@ scan 使用每副本独立的 scratch，`--tmp-slots` 控制其槽数上限，�
 | `submit_workers_cpu_ms` | 全部提交工作线程的 CPU 时间之和，可大于提交墙钟。单线程时为 0 |
 | `submit_worker_max_wall_ms` | 最慢提交工作线程的墙钟耗时。单线程时为 0 |
 | `launches_per_loop` | 每轮底层 GPU kernel 次数，Graph 重放时不等于主机 launch API 次数 |
+| `wide_blocks_per_loop` | 每轮宽层数值 kernel 的线程块总数，包含适用路径的归一化与目标更新 |
+| `template_work` | 每模板的层宽及结构目标数量，各批的实际启动次数另计 |
 | `h2d_bytes_per_loop` / `d2h_bytes_per_loop` | 每轮按逻辑副本数统计的传输字节 |
 | `h2d_copy_ops_per_loop` / `d2h_copy_ops_per_loop` | 每轮 H2D/D2H 操作次数，字节相同不代表操作次数相同 |
 

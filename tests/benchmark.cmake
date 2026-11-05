@@ -339,6 +339,33 @@ if(NOT bytes EQUAL expected OR NOT first EQUAL 64 OR NOT tail EQUAL 2)
     message(FATAL_ERROR "incorrect natural padding or exact tail bytes")
 endif()
 
+# Wide mapped sources share a target. Two batches (33+2) exercise both
+# copy tails and real source-target block/launch accounting, beyond a diagonal.
+file(WRITE "${TEST_DIRECTORY}/wide-targets.mtx" "35 35 103\n")
+foreach(i RANGE 1 34)
+    file(APPEND "${TEST_DIRECTORY}/wide-targets.mtx" "${i} ${i} 4\n35 ${i} 1\n")
+endforeach()
+foreach(i RANGE 1 34)
+    file(APPEND "${TEST_DIRECTORY}/wide-targets.mtx" "${i} 35 1\n")
+endforeach()
+file(APPEND "${TEST_DIRECTORY}/wide-targets.mtx" "35 35 50\n")
+execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/wide-targets.mtx" --tasks 35 --batch-size 33
+    --updates mapped --graph --warmup 1 --loops 2 --diagnostics --output "${TEST_DIRECTORY}/wide-targets.json"
+    RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 60)
+if(NOT status EQUAL 0)
+    message(FATAL_ERROR "wide targets failed: ${output}${error}")
+endif()
+file(READ "${TEST_DIRECTORY}/wide-targets.json" result)
+string(JSON launches GET "${result}" launches_per_loop)
+string(JSON blocks GET "${result}" wide_blocks_per_loop)
+string(JSON checked GET "${result}" checked_tasks)
+string(JSON wide_levels GET "${result}" template_work 0 wide_levels)
+string(JSON targets GET "${result}" template_work 0 wide_target_pairs)
+if(NOT launches EQUAL 10 OR NOT blocks EQUAL 204 OR NOT checked EQUAL 35 OR
+   NOT wide_levels EQUAL 1 OR NOT targets EQUAL 34)
+    message(FATAL_ERROR "incorrect source-target wide accounting")
+endif()
+
 set(ENV{CUDA_VISIBLE_DEVICES} "-1")
 set(ENV{HIP_VISIBLE_DEVICES} "-1")
 execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" --loops 1 --warmup 0
