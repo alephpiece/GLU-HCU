@@ -19,7 +19,7 @@ public:
     ~GpuMatrix();
     unsigned tmp_slots() const; // Effective scratch slots; zero for Mapped.
     size_t task_device_bytes(unsigned batch_size = 1) const; // Exact buffers for one batch.
-    size_t task_host_bytes() const;
+    size_t task_host_bytes() const; // Bytes of one pinned input/output vector.
     // Device allocation payloads, excluding allocator/stream/Graph overhead.
     // shared_device_bytes includes update_map_bytes; it is paid once per template.
     size_t shared_device_bytes() const;
@@ -38,6 +38,11 @@ class GpuTask {
 public:
     // Independent copies of one immutable template; each copy owns its values,
     // output and (only in scan mode) scratch. One stream runs the entire batch.
+    // Tasks keep the template alive after its GpuMatrix wrapper is destroyed.
+    // Serialize calls on the same task; different tasks may use different host
+    // threads. Each submitting thread must first call GpuMatrix::select_device().
+    // Rebuild the task after a GPU submission or execution failure.
+    // Destruction drains even partially submitted work before releasing buffers.
     explicit GpuTask(const GpuMatrix&, unsigned batch_size = 1);
     unsigned batch_size() const;
     // Execution geometry diagnostics; identity layout reports stride zero.
@@ -51,13 +56,19 @@ public:
     // Capture numeric work and output. Each enqueue restores host input outside
     // the graph, preserving stream ordering. Input is immutable for task lifetime.
     // Explicit preparation, outside measured work; no queued input or outstanding enqueue.
+    // Repeated calls in this state reuse the prepared graph without recapturing.
     void prepare_graph();
     // One outstanding enqueue per task. wait() completes H2D, compute and D2H.
     void enqueue();
     // Optionally queue input early. enqueue() otherwise uploads it automatically.
-    // One call per completed iteration; invalidates previous factor results.
+    // Queue at most once before enqueue; this invalidates previous factor results.
+    // An upload alone is not a result: enqueue, then wait before reading factors.
     void upload_input();
+    // Complete submitted work and propagate asynchronous errors. Upload-only
+    // state is rejected because numeric work and output have not been enqueued.
     void wait();
+    // Task-owned view, readable after a successful wait. Valid until the next
+    // upload/enqueue or task destruction; copy selects one independent factor.
     const REAL* factors(unsigned copy = 0) const;
     void check() const; // finite factors and nonzero diagonal; after wait()
 private:

@@ -24,6 +24,7 @@ public:
 
     void predictLU(unsigned*, unsigned*, double*);
     // Complete preprocessed-matrix ||B-LU||inf / ||B||inf (long double accumulation).
+    // Includes product entries outside B's structural pattern.
     double factor_residual(const REAL* factors) const;
     void csr();
     void leveling();

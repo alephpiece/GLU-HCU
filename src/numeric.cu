@@ -490,6 +490,9 @@ unsigned filled_copy_bits(unsigned copies,unsigned cap) {
     while(bits<cap && (1u<<bits)<copies) ++bits;
     return bits;
 }
+// CUDA FP64 normalizes small SoA levels before their updates. Other backend /
+// precision combinations defer normalization; the single-copy mapped AoS path always
+// defers it. This policy does not change the task's input/output contract.
 #if !defined(GLU_USE_HIP) && !defined(GLU_USE_FP32)
 constexpr bool normalize_soa_levels=true;
 #else
