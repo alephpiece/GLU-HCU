@@ -50,7 +50,7 @@ public:
     GpuTask& operator=(const GpuTask&) = delete;
     // Capture numeric work and output. Each enqueue restores host input outside
     // the graph, preserving stream ordering. Input is immutable for task lifetime.
-    // Explicit preparation, outside measured work; no outstanding enqueue.
+    // Explicit preparation, outside measured work; no queued input or outstanding enqueue.
     void prepare_graph();
     // One outstanding enqueue per task. wait() completes H2D, compute and D2H.
     void enqueue();

@@ -318,7 +318,7 @@ foreach(graph "" "--graph")
     if(graph)
         set(expected_downloads 3)
     endif()
-    if(NOT input_order STREQUAL "per-batch-chain" OR NOT uploads EQUAL 7 OR NOT downloads EQUAL expected_downloads OR NOT bytes EQUAL expected_bytes OR
+    if(NOT input_order STREQUAL "all-inputs-first" OR NOT uploads EQUAL 7 OR NOT downloads EQUAL expected_downloads OR NOT bytes EQUAL expected_bytes OR
        NOT pinned EQUAL expected_pinned OR NOT checked EQUAL 7)
         message(FATAL_ERROR "mixed input/output payload accounting failed")
     endif()

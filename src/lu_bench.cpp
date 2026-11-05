@@ -268,6 +268,9 @@ int main(int argc, char** argv) {
         double worker_cpu_ms=0, worker_max_wall_ms=0;
         auto submit = [&]() {
             worker_cpu_ms=0; worker_max_wall_ms=0;
+            // Make all independent inputs eligible before queuing numeric chains.
+            // Every upload is ordered on its own task stream; no global barrier.
+            for(auto& task : tasks) task->upload_input();
             if (submit_threads==1) {
                 for (auto& task : tasks) task->enqueue();
                 return;
@@ -378,7 +381,7 @@ int main(int argc, char** argv) {
                << "\"CUDA\""
 #endif
                << ", \"real_bits\": " << sizeof(REAL)*8
-               << ", \"input_submission\": \"per-batch-chain\""
+               << ", \"input_submission\": \"all-inputs-first\""
                << ", \"device\": " << quoted(matrices[0]->gpu->device_name())
                << ",\n  \"schedule\": " << quoted(o.batch_size==1 ? "one-stream-per-task" : "one-stream-per-batch")
                << ", \"submission\": " << quoted(submit_threads>1 ? (o.graph ? "parallel-host-thread-graph" : "parallel-host-thread-direct") : (o.graph ? "single-host-thread-graph" : "single-host-thread-direct")) << ','
