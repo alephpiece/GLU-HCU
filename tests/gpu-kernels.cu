@@ -293,8 +293,8 @@ void test_limited_slots()
 
 void verify_template_bytes(const GpuMatrix& gpu, const Symbolic_Matrix& matrix, UpdateMode mode)
 {
-    const size_t structure = sizeof(unsigned)*(matrix.sym_c_ptr.size()+matrix.sym_r_idx.size()+
-        matrix.l_col_ptr.size()+matrix.csr_r_ptr.size()+matrix.csr_c_idx.size()+matrix.csr_diag_ptr.size())+
+    const size_t structure = sizeof(unsigned)*(matrix.sym_c_ptr.size()+matrix.l_col_ptr.size()+matrix.csr_r_ptr.size()+matrix.csr_diag_ptr.size()+
+        (mode==UpdateMode::Scan ? matrix.sym_r_idx.size()+matrix.csr_c_idx.size() : 0))+
         sizeof(int)*matrix.level_idx.size();
     uint64_t updates = 0;
     for (unsigned c=0; c<matrix.n; ++c)
@@ -306,7 +306,21 @@ void verify_template_bytes(const GpuMatrix& gpu, const Symbolic_Matrix& matrix, 
         (mode == UpdateMode::Scan ? size_t(matrix.n)*gpu.tmp_slots() : 0));
     if (gpu.task_device_bytes() != task)
         throw std::runtime_error("incorrect task device byte accounting");
-    if (gpu.update_map_bytes() != map || gpu.shared_device_bytes() != structure+map)
+    size_t extra=0;
+    if(mode==UpdateMode::Mapped) {
+        extra=sizeof(uint64_t)*(matrix.level_idx.size()+1);
+        for(size_t lev=0;lev+1<matrix.level_ptr.size();++lev)
+            if(matrix.level_ptr[lev+1]-matrix.level_ptr[lev]<=16)
+                extra+=sizeof(int)*size_t(matrix.level_ptr[lev+1]-matrix.level_ptr[lev]);
+    }
+    for(unsigned copies : {1u,2u,3u,31u,32u,33u,42u}) {
+        const unsigned lanes=1u<<filled_copy_bits(copies,5);
+        const unsigned pitch=mode==UpdateMode::Mapped && copies>1 ? (copies+lanes-1)/lanes*lanes : 0;
+        const size_t expected=sizeof(REAL)*(matrix.val.size()*(copies+pitch)+
+            (mode==UpdateMode::Scan ? size_t(matrix.n)*gpu.tmp_slots()*copies : 0));
+        if(gpu.task_device_bytes(copies)!=expected) throw std::runtime_error("incorrect batch device bytes");
+    }
+    if (gpu.update_map_bytes() != map || gpu.shared_device_bytes() != structure+map+extra)
         throw std::runtime_error("incorrect template device byte accounting");
     if (!std::isfinite(gpu.update_map_setup_ms()) || gpu.update_map_setup_ms() < 0 ||
         (mode == UpdateMode::Scan && gpu.update_map_setup_ms() != 0))
@@ -352,6 +366,16 @@ void test_repeated_tasks(bool graph = false, unsigned copies = 1, UpdateMode mod
         // all input, structure and launch metadata required by later enqueues.
     }
     for (unsigned loop=0; loop<4; ++loop) {
+        if(loop%2) for(auto& task : tasks) {
+            task->upload_input();
+            bool rejected_read=false,rejected_requeue=false,rejected_capture=false,rejected_wait=false;
+            try { task->factors(); } catch(const std::logic_error&) { rejected_read=true; }
+            try { task->upload_input(); } catch(const std::logic_error&) { rejected_requeue=true; }
+            try { task->prepare_graph(); } catch(const std::logic_error&) { rejected_capture=true; }
+            try { task->wait(); } catch(const std::logic_error&) { rejected_wait=true; }
+            if(!rejected_read || !rejected_requeue || !rejected_capture || !rejected_wait)
+                throw std::runtime_error("queued input allowed invalid reuse or result access");
+        }
         for (auto& task : tasks) task->enqueue();
         if (loop == 0) {
             bool rejected_read=false, rejected_reuse=false, rejected_capture=false;
@@ -581,6 +605,197 @@ void test_mapped(bool one_column, bool perturb, unsigned threads)
               << (perturb ? "perturb/" : "plain/") << threads << '\n';
 }
 
+Matrix make_layout_matrix(bool perturb, unsigned copy,unsigned variant = 0)
+{
+    Matrix matrix;
+    matrix.n = 100;
+    matrix.sources = {2, 5, 8, 11};
+    const unsigned shapes[][4]={{65,33,1,0},{0,1,2,3},{17,31,32,33},{9,3,2,0},{7,8,9,0}};
+    const unsigned fanouts[][4]={{5,3,4,2},{5,1,0,2},{5,3,4,2},{5,5,5,2},{5,3,0,2}};
+    if(variant>=5) throw std::invalid_argument("unknown mapped fixture");
+    const unsigned* lengths=shapes[variant];
+    const unsigned* targets=fanouts[variant];
+    std::vector<std::vector<std::pair<unsigned, REAL>>> columns(matrix.n);
+    for (unsigned c=0; c<matrix.n; ++c)
+        columns[c].emplace_back(c, REAL(4));
+    for (unsigned s=0; s<matrix.sources.size(); ++s) {
+        const unsigned c = matrix.sources[s];
+        columns[c][0].second = perturb ? (s % 2 ? REAL(-1e-12) : REAL(0))
+                                      : REAL(2u << s)*(REAL(1)+REAL(copy)/REAL(4));
+        for (unsigned i=0; i<lengths[s]; ++i)
+            columns[c].emplace_back(20+i, REAL(int(i % 7)-3)*REAL(copy+1)/REAL(8));
+    }
+    for (unsigned t=0; t<5; ++t) {
+        const unsigned c = 90+t;
+        std::vector<unsigned> rows{0, 6, 87, c};
+        for (unsigned s=0; s<matrix.sources.size(); ++s) {
+            if (t >= targets[s]) continue;
+            rows.push_back(matrix.sources[s]);
+            for (unsigned i=0; i<lengths[s]; ++i) rows.push_back(20+i);
+        }
+        std::sort(rows.begin(), rows.end());
+        rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+        columns[c].clear();
+        for (unsigned row : rows)
+            columns[c].emplace_back(row, REAL(0.5)+REAL(row % 7)/REAL(16)+
+                                         REAL(t)/REAL(32)+REAL(copy)/REAL(8));
+    }
+    matrix.column.push_back(0);
+    matrix.diagonal.resize(matrix.n);
+    std::vector<std::vector<unsigned>> rows(matrix.n);
+    for (unsigned c=0; c<matrix.n; ++c) {
+        for (const auto& entry : columns[c]) {
+            if (entry.first == c) matrix.diagonal[c] = matrix.row.size();
+            matrix.row.push_back(entry.first);
+            matrix.values.push_back(entry.second);
+            rows[entry.first].push_back(c);
+        }
+        matrix.column.push_back(matrix.row.size());
+    }
+    matrix.csr_row.push_back(0);
+    matrix.csr_diagonal.resize(matrix.n);
+    for (unsigned row=0; row<matrix.n; ++row) {
+        for (unsigned c : rows[row]) {
+            if (c == row) matrix.csr_diagonal[row] = matrix.csr_column.size();
+            matrix.csr_column.push_back(c);
+        }
+        matrix.csr_row.push_back(matrix.csr_column.size());
+    }
+    return matrix;
+}
+
+void test_layout(unsigned copies,unsigned variant,bool perturb,unsigned path) {
+    const bool soa=path!=0,wide=path==3,normalized=path==2;
+    const unsigned bits=filled_copy_bits(copies,wide ? 3 : 5),lanes=1u<<bits;
+    const unsigned alignment=1u<<filled_copy_bits(copies,5);
+    const unsigned pitch=(copies+alignment-1)/alignment*alignment,tiles_y=(copies+lanes-1)/lanes;
+    const REAL threshold=REAL(0.5);
+    const Matrix matrix=make_layout_matrix(perturb,0,variant);
+    const size_t nnz=matrix.values.size();
+    // Use a dense coordinate lookup as an independent map oracle, rather than
+    // duplicating the production builder's sorted-column merge.
+    const unsigned missing = std::numeric_limits<unsigned>::max();
+    std::vector<unsigned> positions(size_t(matrix.n)*matrix.n, missing);
+    for (unsigned c=0; c<matrix.n; ++c)
+        for (unsigned p=matrix.column[c]; p<matrix.column[c+1]; ++p)
+            positions[size_t(c)*matrix.n+matrix.row[p]] = p;
+    std::vector<uint64_t> bases(matrix.n+1);
+    std::vector<unsigned> destinations, pivots(matrix.csr_column.size(), missing);
+    for (unsigned c=0; c<matrix.n; ++c) {
+        bases[c] = destinations.size();
+        for (unsigned q=matrix.csr_diagonal[c]+1; q<matrix.csr_row[c+1]; ++q) {
+            const unsigned target = matrix.csr_column[q];
+            pivots[q] = positions[size_t(target)*matrix.n+c];
+            if (pivots[q] == missing) throw std::runtime_error("mapped fixture missing U entry");
+            for (unsigned p=matrix.diagonal[c]+1; p<matrix.column[c+1]; ++p) {
+                const unsigned destination = positions[size_t(target)*matrix.n+matrix.row[p]];
+                if (destination == missing) throw std::runtime_error("mapped fixture is not closed");
+                destinations.push_back(destination);
+            }
+        }
+        std::vector<unsigned> unique(destinations.begin()+bases[c],destinations.end());
+        std::sort(unique.begin(),unique.end());
+        if (std::adjacent_find(unique.begin(),unique.end())!=unique.end())
+            throw std::runtime_error("one mapped source has duplicate update destinations");
+    }
+    bases[matrix.n] = destinations.size();
+    std::vector<REAL> input, expected;
+    for (unsigned copy=0; copy<copies; ++copy) {
+        const Matrix distinct = make_layout_matrix(perturb, copy,variant);
+        input.insert(input.end(), distinct.values.begin(), distinct.values.end());
+        const auto result = reference_update(distinct, perturb, threshold);
+        expected.insert(expected.end(), result.begin(), result.end());
+    }
+    DeviceBuffer<unsigned> column(matrix.column), row(matrix.row), diagonal(matrix.diagonal);
+    DeviceBuffer<unsigned> csr_row(matrix.csr_row), csr_column(matrix.csr_column), csr_diagonal(matrix.csr_diagonal);
+    DeviceBuffer<uint64_t> map_bases(bases);
+    DeviceBuffer<unsigned> map_destinations(destinations), map_pivots(pivots);
+    // Nonzero levelHead plus a second chunk exercises both source-list offsets.
+    DeviceBuffer<int> sources(std::vector<int>{0, 2, 5, 8, 11});
+    std::vector<uint64_t> target_prefix{0,7};
+    for (unsigned c : {2u,5u,8u,11u})
+        target_prefix.push_back(target_prefix.back()+(matrix.column[c+1]>matrix.diagonal[c]+1
+            ? matrix.csr_row[c+1]-matrix.csr_diagonal[c]-1 : 0));
+    DeviceBuffer<uint64_t> prefix(target_prefix);
+    DeviceBuffer<REAL> values(input),interleaved(soa ? nnz*pitch : 1);
+    Stream stream;
+    for(unsigned repeat=0;repeat<2;++repeat) {
+        const REAL guard=repeat ? std::numeric_limits<REAL>::quiet_NaN() : REAL(12345.5);
+        const std::vector<REAL> guards(soa ? nnz*pitch : 1,guard);
+        check_gpu(cudaMemcpy(interleaved.data(),guards.data(),guards.size()*sizeof(REAL),cudaMemcpyHostToDevice),"initialize guards");
+        check_gpu(cudaMemcpy(values.data(),input.data(),input.size()*sizeof(REAL),cudaMemcpyHostToDevice),"restore oracle inputs");
+        const unsigned tiles=unsigned((nnz/32+(nnz%32!=0))*(copies/32+(copies%32!=0)));
+        if(soa) transpose_task_values<<<tiles,dim3(32,8),0,stream.value>>>(values.data(),interleaved.data(),copies,unsigned(nnz),unsigned(nnz),pitch);
+        if(wide) {
+            if(perturb)
+                mapped_wide_soa<true><<<dim3(4,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),
+                    csr_row.data(),csr_diagonal.data(),sources.data(),1,map_bases.data(),map_destinations.data(),map_pivots.data(),threshold,bits,pitch);
+            else
+                mapped_wide_soa<false><<<dim3(4,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),
+                    csr_row.data(),csr_diagonal.data(),sources.data(),1,map_bases.data(),map_destinations.data(),map_pivots.data(),0,bits,pitch);
+        } else {
+            if(normalized) {
+                if(perturb) mapped_normalize_level_soa<true><<<dim3(4,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),sources.data(),1,bits,threshold,pitch);
+                else mapped_normalize_level_soa<false><<<dim3(4,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),sources.data(),1,bits,0,pitch);
+            }
+            const unsigned targets=unsigned(target_prefix.back()-7);
+            if(soa) {
+                if(normalized) mapped_level_update_soa<false,true><<<dim3(targets,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),0,pitch,bits);
+                else if(perturb) mapped_level_update_soa<true><<<dim3(targets,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),threshold,pitch,bits);
+                else mapped_level_update_soa<false><<<dim3(targets,tiles_y),256,0,stream.value>>>(interleaved.data(),copies,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),0,pitch,bits);
+            } else {
+                if(perturb) mapped_level_update<true><<<dim3(targets,copies),256,0,stream.value>>>(values.data(),nnz,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),threshold);
+                else mapped_level_update<false><<<dim3(targets,copies),256,0,stream.value>>>(values.data(),nnz,column.data(),diagonal.data(),csr_diagonal.data(),sources.data(),prefix.data(),1,5,map_bases.data(),map_destinations.data(),map_pivots.data(),0);
+            }
+        }
+        if(soa) transpose_task_values<<<tiles,dim3(32,8),0,stream.value>>>(interleaved.data(),values.data(),unsigned(nnz),copies,pitch,unsigned(nnz));
+        if(!wide && !normalized) {
+            if(perturb) RL_onecol_factorizeCurrentCol<true,false,true><<<dim3(4,copies),256,0,stream.value>>>(column.data(),row.data(),values.data(),diagonal.data(),0,nullptr,0,matrix.n,nnz,0,threshold,sources.data(),1);
+            else RL_onecol_factorizeCurrentCol<false,false,true><<<dim3(4,copies),256,0,stream.value>>>(column.data(),row.data(),values.data(),diagonal.data(),0,nullptr,0,matrix.n,nnz,0,0,sources.data(),1);
+        }
+        check_gpu(cudaGetLastError(),"launch layout oracle kernels");
+        check_gpu(cudaStreamSynchronize(stream.value),"wait layout oracle");
+        compare(values.read(),expected,"layout factors and distinct values");
+        if(soa) {
+            const auto actual=interleaved.read();
+            for(size_t row=0;row<nnz;++row) for(unsigned copy=copies;copy<pitch;++copy)
+                if(repeat ? !std::isnan(actual[row*pitch+copy]) : actual[row*pitch+copy]!=guard)
+                    throw std::runtime_error("padding guard overwritten");
+        }
+    }
+}
+
+void test_small_level(bool graph,unsigned copies,bool perturb) {
+    // First level has four sources: zero targets, two targets, empty L, one
+    // target. The repeated prefixes are {0,0,2,2,3}; sources 1/3 overlap in col5.
+    unsigned columns[]{0,2,5,6,8,10,15};
+    unsigned rows[]{0,5, 1,4,5, 2, 3,5, 1,4, 1,2,3,4,5};
+    double values[]{4,2, 8,1,2, 16, 32,2, 2,20, 1,4,2,1,30};
+    if (perturb) values[5]=0;
+    std::ostringstream out,err;
+    Symbolic_Matrix matrix(6,out,err);
+    matrix.fill_in(rows,columns); matrix.csr();
+    matrix.predictLU(rows,columns,values); matrix.leveling();
+    if (matrix.level_ptr[1]!=4) throw std::runtime_error("small-level fixture width changed");
+    GpuMatrix control(matrix,1,perturb,UpdateMode::Scan);
+    GpuTask reference(control,copies);
+    reference.enqueue(); reference.wait(); reference.check();
+    GpuMatrix candidate(matrix,1,perturb,UpdateMode::Mapped);
+    verify_template_bytes(candidate,matrix,UpdateMode::Mapped);
+    GpuTask task(candidate,copies);
+    if (graph) task.prepare_graph();
+    for (unsigned loop=0; loop<3; ++loop) {
+        task.enqueue(); task.wait(); task.check();
+        for (unsigned copy=0; copy<copies; ++copy) {
+            compare(std::vector<REAL>(task.factors(copy),task.factors(copy)+matrix.nnz),
+                std::vector<REAL>(reference.factors(copy),reference.factors(copy)+matrix.nnz),
+                "two-stage unequal targets and empty L");
+            if (!perturb && matrix.factor_residual(task.factors(copy))>(sizeof(REAL)==4 ? 1e-5 : 1e-12))
+                throw std::runtime_error("two-stage full factor residual");
+        }
+    }
+}
+
 void test_invalid_factor(REAL value, const char* diagnostic)
 {
     unsigned column[]{0, 1}, row[]{0};
@@ -619,14 +834,17 @@ int main()
         test_batched(empty_lower, 64, true, "RL_perturb/empty-lower");
         test_one_column(empty_lower, true, "one-column/empty-lower");
         test_limited_slots();
-        for (UpdateMode mode : {UpdateMode::Scan, UpdateMode::Mapped}) {
-            test_repeated_tasks(false,1,mode);
-            test_repeated_tasks(true,1,mode);
-            test_repeated_tasks(false,3,mode);
-            test_repeated_tasks(true,3,mode);
-            test_repeated_tasks(false,16,mode);
-            test_repeated_tasks(true,16,mode);
-        }
+        for(UpdateMode mode : {UpdateMode::Scan,UpdateMode::Mapped})
+            for(bool graph : {false,true})
+                for(unsigned copies : {1u,2u,3u,16u,33u,42u})
+                    test_repeated_tasks(graph,copies,mode);
+        for(bool graph : {false,true})
+            for(unsigned copies : {1u,2u,3u,33u,42u})
+                for(bool perturb : {false,true}) test_small_level(graph,copies,perturb);
+        for(unsigned copies : {1u,2u,3u,7u,8u,9u,31u,32u,33u,42u})
+            for(unsigned variant=0;variant<5;++variant)
+                for(bool perturb : {false,true})
+                    for(unsigned path=0;path<4;++path) test_layout(copies,variant,perturb,path);
         test_zero_update_map();
         for (bool one_column : {false,true})
             for (bool perturb : {false,true}) test_distinct_copies(one_column,perturb);

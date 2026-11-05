@@ -130,7 +130,7 @@ make -j64 CUDA_ARCH=sm_90
 | `--warmup N` | 5 | 预热的全局 LOOP 数，允许 0 |
 | `--loops N` | 30 | 计时的全局 LOOP 数，必须大于 0 |
 | `--batch-size N` | 1 | 同模板独立副本的每批上限，每批一条 stream；必须大于 0 |
-| `--graph` | 关闭 | 在准备阶段捕获每批执行图，随后重放 |
+| `--graph` | 关闭 | 在准备阶段捕获每批数值与输出图，随后重放 |
 | `--updates scan\|mapped` | `scan` | 选择目标列扫描或预计算更新位置。`mapped` 增加每模板共享的准备和显存成本 |
 | `--submit-threads N` | 1 | 主机提交线程数上限，必须大于 0。不同批次可由不同线程提交 |
 | `--tmp-slots N` | 32 | scan 每任务 scratch 槽数上限，必须大于 0。mapped 不使用 scratch |
@@ -148,20 +148,23 @@ make -j64 CUDA_ARCH=sm_90
 每个模板只做一次预处理、符号分析和只读索引上传。任务共享模板的只读 pinned
 输入和设备结构，每个副本拥有独立数值区和 pinned 输出，scan 另有独立 scratch。
 每批使用一条 nonblocking stream。模板实现由任务保持寿命；副本之间不共享输出。批量减少
-stream 与分配次数，但不减少上述显式缓冲区总字节。
+stream 与分配次数。Mapped 多副本布局还分配一份交错 values，物理行按实际 copy tile 补齐，
+预检按各批和尾批准确累计显存。单副本不做布局转换。
 
-batch>1 时，默认每轮由主线程按模板交错提交各批的 `H2D 初值 → 数值分解 → D2H 因子` 链。
-每批先上传所有副本，再以 grid.y 区分副本执行共同 kernel 链，最后回传全部因子。
-全部批提交后逐流等待完成，然后才能开始下一轮。默认单线程时，batch-size=1 保持逐任务提交顺序。
+每轮按模板交错顺序提交各批的输入、数值与输出。
+上传与数值之间没有全局同步，每批的 stream 维护 `H2D 初值 → 数值分解 → D2H 因子` 依赖。
+全部批提交后逐流等待完成，然后才能开始下一轮。batch-size=1 按逻辑任务顺序组织批次。
 所有 kernel 显式使用所属批的 stream。
 `--submit-threads N` 大于 1 时，最多使用 N 个工作线程并行提交独立批次。
 实际线程数不超过批数，只有一批时仍由主线程提交。工作线程在每轮创建和汇合，
 这些成本包含在 LOOP 中。全部提交线程完成后，主线程再等待各 stream。
 此时批次开始提交的次序可以变化，逻辑任务和每批内部依赖保持一致。
-宽层使用 batched RL，小层在任务流内按列执行。scan 使用 factor/update/clear，
-mapped 直接读取归一化 L，使用 factor/update，不分配或清理 scratch。
-scan 宽层按 scratch 槽数分段，mapped 宽层一次启动整层，保留多源原子更新。
-实际批内副本数至少 16 时，RL block 最多 128 线程，单列 kernel 使用 256 线程。
+Scan 宽层使用 batched RL，按 scratch 槽数分段，小层按列执行 factor/update/clear。
+Mapped 不分配 scratch，宽层保留整层多源并行，小层按 source-target 对展开更新。
+多副本使用交错 values，使相邻 lanes 访问不同副本的同一符号位置，计时内包含双向转置。
+CUDA FP64 的多副本小层先归一化 L，其它 mapped 路径在输出前归一化小层 L，保留除法和 atomic 更新。
+Scan 的批内副本数至少 16 时，RL block 最多128线程，单列 kernel 使用256线程。
+
 较小批量沿用原线程规则，尾批按实际副本数选择。
 `LUonDevice` 是同一执行接口的单任务封装。性能计时使用 `glu_bench` 的 LOOP 指标；
 求解 CLI 的准备与分解耗时不使用同一计时边界。
@@ -182,7 +185,7 @@ scan 的 scratch 在准备阶段于任务流清零并等待完成。正常执行
 `templates[].effective_tmp_slots` 在 mapped 下为 0，表示不使用 scratch。
 
 `setup_ms` 包含预处理、资源分配、初始化和可选的图准备；`graph_setup_ms` 单列其中的
-捕获与实例化耗时。图捕获包含 H2D、计算和 D2H；准备时不执行分解。
+捕获与实例化耗时。图捕获包含数值和批量 D2H，H2D 在每轮的 Graph 外排队；准备时不执行分解。
 `warmup_ms` 单列全部预热时间，包括可能的首次重放开销。`loop_ms` 使用主机单调时钟，包含 H2D、
 计算提交、GPU 执行、D2H 和轮末等待；`ms_per_loop` 是这些完整轮次的算术平均。
 输出文件、检查、释放不在该区间。逻辑 stream 数不等于实际同时执行的任务数。
@@ -230,7 +233,9 @@ JSON 记录检查模式、后端、精度、设备、调度方式、模板与任
 
 `numeric.h` / `numeric.cu` 提供 `GpuMatrix`、`GpuTask` 和单任务兼容入口。
 `GpuTask(matrix, batch_size)` 表示同模板的一批独立副本；`factors(copy)` 读取对应输出。
-`prepare_graph()` 显式捕获并实例化图，可重复调用，且要求没有未完成的 enqueue。
+`prepare_graph()` 显式捕获并实例化图，可重复调用，且要求没有已排队输入或未完成的 enqueue。
+`enqueue()` 自动恢复输入，也可先调用 `upload_input()` 提前排队。一次输入之后只调用一次 enqueue，
+上传会使前一轮因子失效，需完成数值与输出后才能再次读取。
 `GpuTask::enqueue()` 不分配、不全局等待、不计时；`wait()` 完成该任务并传播异步错误。
 只有 wait 成功后才能读取因子，前一次提交未完成时禁止重用 task。析构会等待尚未
 完成的任务，再释放资源，包括异常后的部分提交。`Symbolic_Matrix::solve` 的因子

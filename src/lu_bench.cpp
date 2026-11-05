@@ -229,7 +229,9 @@ int main(int argc, char** argv) {
         for (size_t i=0; i<matrices.size(); ++i) {
             const auto& g=*matrices[i]->gpu;
             const size_t count=o.counts[i];
-            add_bytes(device_bytes,multiplied_bytes(count,g.task_device_bytes()));
+            const size_t batches=count/o.batch_size,tail=count%o.batch_size;
+            if(batches) add_bytes(device_bytes,multiplied_bytes(batches,g.task_device_bytes(o.batch_size)));
+            if(tail) add_bytes(device_bytes,g.task_device_bytes(unsigned(tail)));
             add_bytes(pinned_bytes,multiplied_bytes(count,g.task_host_bytes()));
         }
         const size_t available=GpuMatrix::free_device_bytes();
@@ -376,6 +378,7 @@ int main(int argc, char** argv) {
                << "\"CUDA\""
 #endif
                << ", \"real_bits\": " << sizeof(REAL)*8
+               << ", \"input_submission\": \"per-batch-chain\""
                << ", \"device\": " << quoted(matrices[0]->gpu->device_name())
                << ",\n  \"schedule\": " << quoted(o.batch_size==1 ? "one-stream-per-task" : "one-stream-per-batch")
                << ", \"submission\": " << quoted(submit_threads>1 ? (o.graph ? "parallel-host-thread-graph" : "parallel-host-thread-direct") : (o.graph ? "single-host-thread-graph" : "single-host-thread-direct")) << ','
@@ -400,37 +403,58 @@ int main(int argc, char** argv) {
         if (o.check == "full") report << tolerance; else report << "null";
         report << ",\n  \"diagnostics\": " << (o.diagnostics ? "true" : "false");
         if (o.diagnostics) {
-            size_t launches=0, transfer_bytes=0;
+            size_t launches=0,transfer_bytes=0,h2d_ops=0,wide_blocks=0;
             report << ",\n  \"template_work\": [";
-            for (size_t i=0; i<matrices.size(); ++i) {
+            for(size_t i=0;i<matrices.size();++i) {
                 const auto& a=*matrices[i]->symbolic;
                 const unsigned slots=matrices[i]->gpu->tmp_slots();
-                size_t batched=0, factor=0, update=0, clear=0;
-                unsigned max_width=0, single_column_levels=0;
-                for (size_t lev=0; lev+1<a.level_ptr.size(); ++lev) {
+                size_t wide=0,wide_columns=0,small=0,updates=0,factor=0,clear=0;
+                unsigned max_width=0;
+                for(size_t lev=0;lev+1<a.level_ptr.size();++lev) {
                     const unsigned width=unsigned(a.level_ptr[lev+1]-a.level_ptr[lev]);
                     max_width=std::max(max_width,width);
-                    single_column_levels += width==1;
-                    if (width>16) batched += o.updates == UpdateMode::Mapped ? 1 : (size_t(width)+slots-1)/slots;
-                    else for (int p=a.level_ptr[lev]; p<a.level_ptr[lev+1]; ++p) {
-                        const unsigned col=a.level_idx[p];
-                        ++factor;
-                        clear += o.updates == UpdateMode::Scan;
-                        update += a.csr_r_ptr[col+1]-a.csr_diag_ptr[col]-1>0;
+                    if(width>16) {
+                        wide+=o.updates==UpdateMode::Mapped ? 1 : (size_t(width)+slots-1)/slots;
+                        wide_columns+=width;
+                    } else {
+                        ++small;
+                        bool targets=false;
+                        for(int p=a.level_ptr[lev];p<a.level_ptr[lev+1];++p) {
+                            const unsigned col=a.level_idx[p];
+                            if(o.updates==UpdateMode::Scan) {
+                                ++factor;++clear;
+                                updates+=a.csr_r_ptr[col+1]-a.csr_diag_ptr[col]-1>0;
+                            } else targets|=a.sym_c_ptr[col+1]>a.l_col_ptr[col]+1 &&
+                                           a.csr_r_ptr[col+1]-a.csr_diag_ptr[col]-1>0;
+                        }
+                        if(o.updates==UpdateMode::Mapped) updates+=targets;
                     }
                 }
-                const size_t count=o.counts[i];
-                add_bytes(launches,multiplied_bytes(template_batches[i],batched+factor+update+clear));
-                add_bytes(transfer_bytes,multiplied_bytes(count,matrices[i]->gpu->task_host_bytes()));
-                if (i) report << ',';
+                for(size_t batch=0;batch<tasks.size();++batch) {
+                    if(task_template[batch]!=i) continue;
+                    const auto& t=*tasks[batch];
+                    const unsigned copies=t.batch_size();
+                    const bool soa=t.soa_value_stride()!=0;
+                    const size_t normalization=o.updates==UpdateMode::Mapped ?
+                        (t.normalizes_each_level() ? small : size_t(small!=0)) : 0;
+                    add_bytes(launches,wide+updates+factor+clear+normalization+(soa ? 2 : 0));
+                    const size_t copy_tiles=(copies+t.wide_copy_tile_size()-1)/t.wide_copy_tile_size();
+                    add_bytes(wide_blocks,multiplied_bytes(wide_columns,copy_tiles));
+                    add_bytes(h2d_ops,copies);
+                }
+                add_bytes(transfer_bytes,multiplied_bytes(o.counts[i],matrices[i]->gpu->task_host_bytes()));
+                if(i) report << ',';
                 report << "{\"levels\":" << a.num_lev << ",\"max_width\":" << max_width
-                       << ",\"single_column_levels\":" << single_column_levels
-                       << ",\"batched_launches\":" << batched << ",\"factor_launches\":" << factor
-                       << ",\"update_launches\":" << update << ",\"clear_launches\":" << clear << '}';
+                       << ",\"wide_launches\":" << wide << ",\"wide_source_columns\":" << wide_columns
+                       << ",\"small_levels\":" << small << ",\"update_launches\":" << updates
+                       << ",\"factor_launches\":" << factor << ",\"clear_launches\":" << clear << '}';
             }
             report << "],\n  \"launches_per_loop\": " << launches
+                   << ", \"wide_blocks_per_loop\": " << wide_blocks
                    << ", \"h2d_bytes_per_loop\": " << transfer_bytes
-                   << ", \"d2h_bytes_per_loop\": " << transfer_bytes;
+                   << ", \"d2h_bytes_per_loop\": " << transfer_bytes
+                   << ", \"h2d_copy_ops_per_loop\": " << h2d_ops
+                   << ", \"d2h_copy_ops_per_loop\": " << (o.graph ? tasks.size() : o.tasks);
             report << ",\n  \"submit_ms\": [";
             for (size_t i=0; i<o.loops; ++i) { if(i) report << ','; report << submit_ms[i]; }
             report << "],\n  \"drain_ms\": [";
@@ -451,6 +475,15 @@ int main(int argc, char** argv) {
         for (size_t i=0; i<tasks.size(); ++i) { if(i) report << ','; report << task_template[i]; }
         report << "],\n  \"batch_sizes\": [";
         for (size_t i=0; i<tasks.size(); ++i) { if(i) report << ','; report << tasks[i]->batch_size(); }
+        report << ']';
+        report << ",\n  \"update_copy_tile_sizes\": [";
+        for(size_t i=0;i<tasks.size();++i) { if(i) report << ',';report << tasks[i]->update_copy_tile_size(); }
+        report << "],\n  \"wide_copy_tile_sizes\": [";
+        for(size_t i=0;i<tasks.size();++i) { if(i) report << ',';report << tasks[i]->wide_copy_tile_size(); }
+        report << "],\n  \"soa_value_strides\": [";
+        for(size_t i=0;i<tasks.size();++i) { if(i) report << ',';report << tasks[i]->soa_value_stride(); }
+        report << "],\n  \"normalize_each_level\": [";
+        for(size_t i=0;i<tasks.size();++i) { if(i) report << ',';report << (tasks[i]->normalizes_each_level() ? "true" : "false"); }
         report << ']';
         report << ",\n  \"task_templates\": [";
         for (size_t i=0; i<o.tasks; ++i) {
