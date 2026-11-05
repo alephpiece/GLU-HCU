@@ -515,7 +515,7 @@ struct GpuMatrix::Impl {
     size_t shared_bytes = 0, map_bytes = 0, plan_bytes = 0;
     double map_setup_ms = 0, plan_setup_ms = 0;
     bool panel_mode=false,native_mmac=false;
-    unsigned row_splits=1;
+    unsigned row_splits=1,aos_update_threads=1024;
     REAL threshold = 0;
     std::string device;
     std::vector<int> levels, columns;
@@ -566,6 +566,10 @@ struct GpuMatrix::Impl {
         if(mode==UpdateMode::Mapped)if(const char* split=std::getenv("GLU_PROBE_ROW_SPLIT")) {
             if(std::string(split)!="1" && std::string(split)!="2")throw std::invalid_argument("row split probe must be 1 or 2");
             row_splits=std::string(split)=="2" ? 2 : 1;
+        }
+        if(mode==UpdateMode::Mapped)if(const char* threads=std::getenv("GLU_PROBE_AOS_THREADS")) {
+            if(std::string(threads)!="1024" && std::string(threads)!="256")throw std::invalid_argument("AoS update probe must be 1024 or 256");
+            aos_update_threads=std::string(threads)=="256" ? 256 : 1024;
         }
         if(row_splits>unsigned(prop.maxGridSize[2]))throw std::invalid_argument("row split grid exceeds device limit");
         unsigned needed = 1;
@@ -776,7 +780,7 @@ struct GpuTask::Impl {
                                 interleaved_values.ptr,copies,a.col.ptr,a.diag.ptr,a.csr_diag.ptr,a.level_idx.ptr,a.level_targets.ptr,
                                 begin,end,a.map_bases.ptr,a.map_destinations.ptr,a.map_pivots.ptr,a.threshold,soa_stride,copy_bits);
                         else
-                            mapped_level_update<Perturb><<<dim3(unsigned(targets),copies),column_threads,0,stream>>>(
+                            mapped_level_update<Perturb><<<dim3(unsigned(targets),copies),a.aos_update_threads,0,stream>>>(
                                 values.ptr,a.nnz,a.col.ptr,a.diag.ptr,a.csr_diag.ptr,a.level_idx.ptr,a.level_targets.ptr,
                                 begin,end,a.map_bases.ptr,a.map_destinations.ptr,a.map_pivots.ptr,a.threshold);
                         gpu_check(cudaGetLastError(),"update mapped level");
