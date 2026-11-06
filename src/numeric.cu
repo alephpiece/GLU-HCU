@@ -558,7 +558,7 @@ struct GpuMatrix::Impl {
         device = prop.name;
         max_batch = unsigned(prop.maxGridSize[1]);
         max_grid_x = unsigned(prop.maxGridSize[0]);
-#if defined(GLU_USE_HIP) && !defined(GLU_USE_FP32)
+#if defined(GLU_USE_HIP)
         native_mmac=mode==UpdateMode::PanelMmac && std::string(prop.gcnArchName).rfind("gfx936",0)==0;
 #endif
         unsigned needed = 1;

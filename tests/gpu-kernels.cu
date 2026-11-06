@@ -2,6 +2,8 @@
 // Compile this translation unit instead of numeric.cu, and link symbolic.cc.
 #include "../src/numeric.cu"
 
+#include <cstring>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -794,13 +796,24 @@ __global__ void mapped_dense_scalar(REAL* values,unsigned copies,unsigned stride
     if(copy<copies)scalar_dense_outputs(values,tiles[begin+blockIdx.x],indices,copy,stride,threadIdx.x>>bits,blockDim.x>>bits);
 }
 
-void test_dense_updates() {
+void test_dense_updates_case(unsigned length,bool full_mantissa) {
     // Independent coordinate fixture: no production planner or factorization
-    // oracle. Four views cover a partial 17x19 rectangle and a partial K=5.
-    constexpr unsigned nr=17,nc=19,length=5,stride=8;
+    // oracle. Four views cover a partial 17x19 rectangle; K is varied separately.
+    constexpr unsigned nr=17,nc=19,stride=8;
     constexpr unsigned dst_base=7,lower_base=dst_base+nr*nc+3;
-    constexpr unsigned pivot_base=lower_base+nr*length+3;
-    constexpr unsigned positions=pivot_base+nc*length+7;
+    const unsigned pivot_base=lower_base+nr*length+3;
+    const unsigned positions=pivot_base+nc*length+7;
+#if defined(GLU_USE_FP32)
+    // Test-side operand sensitivity proxy, not an emulation of a backend's
+    // accumulation order: round binary32 operands to ten fraction bits, RNE.
+    const auto tf32_rne=[](REAL value) {
+        uint32_t bits;std::memcpy(&bits,&value,sizeof(bits));
+        if((bits&0x7f800000u)!=0x7f800000u) {
+            bits+=0x00000fffu+((bits>>13)&1u);bits&=0xffffe000u;
+        }
+        std::memcpy(&value,&bits,sizeof(bits));return value;
+    };
+#endif
     const auto hole=[](unsigned r,unsigned c) {
         return (r==3 && c==2) || (r==5 && c==17) || (r==16 && c==18);
     };
@@ -828,15 +841,20 @@ void test_dense_updates() {
         for(unsigned copy=0;copy<copies;++copy) {
             for(unsigned c=0;c<nc;++c)for(unsigned r=0;r<nr;++r)
                 if(!hole(r,c))input[size_t(dst_base+c*nr+r)*stride+copy]=
-                    REAL(2)+REAL(r)/REAL(16)+REAL(c)/REAL(32)+REAL(copy)/REAL(8);
+                    full_mantissa ? REAL(2.0+double(r+1)/997.0+double(c+1)/1009.0+double(copy+1)/1013.0)
+                                  : REAL(2)+REAL(r)/REAL(16)+REAL(c)/REAL(32)+REAL(copy)/REAL(8);
             for(unsigned q=0;q<length;++q)for(unsigned r=0;r<nr;++r) {
-                REAL factor=REAL(int((3*r+5*q+7*copy)%17)-8)/REAL(64);
-                if(q==1)factor=REAL(1)+REAL(r+copy)/REAL(64); // Always a real update.
+                const int numerator=int((3*r+5*q+7*copy)%17)-8;
+                REAL factor=full_mantissa ? REAL(double(numerator)/29.0+double(r+3*q+copy+1)/8191.0)
+                                          : REAL(numerator)/REAL(64);
+                if(q==1)factor=full_mantissa ? REAL(1.0+double(r+copy+1)/1009.0)
+                                           : REAL(1)+REAL(r+copy)/REAL(64); // Always a real update.
                 if(nonfinite && q==0)factor=REAL(0);
                 input[size_t(lower_base+q*nr+r)*stride+copy]=factor;
             }
             for(unsigned q=0;q<length;++q)for(unsigned c=0;c<nc;++c) {
-                REAL pivot=REAL(1)+REAL(2*c+q+3*copy)/REAL(64);
+                REAL pivot=full_mantissa ? REAL(1.0+double(2*c+q+3*copy+1)/997.0)
+                                         : REAL(1)+REAL(2*c+q+3*copy)/REAL(64);
                 if(nonfinite && q==0 && copy%2==0) {
                     if(c==1)pivot=std::numeric_limits<REAL>::infinity();
                     if(c==17)pivot=std::numeric_limits<REAL>::quiet_NaN();
@@ -846,20 +864,42 @@ void test_dense_updates() {
         }
         std::vector<long double> expected(input.size(),0);
         std::vector<unsigned char> writable(input.size(),0);
+#if defined(GLU_USE_FP32)
+        unsigned tf32_distinguished=0;
+#endif
         for(unsigned copy=0;copy<copies;++copy)
             for(unsigned c=0;c<nc;++c)for(unsigned r=0;r<nr;++r) {
                 if(hole(r,c))continue;
                 const size_t dst=size_t(dst_base+c*nr+r)*stride+copy;
                 long double acc=input[dst];
+#if defined(GLU_USE_FP32)
+                long double tf32_acc=acc;
+#endif
                 for(unsigned q=0;q<length;++q) {
                     const REAL factor=input[size_t(lower_base+q*nr+r)*stride+copy];
                     // In particular, never evaluate zero times Inf or NaN.
                     if(factor!=REAL(0))acc-=static_cast<long double>(factor)*
                         static_cast<long double>(input[size_t(pivot_base+q*nc+c)*stride+copy]);
+#if defined(GLU_USE_FP32)
+                    if(full_mantissa && !nonfinite) {
+                        const REAL rounded=tf32_rne(factor);
+                        if(rounded!=REAL(0))tf32_acc-=static_cast<long double>(rounded)*
+                            static_cast<long double>(tf32_rne(input[size_t(pivot_base+q*nc+c)*stride+copy]));
+                    }
+#endif
                 }
                 if(!std::isfinite(acc))throw std::logic_error("dense oracle must remain finite");
                 expected[dst]=acc;writable[dst]=1;
+#if defined(GLU_USE_FP32)
+                const long double tolerance=64*static_cast<long double>(std::numeric_limits<REAL>::epsilon())*
+                    std::max(1.0L,std::fabs(acc));
+                if(full_mantissa && !nonfinite && std::fabs(tf32_acc-acc)>8*tolerance)++tf32_distinguished;
+#endif
             }
+#if defined(GLU_USE_FP32)
+        if(full_mantissa && !nonfinite && tf32_distinguished<8)
+            throw std::logic_error("dense full-mantissa fixture lacks TF32 operand sensitivity, K="+std::to_string(length));
+#endif
         unsigned bits=0;while((1u<<bits)<copies)++bits;
         for(bool mmac:{false,true}) {
             DeviceBuffer<REAL> values(input);
@@ -886,14 +926,21 @@ void test_dense_updates() {
                 if(!valid) {
                     std::ostringstream error;
                     error<<"dense "<<(mmac ? "mmac-or-fallback" : "scalar")<<" copies="<<copies
-                         <<" nonfinite="<<nonfinite<<" position="<<i
+                         <<" K="<<length<<" full_mantissa="<<full_mantissa<<" nonfinite="<<nonfinite<<" position="<<i
                          <<(writable[i] ? " output mismatch" : " unexpected write");
+                    if(writable[i])error<<std::setprecision(std::numeric_limits<long double>::max_digits10)
+                        <<" actual="<<static_cast<long double>(actual[i])<<" expected="<<expected[i];
                     throw std::runtime_error(error.str());
                 }
             }
         }
     }
-    std::cout<<"PASS dense/independent-coordinate-oracle-holes-tail-and-nonfinite\n";
+}
+
+void test_dense_updates() {
+    test_dense_updates_case(5,false); // Preserve the original binary-grid control.
+    for(unsigned length:{3u,4u,5u,9u})test_dense_updates_case(length,true);
+    std::cout<<"PASS dense/independent-coordinate-oracle-full-mantissa-holes-tail-and-nonfinite\n";
 }
 
 void test_panel_boundaries() {

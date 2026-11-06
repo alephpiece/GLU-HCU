@@ -7,7 +7,7 @@
 using namespace std;
 
 // Each strategy owns only its execution representation, shared by value copies.
-// PanelMmac extracts dense rectangles; unsupported devices/precisions use scalar.
+// PanelMmac extracts dense rectangles; other GPU targets use scalar.
 enum class UpdateMode { Scan, Mapped, Panel, PanelMmac };
 
 // Single-device execution. Templates own immutable input/structure; tasks retain
