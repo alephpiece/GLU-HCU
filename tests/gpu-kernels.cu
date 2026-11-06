@@ -901,9 +901,9 @@ void test_dense_updates_case(unsigned length,bool full_mantissa) {
             throw std::logic_error("dense full-mantissa fixture lacks TF32 operand sensitivity, K="+std::to_string(length));
 #endif
         unsigned bits=0;while((1u<<bits)<copies)++bits;
-        for(bool mmac:{false,true}) {
+        for(bool tiled:{false,true}) {
             DeviceBuffer<REAL> values(input);
-            if(mmac)mapped_dense_mmac<<<dim3(4,(copies+3)/4),256,0,stream.value>>>(
+            if(tiled)panel_tiled_update<<<dim3(4,(copies+3)/4),256,0,stream.value>>>(
                 values.data(),copies,stride,device_tiles.data(),device_indices.data(),0);
             else mapped_dense_scalar<<<dim3(4,(copies+(1u<<bits)-1)/(1u<<bits)),256,0,stream.value>>>(
                 values.data(),copies,stride,bits,device_tiles.data(),device_indices.data(),0);
@@ -925,7 +925,7 @@ void test_dense_updates_case(unsigned length,bool full_mantissa) {
                 }
                 if(!valid) {
                     std::ostringstream error;
-                    error<<"dense "<<(mmac ? "mmac-or-fallback" : "scalar")<<" copies="<<copies
+                    error<<"dense "<<(tiled ? "tiled" : "scalar")<<" copies="<<copies
                          <<" K="<<length<<" full_mantissa="<<full_mantissa<<" nonfinite="<<nonfinite<<" position="<<i
                          <<(writable[i] ? " output mismatch" : " unexpected write");
                     if(writable[i])error<<std::setprecision(std::numeric_limits<long double>::max_digits10)
@@ -961,7 +961,7 @@ void test_panel_boundaries() {
     std::ostringstream out,err;Symbolic_Matrix matrix(n,out,err);
     matrix.fill_in(rows.data(),columns.data());matrix.csr();matrix.predictLU(rows.data(),columns.data(),input.data());matrix.leveling();
     if(matrix.num_lev!=int(n))throw std::runtime_error("panel chain fixture changed");
-    for(UpdateMode mode:{UpdateMode::Panel,UpdateMode::PanelMmac})
+    for(UpdateMode mode:{UpdateMode::Panel,UpdateMode::PanelTiled})
         for(unsigned copies:{1u,3u,33u})for(bool graph:{false,true})for(bool perturb:{false,true}) {
         GpuMatrix gpu(matrix,1,perturb,mode);GpuTask task(gpu,copies);if(graph)task.prepare_graph();
         for(unsigned repeat=0;repeat<2;++repeat) {
@@ -1024,7 +1024,7 @@ void test_fresh_inputs()
     if(matrix.sym_c_ptr!=columns || matrix.sym_r_idx!=rows)
         throw std::runtime_error("fresh input fixture changed factor-slot layout");
 
-    for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped,UpdateMode::Panel,UpdateMode::PanelMmac})
+    for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped,UpdateMode::Panel,UpdateMode::PanelTiled})
         for(unsigned copies:{1u,3u,33u}) for(bool graph:{false,true}) {
         try {
             GpuMatrix gpu(matrix,1,false,mode);

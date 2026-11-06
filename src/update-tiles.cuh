@@ -24,7 +24,7 @@ __device__ __forceinline__ DenseMmacVector dense_mmac(REAL a,REAL b,DenseMmacVec
     return c;
 }
 #endif
-__global__ void mapped_dense_mmac(REAL* values,unsigned copies,unsigned stride,
+__global__ void panel_tiled_update(REAL* values,unsigned copies,unsigned stride,
         const DenseUpdateTile* tiles,const unsigned* indices,unsigned begin) {
     const unsigned lane=threadIdx.x%64,copy=blockIdx.y*4+threadIdx.x/64;
     if(copy>=copies)return;

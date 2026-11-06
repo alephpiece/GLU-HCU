@@ -547,9 +547,9 @@ struct GpuMatrix::Impl {
     {
         if (!n || !nnz || !requested_slots || levels.size() < 2)
             throw std::invalid_argument("empty matrix or zero scratch slots");
-        if (mode != UpdateMode::Scan && mode != UpdateMode::Mapped && mode != UpdateMode::Panel && mode != UpdateMode::PanelMmac)
+        if (mode != UpdateMode::Scan && mode != UpdateMode::Mapped && mode != UpdateMode::Panel && mode != UpdateMode::PanelTiled)
             throw std::invalid_argument("invalid update mode");
-        panel_mode=mode==UpdateMode::Panel || mode==UpdateMode::PanelMmac;
+        panel_mode=mode==UpdateMode::Panel || mode==UpdateMode::PanelTiled;
         GpuMatrix::select_device();
         cudaDeviceProp prop;
         gpu_check(cudaGetDeviceProperties(&prop, 0), "get device properties");
@@ -559,7 +559,7 @@ struct GpuMatrix::Impl {
         max_batch = unsigned(prop.maxGridSize[1]);
         max_grid_x = unsigned(prop.maxGridSize[0]);
 #if defined(GLU_USE_HIP)
-        native_mmac=mode==UpdateMode::PanelMmac && std::string(prop.gcnArchName).rfind("gfx936",0)==0;
+        native_mmac=mode==UpdateMode::PanelTiled && std::string(prop.gcnArchName).rfind("gfx936",0)==0;
 #endif
         unsigned needed = 1;
         for (size_t i=1; i<levels.size(); ++i) {
@@ -576,7 +576,7 @@ struct GpuMatrix::Impl {
         level_idx.upload(a.level_idx);
         if(panel_mode) {
             const auto begin=std::chrono::steady_clock::now();
-            auto plan=make_panel_update_plan(a,32,mode==UpdateMode::PanelMmac);
+            auto plan=make_panel_update_plan(a,32,mode==UpdateMode::PanelTiled);
             for(size_t bytes:{checked_bytes(plan.groups.size(),sizeof(UpdateGroup)),checked_bytes(plan.pairs.size(),sizeof(NormalizedUpdatePair)),
                               checked_bytes(plan.dense_tiles.size(),sizeof(DenseUpdateTile)),checked_bytes(plan.dense_indices.size(),sizeof(unsigned))})
                 plan_bytes=checked_sum(plan_bytes,bytes);
@@ -745,7 +745,7 @@ struct GpuTask::Impl {
                 update(a.panel_deferred[lev]);gpu_check(cudaGetLastError(),"panel deferred update");
                 const auto range=a.panel_dense[lev];
                 if(range.end>range.begin) {
-                    mapped_dense_mmac<<<dim3(range.end-range.begin,(copies+3)/4),256,0,stream>>>(
+                    panel_tiled_update<<<dim3(range.end-range.begin,(copies+3)/4),256,0,stream>>>(
                         data,copies,stride,a.dense_tiles.ptr,a.dense_indices.ptr,range.begin);
                     gpu_check(cudaGetLastError(),"panel dense update");
                 }
