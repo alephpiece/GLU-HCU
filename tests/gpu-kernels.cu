@@ -1,6 +1,73 @@
 // Numeric kernel and host scheduling regressions, without preprocessing.
 // Compile this translation unit instead of numeric.cu, and link symbolic.cc.
+#include "gpu-compat.h"
+
+namespace async_fault {
+
+#if defined(GLU_USE_HIP)
+constexpr cudaError_t copy_error=hipErrorInvalidValue, sync_error=hipErrorUnknown;
+#else
+constexpr cudaError_t copy_error=cudaErrorInvalidValue, sync_error=cudaErrorUnknown;
+#endif
+
+struct State {
+    bool fail_upload,override_sync,same_stream=true;
+    unsigned h2d_calls=0,d2h_calls=0,h2d_submitted=0,sync_calls=0,sync_successes=0;
+    cudaStream_t stream=nullptr;
+};
+State* active=nullptr;
+
+struct Scope {
+    explicit Scope(State& state) { active=&state; }
+    ~Scope() { active=nullptr; }
+    Scope(const Scope&)=delete;
+    Scope& operator=(const Scope&)=delete;
+};
+
+cudaError_t memcpy_async(void* destination,const void* source,size_t bytes,
+                         decltype(cudaMemcpyHostToDevice) kind,cudaStream_t stream)
+{
+    State* state=active;
+    if(state && (kind==cudaMemcpyHostToDevice || kind==cudaMemcpyDeviceToHost)) {
+        if(state->h2d_calls+state->d2h_calls==0) state->stream=stream;
+        else state->same_stream=state->same_stream && state->stream==stream;
+        unsigned& calls=kind==cudaMemcpyHostToDevice ? state->h2d_calls : state->d2h_calls;
+        ++calls;
+        if((state->fail_upload && kind==cudaMemcpyHostToDevice && calls==2) ||
+           (!state->fail_upload && kind==cudaMemcpyDeviceToHost && calls==1))
+            return copy_error;
+    }
+    const auto status=cudaMemcpyAsync(destination,source,bytes,kind,stream);
+    if(state && kind==cudaMemcpyHostToDevice && status==cudaSuccess) ++state->h2d_submitted;
+    return status;
+}
+
+cudaError_t stream_synchronize(cudaStream_t stream)
+{
+    const auto status=cudaStreamSynchronize(stream);
+    if(active) {
+        ++active->sync_calls;
+        active->same_stream=active->same_stream && active->stream==stream;
+        if(status==cudaSuccess) {
+            ++active->sync_successes;
+            if(active->override_sync) return sync_error;
+        }
+    }
+    return status;
+}
+
+} // namespace async_fault
+
+// Wrap only numeric.cu calls; keep runtime declarations and HIP aliases intact.
+#pragma push_macro("cudaMemcpyAsync")
+#pragma push_macro("cudaStreamSynchronize")
+#undef cudaMemcpyAsync
+#undef cudaStreamSynchronize
+#define cudaMemcpyAsync async_fault::memcpy_async
+#define cudaStreamSynchronize async_fault::stream_synchronize
 #include "../src/numeric.cu"
+#pragma pop_macro("cudaStreamSynchronize")
+#pragma pop_macro("cudaMemcpyAsync")
 
 #include <cstring>
 #include <iomanip>
@@ -983,6 +1050,60 @@ void expect_task_rejection(Operation operation, const char* diagnostic)
     if(!rejected) throw std::runtime_error(diagnostic);
 }
 
+void test_submission_failure_cleanup()
+{
+    constexpr unsigned copies=2;
+    unsigned columns[]{0,2,4},rows[]{0,1,0,1};
+    double values[]{4,2,1,3}; // Closed 2x2 pattern with nonzero known LU pivots.
+    std::ostringstream out,err;
+    Symbolic_Matrix matrix(2,out,err);
+    matrix.fill_in(rows,columns);matrix.csr();
+    matrix.predictLU(rows,columns,values);matrix.leveling();
+    GpuMatrix gpu(matrix,1,false,UpdateMode::Scan);
+    Buffer<REAL,true> input;
+    const size_t elements=size_t(matrix.nnz)*copies;
+    input.allocate(elements);
+    for(unsigned copy=0;copy<copies;++copy)
+        std::copy(matrix.val.begin(),matrix.val.end(),input.ptr+size_t(copy)*matrix.nnz);
+
+    for(bool fail_upload:{true,false}) for(bool override_sync:{false,true}) {
+        GpuTask task(gpu,copies);
+        async_fault::State state{fail_upload,override_sync};
+        async_fault::Scope fault(state);
+        if(!fail_upload) {
+            task.upload_input(input.ptr,elements);
+            if(state.sync_calls!=0)
+                throw std::runtime_error("successful fresh upload unexpectedly synchronized");
+        }
+        std::string diagnostic;
+        try {
+            if(fail_upload) task.upload_input(input.ptr,elements);
+            else task.enqueue();
+        } catch(const std::runtime_error& error) { diagnostic=error.what(); }
+        const char* operation=fail_upload ? "upload matrix input" : "download matrix factors";
+        const std::string expected=std::string(operation)+": "+cudaGetErrorString(async_fault::copy_error);
+        if(diagnostic!=expected)
+            throw std::runtime_error("submission failure lost original error: "+diagnostic);
+        // Assert before task destruction can drain anything. The pinned AoS
+        // source remains alive, including while enqueue drains earlier uploads.
+        if(state.h2d_calls!=copies || state.h2d_submitted!=(fail_upload ? 1u : copies) ||
+           state.d2h_calls!=(fail_upload ? 0u : 1u) || !state.same_stream ||
+           state.sync_calls!=1 || state.sync_successes!=1)
+            throw std::runtime_error("submission failure did not drain prior copies on its stream");
+        expect_task_rejection<std::logic_error>([&] { task.enqueue(); },
+            "failed task accepted enqueue");
+        expect_task_rejection<std::logic_error>([&] { task.upload_input(); },
+            "failed task accepted default upload");
+        expect_task_rejection<std::logic_error>([&] { task.upload_input(input.ptr,elements); },
+            "failed task accepted fresh upload");
+        expect_task_rejection<std::logic_error>([&] { task.prepare_graph(); },
+            "failed task accepted graph preparation");
+        expect_task_rejection<std::logic_error>([&] { task.factors(); },
+            "failed task allowed result access");
+    }
+    std::cout<<"PASS host/submission-failure-drain-and-original-error\n";
+}
+
 void test_fresh_inputs()
 {
     // A small closed pattern keeps every round in the same factor-slot layout.
@@ -1170,6 +1291,7 @@ int main()
         test_dense_updates();
         test_panel_boundaries();
         test_fresh_inputs();
+        test_submission_failure_cleanup();
         test_zero_update_map();
         for (bool one_column : {false,true})
             for (bool perturb : {false,true}) test_distinct_copies(one_column,perturb);

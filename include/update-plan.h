@@ -11,7 +11,7 @@
 
 // Structural panel plan. Every entry is a multiply-subtract; stable destination
 // sorting changes ownership, never the contribution set.
-struct UpdateContribution { unsigned destination, lower, pivot, diagonal; };
+struct UpdateContribution { unsigned destination, lower, pivot; };
 struct NormalizedUpdatePair { unsigned lower, pivot; };
 struct UpdateGroup { unsigned destination, begin, end; };
 inline std::vector<UpdateContribution> level_contributions(const Symbolic_Matrix& a,unsigned level) {
@@ -27,7 +27,7 @@ inline std::vector<UpdateContribution> level_contributions(const Symbolic_Matrix
             for(unsigned l=a.l_col_ptr[source]+1;l<a.sym_c_ptr[source+1];++l) {
                 while(at<end && a.sym_r_idx[at]<a.sym_r_idx[l]) ++at;
                 if(at==end || a.sym_r_idx[at]!=a.sym_r_idx[l]) throw std::runtime_error("aggregation missing lower row");
-                out.push_back({at,l,pivot,a.l_col_ptr[source]});
+                out.push_back({at,l,pivot});
             }
         }
     }
@@ -88,7 +88,7 @@ inline void extract_dense_updates(const Symbolic_Matrix& a,
         }
     }
     for (const auto& u : deferred)
-        if (u.destination >= a.nnz || u.lower >= a.nnz || u.pivot >= a.nnz || u.diagonal >= a.nnz)
+        if (u.destination >= a.nnz || u.lower >= a.nnz || u.pivot >= a.nnz)
             throw std::runtime_error("dense update contribution index");
     std::stable_sort(deferred.begin(), deferred.end(), [](const auto& x, const auto& y) {
         return x.destination < y.destination;
@@ -208,7 +208,8 @@ inline PanelUpdatePlan make_panel_update_plan(const Symbolic_Matrix& a,unsigned 
                 const unsigned c=unsigned(a.level_idx[p]);
                 for(unsigned q=a.l_col_ptr[c];q<a.sym_c_ptr[c+1];++q)needed[q]=1;
             }
-            for(const auto& u:levels.back()){needed[u.lower]=1;needed[u.pivot]=1;needed[u.diagonal]=1;}
+            // The source loop above covers every diagonal and lower operand.
+            for(const auto& u:levels.back())needed[u.pivot]=1;
         }
         std::vector<UpdateContribution> delayed;
         for(unsigned lev=begin;lev<end;++lev) {

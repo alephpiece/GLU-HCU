@@ -55,7 +55,7 @@ public:
     unsigned soa_value_stride() const;
     bool normalizes_each_level() const;
     size_t numeric_launches() const;
-    size_t numeric_wide_blocks() const;
+    size_t numeric_wide_blocks() const; // Scan/Mapped only; zero means not applicable for panel modes.
     ~GpuTask();
     GpuTask(const GpuTask&) = delete;
     GpuTask& operator=(const GpuTask&) = delete;
@@ -75,6 +75,7 @@ public:
     // unchanged through enqueue()+wait(); pinned storage permits async upload.
     // Reuses the prepared Graph and does not replace the template's default.
     // Not available with perturbation (whose threshold belongs to the snapshot).
+    // On submission failure, attempt to drain before rethrowing; rebuild the task.
     void upload_input(const REAL* values, size_t elements);
     // Complete submitted work and propagate asynchronous errors. Upload-only
     // state is rejected because numeric work and output have not been enqueued.

@@ -970,7 +970,7 @@ void GpuTask::upload_input() {
     if(t.failed || t.pending || t.input_queued) throw std::logic_error("cannot queue task input in this state");
     t.ready=false;
     try { t.enqueue_input();t.input_queued=true; }
-    catch(...) { t.failed=true;throw; }
+    catch(...) { t.failed=true;cudaStreamSynchronize(t.stream);throw; }
 }
 void GpuTask::upload_input(const REAL* values,size_t elements) {
     auto& t=*impl_;
@@ -979,7 +979,9 @@ void GpuTask::upload_input(const REAL* values,size_t elements) {
     if(t.failed || t.pending || t.input_queued)throw std::logic_error("cannot queue task input in this state");
     t.ready=false;
     try {t.enqueue_input(values);t.input_queued=true;}
-    catch(...) {t.failed=true;throw;}
+    // Earlier copies may already be queued. Drain before the caller can release
+    // the external input; a cleanup error must not replace the original error.
+    catch(...) {t.failed=true;cudaStreamSynchronize(t.stream);throw;}
 }
 void GpuTask::enqueue() {
     auto& t=*impl_;
@@ -991,7 +993,7 @@ void GpuTask::enqueue() {
         t.input_queued=false;
         if(t.graph_exec) gpu_check(cudaGraphLaunch(t.graph_exec,t.stream),"launch task graph");
         else t.enqueue_work(false);
-    } catch(...) { t.failed=true;throw; }
+    } catch(...) { t.failed=true;cudaStreamSynchronize(t.stream);throw; }
 }
 void GpuTask::wait() {
     auto& t = *impl_;

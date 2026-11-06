@@ -176,7 +176,7 @@ scan 使用每副本独立的 scratch，`--tmp-slots` 控制其槽数上限，�
 
 panel 将 32 层依赖窗口内可延后的贡献按目标归约，及时完成窗口内需要读取的更新。tiled 在 panel 基础上提取符合结构条件的局部密集块，在 gfx936 FP32/FP64 使用原生矩阵指令，其它目标使用标量回退，不通过 TF32 转换降低输入精度。两者只构造自身的分组和索引，不同时保留普通位置映射，也不分配 scratch。它们的准备时间、容量和收益依赖结构及复用条件，需要显式选择。多副本仍包含 SoA 转换，单副本保持 AoS。聚合及矩阵指令会改变浮点累加次序，选择策略时仍需验证所选精度的数值结果。
 
-C++ 任务接口可通过 `upload_input(values, elements)` 上传固定执行符号结构下的新数值。输入采用因子槽位顺序，各副本以 AoS 连续存放，元素数严格等于 `factor_nnz × batch_size`。调用者保持源内存可读且不变，直到 `enqueue()` 和 `wait()` 完成，pinned host 内存可支持异步上传。它复用已有 Graph，不替换模板默认输入，不接受与 perturbation 同用。原始矩阵非零模式相同并不自动保证重排、填充和主元安排不变，调用者须保持执行结构一致。
+C++ 任务接口可通过 `upload_input(values, elements)` 上传固定执行符号结构下的新数值。输入采用因子槽位顺序，各副本以 AoS 连续存放，元素数严格等于 `factor_nnz × batch_size`。调用者保持源内存可读且不变，直到 `enqueue()` 和 `wait()` 完成，pinned host 内存可支持异步上传。提交失败会尽力等待已排队操作结束，再抛出原异常，失败任务需重建。它复用已有 Graph，不替换模板默认输入，不接受与 perturbation 同用。原始矩阵非零模式相同并不自动保证重排、填充和主元安排不变，调用者须保持执行结构一致。
 
 程序预检映射或更新计划及任务缓冲能否放入当前空闲显存，失败时明确退出，不自动调整任务、批量或槽数。mapped 多副本要求每层的有效 source-target 对数不超过设备 `grid.x` 上限，panel/tiled 也检查计划执行网格，超限时明确报错。预检不包含运行时内部开销，也不保证后续设备或 pinned host 分配成功。
 
@@ -211,7 +211,7 @@ C++ 任务接口可通过 `upload_input(values, elements)` 上传固定执行符
 | `submit_workers_cpu_ms` | 全部提交工作线程的 CPU 时间之和，可大于提交墙钟。单线程时为 0 |
 | `submit_worker_max_wall_ms` | 最慢提交工作线程的墙钟耗时。单线程时为 0 |
 | `launches_per_loop` | 每轮底层 GPU kernel 次数，Graph 重放时不等于主机 launch API 次数 |
-| `wide_blocks_per_loop` | 每轮宽层数值 kernel 的线程块总数，包含适用路径的归一化与目标更新 |
+| `wide_blocks_per_loop` | scan/mapped 每轮宽层数值 kernel 的线程块总数，包含适用路径的归一化与目标更新。panel/tiled 返回 0 表示不适用 |
 | `template_work` | 每模板的层宽及 L 非空源列的结构目标数量，各批实际启动次数另计。panel/tiled 不适用的层内启动字段为 null |
 | `h2d_bytes_per_loop` / `d2h_bytes_per_loop` | 每轮按逻辑副本数统计的传输字节 |
 | `h2d_copy_ops_per_loop` / `d2h_copy_ops_per_loop` | 每轮 H2D/D2H 操作次数，字节相同不代表操作次数相同 |
