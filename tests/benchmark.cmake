@@ -21,6 +21,10 @@ string(JSON second GET "${result}" templates 1 tasks)
 if(NOT count EQUAL 3 OR NOT first EQUAL 4 OR NOT second EQUAL 3)
     message(FATAL_ERROR "incorrect loops or task assignment")
 endif()
+string(JSON requested GET "${result}" snapshot_policy)
+if(NOT requested STREQUAL "auto")
+    message(FATAL_ERROR "default snapshot request is not auto")
+endif()
 execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" -i "${TEST_DIRECTORY}/b.mtx"
     --tasks 7 --warmup 1 --loops 2 --check basic --diagnostics --output "${TEST_DIRECTORY}/basic.json"
     RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 60)
@@ -97,9 +101,10 @@ foreach(execution direct graph)
     string(JSON ordering GET "${mapped}" ordering)
     string(JSON backend GET "${mapped}" backend)
     string(JSON bits GET "${mapped}" real_bits)
-    set(expected_launches 9)
+    # The two multi-copy batches prepare their layout before numerical work.
+    set(expected_launches 7)
     if(backend STREQUAL "CUDA" AND bits EQUAL 64)
-        set(expected_launches 10)
+        set(expected_launches 8)
     endif()
     if(NOT checked EQUAL 7 OR NOT launches EQUAL expected_launches OR NOT threads EQUAL 3 OR
        NOT bytes GREATER 0 OR shared LESS bytes OR NOT ordering STREQUAL "parallel-batches")
@@ -380,10 +385,127 @@ string(JSON blocks GET "${result}" wide_blocks_per_loop)
 string(JSON checked GET "${result}" checked_tasks)
 string(JSON wide_levels GET "${result}" template_work 0 wide_levels)
 string(JSON targets GET "${result}" template_work 0 wide_target_pairs)
-if(NOT launches EQUAL 10 OR NOT blocks EQUAL 204 OR NOT checked EQUAL 35 OR
+if(NOT launches EQUAL 8 OR NOT blocks EQUAL 204 OR NOT checked EQUAL 35 OR
    NOT wide_levels EQUAL 1 OR NOT targets EQUAL 34)
     message(FATAL_ERROR "incorrect source-target wide accounting")
 endif()
+
+# Snapshot policies preserve all independent factors and numerical work.
+# Input restoration counts the broadcast/restore and layout preparation per batch.
+foreach(policy IN ITEMS shared device)
+    execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/wide-targets.mtx" --tasks 35 --batch-size 33
+        --updates mapped --graph --snapshot-policy "${policy}" --warmup 1 --loops 2 --check full --diagnostics
+        --output "${TEST_DIRECTORY}/snapshot-${policy}.json"
+        RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 60)
+    if(NOT status EQUAL 0)
+        message(FATAL_ERROR "snapshot ${policy} failed: ${output}${error}")
+    endif()
+    file(READ "${TEST_DIRECTORY}/snapshot-${policy}.json" result)
+    foreach(field IN ITEMS snapshot_policy h2d_bytes_per_loop h2d_copy_ops_per_loop d2h_bytes_per_loop
+            d2h_copy_ops_per_loop input_restore_launches_per_loop launches_per_loop checked_tasks pinned_bytes real_bits)
+        string(JSON ${field} GET "${result}" ${field})
+    endforeach()
+    string(JSON nnz GET "${result}" templates 0 factor_nnz)
+    math(EXPR one "${nnz}*${real_bits}/8")
+    math(EXPR expected_h2d "2*${one}")
+    math(EXPR expected_d2h "35*${one}")
+    math(EXPR expected_pinned "36*${one}")
+    set(expected_ops 2)
+    if(policy STREQUAL "device")
+        set(expected_h2d 0)
+        set(expected_ops 0)
+    endif()
+    if(NOT snapshot_policy STREQUAL policy OR NOT h2d_bytes_per_loop EQUAL expected_h2d OR
+       NOT h2d_copy_ops_per_loop EQUAL expected_ops OR NOT d2h_bytes_per_loop EQUAL expected_d2h OR
+       NOT d2h_copy_ops_per_loop EQUAL 2 OR NOT input_restore_launches_per_loop EQUAL 4 OR
+       NOT launches_per_loop EQUAL 8 OR NOT checked_tasks EQUAL 35 OR NOT pinned_bytes EQUAL expected_pinned)
+        message(FATAL_ERROR "snapshot ${policy} numerical coverage or transfer accounting")
+    endif()
+endforeach()
+execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx" --snapshot-policy unsupported
+    RESULT_VARIABLE status OUTPUT_QUIET ERROR_QUIET)
+if(status EQUAL 0)
+    message(FATAL_ERROR "unsupported snapshot policy accepted")
+endif()
+
+# A 33+1 split must resolve the same Auto request differently for panel tails.
+foreach(strategy scan mapped panel tiled)
+    foreach(execution direct graph)
+        set(graph_option)
+        set(snapshot_option) # Also exercise omission of the default option.
+        if(execution STREQUAL "graph")
+            set(graph_option --graph)
+            set(snapshot_option --snapshot-policy auto)
+        endif()
+        # Force overrides on one panel configuration as well as checking Auto.
+        set(policies auto)
+        if(strategy STREQUAL "panel" AND execution STREQUAL "graph")
+            list(APPEND policies per-copy shared device)
+        endif()
+        foreach(policy IN LISTS policies)
+            set(policy_option ${snapshot_option})
+            if(NOT policy STREQUAL "auto")
+                set(policy_option --snapshot-policy ${policy})
+            endif()
+            execute_process(COMMAND "${GLU_BENCH}" -i "${TEST_DIRECTORY}/a.mtx"
+                --tasks 34 --batch-size 33 --updates ${strategy} ${graph_option} ${policy_option}
+                --warmup 1 --loops 2 --check full --diagnostics
+                --output "${TEST_DIRECTORY}/auto-${strategy}-${execution}-${policy}.json"
+                RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 60)
+            if(NOT status EQUAL 0)
+                message(FATAL_ERROR "Auto tail failed: ${strategy}/${execution}/${policy}: ${output}${error}")
+            endif()
+            file(READ "${TEST_DIRECTORY}/auto-${strategy}-${execution}-${policy}.json" result)
+            foreach(field snapshot_policy snapshot_setup_ms real_bits h2d_bytes_per_loop h2d_copy_ops_per_loop
+                    d2h_bytes_per_loop d2h_copy_ops_per_loop input_restore_launches_per_loop checked_tasks pinned_bytes)
+                string(JSON ${field} GET "${result}" ${field})
+            endforeach()
+            string(JSON nnz GET "${result}" templates 0 factor_nnz)
+            string(JSON first GET "${result}" batch_snapshot_policies 0)
+            string(JSON tail GET "${result}" batch_snapshot_policies 1)
+            math(EXPR one "${nnz}*${real_bits}/8")
+            math(EXPR all "34*${one}")
+            math(EXPR pinned "35*${one}")
+            set(expected_first per-copy)
+            set(expected_tail per-copy)
+            set(expected_ops 34)
+            set(expected_restore 0)
+            set(expected_h2d ${all})
+            if(policy STREQUAL "shared" OR (policy STREQUAL "auto" AND strategy STREQUAL "panel"))
+                set(expected_first shared)
+                set(expected_ops 2)
+                set(expected_restore 1)
+                math(EXPR expected_h2d "2*${one}")
+            endif()
+            if(policy STREQUAL "shared")
+                set(expected_tail shared)
+            elseif(policy STREQUAL "device")
+                set(expected_first device)
+                set(expected_tail device)
+                set(expected_ops 0)
+                set(expected_restore 2)
+                set(expected_h2d 0)
+            endif()
+            # Only the 33-copy batch uses SoA, independently of snapshot policy.
+            if(NOT strategy STREQUAL "scan")
+                math(EXPR expected_restore "${expected_restore}+1")
+            endif()
+            set(output_ops 34)
+            if(execution STREQUAL "graph")
+                set(output_ops 2)
+            endif()
+            if(NOT snapshot_policy STREQUAL policy OR NOT first STREQUAL expected_first OR NOT tail STREQUAL expected_tail OR
+               NOT h2d_bytes_per_loop EQUAL expected_h2d OR NOT h2d_copy_ops_per_loop EQUAL expected_ops OR
+               NOT input_restore_launches_per_loop EQUAL expected_restore OR NOT d2h_bytes_per_loop EQUAL all OR
+               NOT d2h_copy_ops_per_loop EQUAL output_ops OR NOT checked_tasks EQUAL 34 OR NOT pinned_bytes EQUAL pinned)
+                message(FATAL_ERROR "Auto or forced policy tail/IO/coverage accounting: ${strategy}/${execution}/${policy}")
+            endif()
+            if(policy STREQUAL "auto" AND NOT snapshot_setup_ms EQUAL 0)
+                message(FATAL_ERROR "Auto added device snapshot preparation")
+            endif()
+        endforeach()
+    endforeach()
+endforeach()
 
 set(ENV{CUDA_VISIBLE_DEVICES} "-1")
 set(ENV{HIP_VISIBLE_DEVICES} "-1")

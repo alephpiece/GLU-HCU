@@ -195,6 +195,9 @@ struct PanelUpdatePlan {
     uint64_t dense_products=0;
     uint64_t immediate_products=0,deferred_products=0;
 };
+// Keep destinations read anywhere in this dependency window current at each
+// level. Only unread destinations may be grouped across levels and applied at
+// the window end; dense extraction partitions those same deferred contributions.
 inline PanelUpdatePlan make_panel_update_plan(const Symbolic_Matrix& a,unsigned window,bool dense=false) {
     if(!window)throw std::invalid_argument("zero aggregation window");
     PanelUpdatePlan plan;plan.immediate.resize(a.num_lev);plan.deferred.resize(a.num_lev);plan.dense_ranges.resize(a.num_lev);

@@ -14,6 +14,7 @@ __device__ void scalar_dense_outputs(REAL* values,const DenseUpdateTile& tile,co
     }
 }
 #if defined(__gfx936__)
+// REAL selects native f32/f64 operands and accumulation; no TF32 conversion.
 using DenseMmacVector=REAL __attribute__((ext_vector_type(4)));
 __device__ __forceinline__ DenseMmacVector dense_mmac(REAL a,REAL b,DenseMmacVector c) {
 #if defined(GLU_USE_FP32)

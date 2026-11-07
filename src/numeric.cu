@@ -450,6 +450,13 @@ __global__ void RL_onecol_cleartmpMem(
 
 
 namespace {
+// Resolve once per task, including its actual tail-batch size. Keep execution
+// and diagnostics on the same effective policy; Auto never adds device residency.
+SnapshotPolicy resolve_snapshot_policy(SnapshotPolicy requested,UpdateMode mode,unsigned copies) {
+    if(requested!=SnapshotPolicy::Auto)return requested;
+    return copies>1 && mode==UpdateMode::Panel
+        ? SnapshotPolicy::Shared : SnapshotPolicy::PerCopy;
+}
 // Copy lanes fill naturally up to the fixed kernel cap. This is also the
 // physical row alignment, so tiny batches do not pay a 32-column allocation.
 unsigned filled_copy_bits(unsigned copies,unsigned cap) {
@@ -506,13 +513,22 @@ template<class T, bool Pinned = false> struct Buffer {
 };
 }
 
+// Separate destinations let all copies factor independently. For Shared, the
+// first uploaded copy is read-only until this stream finishes the broadcast.
+__global__ void restore_snapshot(REAL* destination,const REAL* source,unsigned nnz) {
+    const size_t at=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(at<nnz) destination[size_t(blockIdx.y)*nnz+at]=source[at];
+}
+
 struct GpuMatrix::Impl {
     unsigned n, nnz, slots, max_batch, max_grid_x;
     unsigned deferred_columns_count=0;
     bool perturb;
     UpdateMode update_mode;
+    SnapshotPolicy snapshot_policy;
     size_t shared_bytes = 0, map_bytes = 0, plan_bytes = 0;
     double map_setup_ms = 0, plan_setup_ms = 0;
+    double snapshot_setup_ms=0;
     bool panel_mode=false,native_mmac=false;
     REAL threshold = 0;
     std::string device;
@@ -530,6 +546,7 @@ struct GpuMatrix::Impl {
     Buffer<DenseUpdateTile> dense_tiles;
     Buffer<unsigned> dense_indices;
     Buffer<REAL, true> input;
+    Buffer<REAL> initial_values;
 
     unsigned value_pitch(unsigned copies) const {
         if(!copies || copies>max_batch) throw std::invalid_argument("batch size exceeds device grid limit");
@@ -540,8 +557,9 @@ struct GpuMatrix::Impl {
         return unsigned(pitch);
     }
 
-    Impl(const Symbolic_Matrix& a, unsigned requested_slots, bool use_perturb, UpdateMode mode)
+    Impl(const Symbolic_Matrix& a, unsigned requested_slots, bool use_perturb, UpdateMode mode,SnapshotPolicy snapshot)
         : n(a.n), nnz(a.nnz), slots(0), perturb(use_perturb), update_mode(mode),
+          snapshot_policy(snapshot),
           levels(a.level_ptr), columns(a.level_idx), csr_rows(a.csr_r_ptr),
           csr_diags(a.csr_diag_ptr), diagonals(a.l_col_ptr)
     {
@@ -549,6 +567,9 @@ struct GpuMatrix::Impl {
             throw std::invalid_argument("empty matrix or zero scratch slots");
         if (mode != UpdateMode::Scan && mode != UpdateMode::Mapped && mode != UpdateMode::Panel && mode != UpdateMode::PanelTiled)
             throw std::invalid_argument("invalid update mode");
+        if(snapshot!=SnapshotPolicy::Auto && snapshot!=SnapshotPolicy::PerCopy &&
+           snapshot!=SnapshotPolicy::Shared && snapshot!=SnapshotPolicy::Device)
+            throw std::invalid_argument("invalid snapshot policy");
         panel_mode=mode==UpdateMode::Panel || mode==UpdateMode::PanelTiled;
         GpuMatrix::select_device();
         cudaDeviceProp prop;
@@ -618,6 +639,12 @@ struct GpuMatrix::Impl {
             shared_bytes = checked_sum(shared_bytes, bytes);
         input.allocate(nnz);
         std::copy(a.val.begin(), a.val.end(), input.ptr);
+        if(snapshot_policy==SnapshotPolicy::Device) {
+            const auto start=std::chrono::steady_clock::now();
+            initial_values.upload(a.val);
+            shared_bytes=checked_sum(shared_bytes,initial_values.bytes);
+            snapshot_setup_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        }
         if (perturb) {
             for (unsigned j=0; j<n; ++j) {
                 REAL sum = 0;
@@ -681,6 +708,7 @@ struct GpuMatrix::Impl {
 
 struct GpuTask::Impl {
     std::shared_ptr<const GpuMatrix::Impl> matrix;
+    const SnapshotPolicy snapshot_policy;
     Buffer<REAL> values, scratch, interleaved_values;
     Buffer<REAL, true> output;
     cudaStream_t stream = nullptr;
@@ -689,7 +717,8 @@ struct GpuTask::Impl {
     bool pending=false,ready=false,failed=false,input_queued=false;
     unsigned copy_tiles(unsigned bits) const { return (copies+(1u<<bits)-1)>>bits; }
     explicit Impl(std::shared_ptr<const GpuMatrix::Impl> m,unsigned batch)
-        : matrix(std::move(m)),copies(batch),copy_bits(filled_copy_bits(batch,5)),soa_stride(matrix->value_pitch(batch)) {
+        : matrix(std::move(m)),snapshot_policy(resolve_snapshot_policy(matrix->snapshot_policy,matrix->update_mode,batch)),
+          copies(batch),copy_bits(filled_copy_bits(batch,5)),soa_stride(matrix->value_pitch(batch)) {
         if(soa_stride && !matrix->panel_mode)for(size_t lev=0;lev+1<matrix->levels.size();++lev)
             if(matrix->target_prefix[matrix->levels[lev+1]]-matrix->target_prefix[matrix->levels[lev]]>matrix->max_grid_x)
                 throw std::invalid_argument("mapped level targets exceed device grid limit");
@@ -709,14 +738,33 @@ struct GpuTask::Impl {
             }
         } catch(...) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); throw; }
     }
-    void enqueue_input(const REAL* input=nullptr) {
+    void enqueue_aos_input(const REAL* input) {
         if(input) {
             gpu_check(cudaMemcpyAsync(values.ptr,input,values.bytes,cudaMemcpyHostToDevice,stream),"upload matrix input");
+            return;
+        }
+        if(snapshot_policy==SnapshotPolicy::Device) {
+            restore_snapshot<<<dim3(matrix->nnz/256u+(matrix->nnz%256u!=0),copies),256,0,stream>>>(
+                values.ptr,matrix->initial_values.ptr,matrix->nnz);
+            gpu_check(cudaGetLastError(),"restore device snapshot");
+            return;
+        }
+        if(snapshot_policy==SnapshotPolicy::Shared && copies>1) {
+            gpu_check(cudaMemcpyAsync(values.ptr,matrix->input.ptr,matrix->input.bytes,cudaMemcpyHostToDevice,stream),"upload shared snapshot");
+            restore_snapshot<<<dim3(matrix->nnz/256u+(matrix->nnz%256u!=0),copies-1),256,0,stream>>>(
+                values.ptr+matrix->nnz,values.ptr,matrix->nnz);
+            gpu_check(cudaGetLastError(),"broadcast shared snapshot");
             return;
         }
         for(unsigned copy=0;copy<copies;++copy)
             gpu_check(cudaMemcpyAsync(values.ptr+size_t(copy)*matrix->nnz,matrix->input.ptr,
                 size_t(matrix->nnz)*sizeof(REAL),cudaMemcpyHostToDevice,stream),"upload matrix input");
+    }
+    void enqueue_input(const REAL* input=nullptr) {
+        enqueue_aos_input(input);
+        // Every input path prepares the execution layout before numeric work.
+        // This boundary is independent of the snapshot policy and Graph capture.
+        if(soa_stride)transpose(true);
     }
     void transpose(bool to_interleaved) {
         const unsigned rows=to_interleaved ? copies : matrix->nnz,columns=to_interleaved ? matrix->nnz : copies;
@@ -731,7 +779,6 @@ struct GpuTask::Impl {
         const auto& a=*matrix;
         const unsigned column_threads=copies>=16 ? 256 : 1024;
         const bool soa=soa_stride!=0;
-        if(soa) transpose(true);
         if constexpr(Mode==UpdateMode::Mapped)if(a.panel_mode) {
             REAL* data=soa ? interleaved_values.ptr : values.ptr;
             const unsigned bits=soa ? copy_bits : 0,stride=soa ? soa_stride : 1,rows=256u>>bits;
@@ -874,8 +921,8 @@ struct GpuTask::Impl {
     }
 };
 
-GpuMatrix::GpuMatrix(const Symbolic_Matrix& a, unsigned slots, bool perturb, UpdateMode mode)
-    : impl_(std::make_shared<Impl>(a, slots, perturb, mode)) {}
+GpuMatrix::GpuMatrix(const Symbolic_Matrix& a, unsigned slots, bool perturb, UpdateMode mode,SnapshotPolicy snapshot)
+    : impl_(std::make_shared<Impl>(a, slots, perturb, mode,snapshot)) {}
 GpuMatrix::~GpuMatrix() = default;
 unsigned GpuMatrix::tmp_slots() const { return impl_->slots; }
 size_t GpuMatrix::task_device_bytes(unsigned copies) const {
@@ -887,6 +934,8 @@ size_t GpuMatrix::task_device_bytes(unsigned copies) const {
     return bytes;
 }
 size_t GpuMatrix::task_host_bytes() const { return size_t(impl_->nnz)*sizeof(REAL); }
+SnapshotPolicy GpuMatrix::snapshot_policy() const { return impl_->snapshot_policy; }
+double GpuMatrix::snapshot_setup_ms() const { return impl_->snapshot_setup_ms; }
 size_t GpuMatrix::shared_device_bytes() const { return impl_->shared_bytes; }
 size_t GpuMatrix::update_map_bytes() const { return impl_->map_bytes; }
 double GpuMatrix::update_map_setup_ms() const { return impl_->map_setup_ms; }
@@ -907,6 +956,23 @@ size_t GpuMatrix::free_device_bytes() {
 }
 GpuTask::GpuTask(const GpuMatrix& matrix,unsigned batch) : impl_(new Impl(matrix.impl_,batch)) {}
 unsigned GpuTask::batch_size() const { return impl_->copies; }
+SnapshotPolicy GpuTask::snapshot_policy() const { return impl_->snapshot_policy; }
+size_t GpuTask::snapshot_h2d_bytes() const {
+    const auto& t=*impl_;
+    if(t.snapshot_policy==SnapshotPolicy::Device)return 0;
+    return t.snapshot_policy==SnapshotPolicy::Shared ? t.matrix->input.bytes : t.values.bytes;
+}
+size_t GpuTask::snapshot_h2d_ops() const {
+    const auto& t=*impl_;
+    if(t.snapshot_policy==SnapshotPolicy::Device)return 0;
+    return t.snapshot_policy==SnapshotPolicy::PerCopy ? t.copies : 1;
+}
+size_t GpuTask::snapshot_restore_launches() const {
+    const auto& t=*impl_;
+    const bool restore=t.snapshot_policy==SnapshotPolicy::Device ||
+        (t.snapshot_policy==SnapshotPolicy::Shared && t.copies>1);
+    return size_t(restore)+size_t(t.soa_stride!=0);
+}
 GpuTask::~GpuTask() = default;
 
 unsigned GpuTask::update_copy_tile_size() const { return impl_->soa_stride ? 1u<<impl_->copy_bits : 1; }
@@ -916,7 +982,8 @@ bool GpuTask::normalizes_each_level() const { return impl_->matrix->panel_mode |
 
 size_t GpuTask::numeric_launches() const {
     const auto& t=*impl_;const auto& a=*t.matrix;
-    size_t count=t.soa_stride ? 2 : 0;
+    // Input paths prepare the execution layout; numeric work converts only output.
+    size_t count=t.soa_stride ? 1 : 0;
     if(a.panel_mode) {
         count+=a.levels.size()-1;
         for(const auto r:a.panel_immediate)count+=r.end>r.begin;

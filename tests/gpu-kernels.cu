@@ -362,7 +362,7 @@ void test_limited_slots()
 }
 
 
-void verify_template_bytes(const GpuMatrix& gpu, const Symbolic_Matrix& matrix, UpdateMode mode)
+void verify_template_bytes(const GpuMatrix& gpu, const Symbolic_Matrix& matrix, UpdateMode mode,SnapshotPolicy snapshot=SnapshotPolicy::PerCopy)
 {
     const size_t structure = sizeof(unsigned)*(matrix.sym_c_ptr.size()+matrix.l_col_ptr.size()+matrix.csr_r_ptr.size()+matrix.csr_diag_ptr.size()+
         (mode==UpdateMode::Scan ? matrix.sym_r_idx.size()+matrix.csr_c_idx.size() : 0))+
@@ -391,14 +391,15 @@ void verify_template_bytes(const GpuMatrix& gpu, const Symbolic_Matrix& matrix, 
             (mode==UpdateMode::Scan ? size_t(matrix.n)*gpu.tmp_slots()*copies : 0));
         if(gpu.task_device_bytes(copies)!=expected) throw std::runtime_error("incorrect batch device bytes");
     }
-    if (gpu.update_map_bytes() != map || gpu.shared_device_bytes() != structure+map+extra)
+    if (gpu.update_map_bytes() != map || gpu.shared_device_bytes() != structure+map+extra+
+        (snapshot==SnapshotPolicy::Device ? matrix.val.size()*sizeof(REAL) : 0))
         throw std::runtime_error("incorrect template device byte accounting");
     if (!std::isfinite(gpu.update_map_setup_ms()) || gpu.update_map_setup_ms() < 0 ||
         (mode == UpdateMode::Scan && gpu.update_map_setup_ms() != 0))
         throw std::runtime_error("incorrect map setup timing");
 }
 
-void test_repeated_tasks(bool graph = false, unsigned copies = 1, UpdateMode mode = UpdateMode::Scan)
+void test_repeated_tasks(bool graph = false, unsigned copies = 1, UpdateMode mode = UpdateMode::Scan,SnapshotPolicy snapshot=SnapshotPolicy::PerCopy)
 {
     std::ostringstream out, err;
     std::vector<std::unique_ptr<GpuTask>> tasks;
@@ -424,8 +425,8 @@ void test_repeated_tasks(bool graph = false, unsigned copies = 1, UpdateMode mod
         Symbolic_Matrix a(n,out,err);
         a.fill_in(row.data(),col.data()); a.csr();
         a.predictLU(row.data(),col.data(),val.data()); a.leveling();
-        GpuMatrix matrix(a, variant ? 3 : 1, false, mode);
-        verify_template_bytes(matrix, a, mode);
+        GpuMatrix matrix(a, variant ? 3 : 1, false, mode,snapshot);
+        verify_template_bytes(matrix, a, mode,snapshot);
         const unsigned expected_slots = mode == UpdateMode::Scan ? (variant ? 3u : 1u) : 0;
         if (matrix.tmp_slots() != expected_slots) throw std::runtime_error("wrong effective scratch slots");
         for (unsigned copy=0; copy<2; ++copy) {
@@ -1148,9 +1149,10 @@ void test_fresh_inputs()
         throw std::runtime_error("fresh input fixture changed factor-slot layout");
 
     for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped,UpdateMode::Panel,UpdateMode::PanelTiled})
+        for(SnapshotPolicy snapshot:{SnapshotPolicy::Auto,SnapshotPolicy::PerCopy,SnapshotPolicy::Shared,SnapshotPolicy::Device})
         for(unsigned copies:{1u,3u,33u}) for(bool graph:{false,true}) {
         try {
-            GpuMatrix gpu(matrix,1,false,mode);
+            GpuMatrix gpu(matrix,1,false,mode,snapshot);
             GpuTask task(gpu,copies);
             if(graph) task.prepare_graph(); // Once, before every subsequent fresh input.
             const size_t elements=size_t(matrix.nnz)*copies;
@@ -1223,7 +1225,7 @@ void test_fresh_inputs()
             task.enqueue();task.wait();
             check_values(task,default_input,default_factors);
             if(copies==3) {
-                GpuMatrix perturbed(matrix,1,true,mode);
+                GpuMatrix perturbed(matrix,1,true,mode,snapshot);
                 GpuTask rejected(perturbed,copies);
                 if(graph) rejected.prepare_graph();
                 expect_task_rejection<std::invalid_argument>([&] {
@@ -1239,6 +1241,54 @@ void test_fresh_inputs()
         }
     }
     std::cout<<"PASS host/fresh-input-fixed-structure-known-LU-and-state-contract\n";
+}
+
+void test_auto_snapshot()
+{
+    unsigned columns[]{0,2,4},rows[]{0,1,0,1};double input[]{4,2,1,3};
+    const std::vector<REAL> expected{4,REAL(.5),1,REAL(2.5)};
+    std::ostringstream out,err;Symbolic_Matrix matrix(2,out,err);
+    matrix.fill_in(rows,columns);matrix.csr();matrix.predictLU(rows,columns,input);matrix.leveling();
+    const std::pair<UpdateMode,SnapshotPolicy> modes[]{
+        {UpdateMode::Scan,SnapshotPolicy::PerCopy},{UpdateMode::Mapped,SnapshotPolicy::PerCopy},
+        {UpdateMode::Panel,SnapshotPolicy::Shared},{UpdateMode::PanelTiled,SnapshotPolicy::PerCopy}};
+    for(const auto& mode:modes) {
+        GpuMatrix defaults(matrix,1,false,mode.first);
+        if(defaults.snapshot_policy()!=SnapshotPolicy::Auto || defaults.snapshot_setup_ms()!=0)
+            throw std::runtime_error("default template must request Auto without device residency");
+        for(SnapshotPolicy requested:{SnapshotPolicy::Auto,SnapshotPolicy::PerCopy,SnapshotPolicy::Shared,SnapshotPolicy::Device}) {
+            GpuMatrix prepared(matrix,1,false,mode.first,requested);
+            if(prepared.snapshot_policy()!=requested ||
+               prepared.shared_device_bytes()!=defaults.shared_device_bytes()+
+                   (requested==SnapshotPolicy::Device ? matrix.nnz*sizeof(REAL):0))
+                throw std::runtime_error("snapshot request or persistent payload changed");
+            for(unsigned copies:{1u,3u}) {
+                GpuTask task(prepared,copies),default_task(defaults,copies);
+                const auto automatic=copies==1 ? SnapshotPolicy::PerCopy:mode.second;
+                const auto effective=requested==SnapshotPolicy::Auto ? automatic:requested;
+                if(default_task.snapshot_policy()!=automatic)
+                    throw std::runtime_error("default template did not resolve per task geometry");
+                const size_t one=matrix.nnz*sizeof(REAL);
+                const size_t bytes=effective==SnapshotPolicy::Device ? 0:
+                    effective==SnapshotPolicy::Shared ? one:one*copies;
+                const size_t ops=effective==SnapshotPolicy::Device ? 0:
+                    effective==SnapshotPolicy::Shared ? 1:copies;
+                const size_t restores=size_t(effective==SnapshotPolicy::Device ||
+                    (effective==SnapshotPolicy::Shared && copies>1))+
+                    size_t(copies>1 && mode.first!=UpdateMode::Scan);
+                for(bool graph:{false,true}) {
+                    if(graph)task.prepare_graph();
+                    if(task.snapshot_policy()!=effective || task.snapshot_h2d_bytes()!=bytes ||
+                       task.snapshot_h2d_ops()!=ops || task.snapshot_restore_launches()!=restores)
+                        throw std::runtime_error("resolved snapshot diagnostics disagree with task policy");
+                    task.enqueue();task.wait();task.check();
+                    for(unsigned copy=0;copy<copies;++copy)
+                        compare(std::vector<REAL>(task.factors(copy),task.factors(copy)+matrix.nnz),expected,"auto snapshot known LU");
+                }
+            }
+        }
+    }
+    std::cout<<"PASS host/auto-snapshot-per-task-policy-override-and-graph-stability\n";
 }
 
 void test_invalid_factor(REAL value, const char* diagnostic)
@@ -1292,7 +1342,12 @@ int main()
                     for(unsigned path=0;path<3;++path) test_layout(copies,variant,perturb,path);
         test_dense_updates();
         test_panel_boundaries();
+        for(SnapshotPolicy snapshot:{SnapshotPolicy::Shared,SnapshotPolicy::Device})
+            for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped})
+                for(unsigned copies:{1u,3u,33u})for(bool graph:{false,true})
+                    test_repeated_tasks(graph,copies,mode,snapshot);
         test_fresh_inputs();
+        test_auto_snapshot();
         test_submission_failure_cleanup();
         test_zero_update_map();
         for (bool one_column : {false,true})
