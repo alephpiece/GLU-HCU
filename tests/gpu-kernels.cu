@@ -33,12 +33,14 @@ cudaError_t memcpy_async(void* destination,const void* source,size_t bytes,
         else state->same_stream=state->same_stream && state->stream==stream;
         unsigned& calls=kind==cudaMemcpyHostToDevice ? state->h2d_calls : state->d2h_calls;
         ++calls;
-        if((state->fail_upload && kind==cudaMemcpyHostToDevice && calls==2) ||
-           (!state->fail_upload && kind==cudaMemcpyDeviceToHost && calls==1))
+        if(!state->fail_upload && kind==cudaMemcpyDeviceToHost && calls==1)
             return copy_error;
     }
     const auto status=cudaMemcpyAsync(destination,source,bytes,kind,stream);
     if(state && kind==cudaMemcpyHostToDevice && status==cudaSuccess) ++state->h2d_submitted;
+    // A failed upload must drain even if the batch DMA was already queued.
+    if(state && state->fail_upload && kind==cudaMemcpyHostToDevice && status==cudaSuccess)
+        return copy_error;
     return status;
 }
 
@@ -360,7 +362,7 @@ void test_limited_slots()
 }
 
 
-void verify_template_bytes(const GpuMatrix& gpu, const Symbolic_Matrix& matrix, UpdateMode mode)
+void verify_template_bytes(const GpuMatrix& gpu, const Symbolic_Matrix& matrix, UpdateMode mode,SnapshotPolicy snapshot=SnapshotPolicy::PerCopy)
 {
     const size_t structure = sizeof(unsigned)*(matrix.sym_c_ptr.size()+matrix.l_col_ptr.size()+matrix.csr_r_ptr.size()+matrix.csr_diag_ptr.size()+
         (mode==UpdateMode::Scan ? matrix.sym_r_idx.size()+matrix.csr_c_idx.size() : 0))+
@@ -389,14 +391,15 @@ void verify_template_bytes(const GpuMatrix& gpu, const Symbolic_Matrix& matrix, 
             (mode==UpdateMode::Scan ? size_t(matrix.n)*gpu.tmp_slots()*copies : 0));
         if(gpu.task_device_bytes(copies)!=expected) throw std::runtime_error("incorrect batch device bytes");
     }
-    if (gpu.update_map_bytes() != map || gpu.shared_device_bytes() != structure+map+extra)
+    if (gpu.update_map_bytes() != map || gpu.shared_device_bytes() != structure+map+extra+
+        (snapshot==SnapshotPolicy::Device ? matrix.val.size()*sizeof(REAL) : 0))
         throw std::runtime_error("incorrect template device byte accounting");
     if (!std::isfinite(gpu.update_map_setup_ms()) || gpu.update_map_setup_ms() < 0 ||
         (mode == UpdateMode::Scan && gpu.update_map_setup_ms() != 0))
         throw std::runtime_error("incorrect map setup timing");
 }
 
-void test_repeated_tasks(bool graph = false, unsigned copies = 1, UpdateMode mode = UpdateMode::Scan)
+void test_repeated_tasks(bool graph = false, unsigned copies = 1, UpdateMode mode = UpdateMode::Scan,SnapshotPolicy snapshot=SnapshotPolicy::PerCopy)
 {
     std::ostringstream out, err;
     std::vector<std::unique_ptr<GpuTask>> tasks;
@@ -422,8 +425,8 @@ void test_repeated_tasks(bool graph = false, unsigned copies = 1, UpdateMode mod
         Symbolic_Matrix a(n,out,err);
         a.fill_in(row.data(),col.data()); a.csr();
         a.predictLU(row.data(),col.data(),val.data()); a.leveling();
-        GpuMatrix matrix(a, variant ? 3 : 1, false, mode);
-        verify_template_bytes(matrix, a, mode);
+        GpuMatrix matrix(a, variant ? 3 : 1, false, mode,snapshot);
+        verify_template_bytes(matrix, a, mode,snapshot);
         const unsigned expected_slots = mode == UpdateMode::Scan ? (variant ? 3u : 1u) : 0;
         if (matrix.tmp_slots() != expected_slots) throw std::runtime_error("wrong effective scratch slots");
         for (unsigned copy=0; copy<2; ++copy) {
@@ -1085,11 +1088,11 @@ void test_submission_failure_cleanup()
         if(diagnostic!=expected)
             throw std::runtime_error("submission failure lost original error: "+diagnostic);
         // Assert before task destruction can drain anything. The pinned AoS
-        // source remains alive, including while enqueue drains earlier uploads.
-        if(state.h2d_calls!=copies || state.h2d_submitted!=(fail_upload ? 1u : copies) ||
+        // source remains alive, including while enqueue drains the batch upload.
+        if(state.h2d_calls!=1 || state.h2d_submitted!=1 ||
            state.d2h_calls!=(fail_upload ? 0u : 1u) || !state.same_stream ||
            state.sync_calls!=1 || state.sync_successes!=1)
-            throw std::runtime_error("submission failure did not drain prior copies on its stream");
+            throw std::runtime_error("submission failure did not drain the batch upload on its stream");
         expect_task_rejection<std::logic_error>([&] { task.enqueue(); },
             "failed task accepted enqueue");
         expect_task_rejection<std::logic_error>([&] { task.upload_input(); },
@@ -1146,9 +1149,10 @@ void test_fresh_inputs()
         throw std::runtime_error("fresh input fixture changed factor-slot layout");
 
     for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped,UpdateMode::Panel,UpdateMode::PanelTiled})
+        for(SnapshotPolicy snapshot:{SnapshotPolicy::Auto,SnapshotPolicy::PerCopy,SnapshotPolicy::Shared,SnapshotPolicy::Device})
         for(unsigned copies:{1u,3u,33u}) for(bool graph:{false,true}) {
         try {
-            GpuMatrix gpu(matrix,1,false,mode);
+            GpuMatrix gpu(matrix,1,false,mode,snapshot);
             GpuTask task(gpu,copies);
             if(graph) task.prepare_graph(); // Once, before every subsequent fresh input.
             const size_t elements=size_t(matrix.nnz)*copies;
@@ -1221,7 +1225,7 @@ void test_fresh_inputs()
             task.enqueue();task.wait();
             check_values(task,default_input,default_factors);
             if(copies==3) {
-                GpuMatrix perturbed(matrix,1,true,mode);
+                GpuMatrix perturbed(matrix,1,true,mode,snapshot);
                 GpuTask rejected(perturbed,copies);
                 if(graph) rejected.prepare_graph();
                 expect_task_rejection<std::invalid_argument>([&] {
@@ -1237,6 +1241,221 @@ void test_fresh_inputs()
         }
     }
     std::cout<<"PASS host/fresh-input-fixed-structure-known-LU-and-state-contract\n";
+}
+
+void test_compact_inputs() {
+    // One omitted input position becomes a nonzero fill value during LU.
+    // Another stored input starts at zero and changes legally across rounds.
+    const unsigned n=3;
+    std::vector<unsigned> columns{0,3,5,8},rows{0,1,2,0,1,0,1,2};
+    const std::vector<unsigned> positions{8,0,7,3,6,4,2,1}; // Deliberately not sorted.
+    const auto dense_values=[](unsigned round,unsigned copy) {
+        std::vector<REAL> a(9,0);
+        for(unsigned c=0;c<3;++c)a[c*3+c]=REAL(4)+REAL(round)/8+REAL(copy)/64;
+        a[1]=REAL(.5)+REAL(copy)/64;a[2]=1;a[3]=round%2 ? REAL(0):REAL(1);
+        a[6]=REAL(1)+REAL(round)/64;a[7]=round%2 ? REAL(.0625):REAL(0);
+        return a;
+    };
+    const auto factor=[](std::vector<REAL> a) {
+        for(unsigned c=0;c<3;++c) {
+            for(unsigned r=c+1;r<3;++r)a[c*3+r]/=a[c*3+c];
+            for(unsigned j=c+1;j<3;++j)for(unsigned r=c+1;r<3;++r)a[j*3+r]-=a[c*3+r]*a[j*3+c];
+        }
+        return a;
+    };
+    const auto base=dense_values(0,0);
+    std::vector<double> initial;
+    for(unsigned c=0;c<n;++c)for(unsigned p=columns[c];p<columns[c+1];++p)initial.push_back(base[c*3+rows[p]]);
+    std::ostringstream out,err;
+    Symbolic_Matrix matrix(n,out,err);matrix.fill_in(rows.data(),columns.data());matrix.csr();
+    matrix.predictLU(rows.data(),columns.data(),initial.data());matrix.leveling();
+    if(matrix.nnz!=9 || matrix.val!=base)throw std::runtime_error("compact fixture must have a zero fill slot");
+    for(const auto& invalid:std::vector<std::vector<unsigned>>{{},{0,0},{9}})
+        expect_task_rejection<std::invalid_argument>([&]{GpuMatrix rejected(matrix,invalid,1,false,UpdateMode::Mapped);},"invalid compact order accepted");
+    {
+        GpuMatrix ordinary(matrix,1,false,UpdateMode::Mapped);GpuTask task(ordinary);
+        expect_task_rejection<std::invalid_argument>([&]{task.upload_compact_input(base.data(),base.size());},"compact upload without an order accepted");
+    }
+    for(SnapshotPolicy snapshot:{SnapshotPolicy::Auto,SnapshotPolicy::PerCopy,SnapshotPolicy::Shared,SnapshotPolicy::Device})
+    for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped,UpdateMode::Panel,UpdateMode::PanelTiled})
+        for(unsigned copies:{1u,3u,33u})for(bool graph:{false,true}) {
+        std::unique_ptr<GpuTask> task;
+        {
+            GpuMatrix ordinary(matrix,1,false,mode,snapshot),compact(matrix,positions,1,false,mode,snapshot);
+            if(compact.compact_input_elements()!=positions.size() || ordinary.compact_input_elements()!=0 ||
+               compact.shared_device_bytes()!=ordinary.shared_device_bytes()+positions.size()*sizeof(unsigned) ||
+               compact.task_device_bytes(copies)!=ordinary.task_device_bytes(copies)+positions.size()*copies*sizeof(REAL))
+                throw std::runtime_error("compact input payload accounting");
+            task.reset(new GpuTask(compact,copies));
+            GpuTask ordinary_task(ordinary,copies);
+            if(task->numeric_launches()!=ordinary_task.numeric_launches() ||
+               task->snapshot_restore_launches()!=ordinary_task.snapshot_restore_launches())
+                throw std::runtime_error("compact numeric/input layout launch accounting");
+            if(graph)task->prepare_graph();
+        } // Task must retain its compact position map and default snapshot.
+        const auto check=[&](const std::vector<REAL>& inputs) {
+            task->check();Symbolic_Matrix oracle(matrix);
+            for(unsigned copy=0;copy<copies;++copy) {
+                const auto first=inputs.begin()+size_t(copy)*matrix.nnz;
+                std::vector<REAL> one(first,first+matrix.nnz);oracle.val=one;
+                compare(std::vector<REAL>(task->factors(copy),task->factors(copy)+matrix.nnz),factor(one),"compact input independent CPU LU");
+                const double residual=oracle.factor_residual(task->factors(copy));
+                if(!std::isfinite(residual) || residual>(sizeof(REAL)==8 ? 1e-12:1e-5))throw std::runtime_error("compact factor residual");
+            }
+        };
+        std::vector<REAL> defaults;
+        for(unsigned copy=0;copy<copies;++copy)defaults.insert(defaults.end(),base.begin(),base.end());
+        task->enqueue();task->wait();check(defaults);
+        const size_t elements=positions.size()*copies;
+        expect_task_rejection<std::invalid_argument>([&]{task->upload_compact_input(nullptr,elements);},"null compact source accepted");
+        expect_task_rejection<std::invalid_argument>([&]{task->upload_compact_input(defaults.data(),elements-1);},"incorrect compact count accepted");
+        check(defaults);
+        for(unsigned round=0;round<4;++round) {
+            std::vector<REAL> inputs,compact;
+            for(unsigned copy=0;copy<copies;++copy) {
+                const auto a=dense_values(round,copy);inputs.insert(inputs.end(),a.begin(),a.end());
+                for(unsigned p:positions)compact.push_back(a[p]);
+            }
+            task->upload_compact_input(compact.data(),compact.size());
+            expect_task_rejection<std::logic_error>([&]{task->upload_compact_input(compact.data(),compact.size());},"duplicate compact upload accepted");
+            expect_task_rejection<std::logic_error>([&]{task->wait();},"compact-only wait accepted");
+            task->enqueue();
+            expect_task_rejection<std::logic_error>([&]{task->upload_compact_input(compact.data(),compact.size());},"pending compact upload accepted");
+            task->wait();check(inputs);
+            if(round==0) {
+                // The full API may write a slot omitted by compact input. The
+                // next compact round must clear it instead of retaining it.
+                for(unsigned copy=0;copy<copies;++copy)inputs[size_t(copy)*matrix.nnz+5]=REAL(.125);
+                task->upload_input(inputs.data(),inputs.size());task->enqueue();task->wait();check(inputs);
+            }
+        }
+        task->enqueue();task->wait();check(defaults);
+    }
+    {
+        GpuMatrix compact(matrix,positions,1,true,UpdateMode::Mapped);GpuTask task(compact);
+        std::vector<REAL> source(positions.size(),REAL(1));
+        expect_task_rejection<std::invalid_argument>([&]{task.upload_compact_input(source.data(),source.size());},"perturbed compact upload accepted");
+        task.enqueue();task.wait();task.check();
+    }
+    for(bool override_sync:{false,true}) {
+        GpuMatrix compact(matrix,positions,1,false,UpdateMode::Mapped);GpuTask task(compact,3);
+        std::vector<REAL> source(positions.size()*3,REAL(1));
+        async_fault::State state;state.fail_upload=true;state.override_sync=override_sync;
+        {
+            async_fault::Scope scope(state);bool original=false;
+            try{task.upload_compact_input(source.data(),source.size());}
+            catch(const std::runtime_error& e){original=std::string(e.what())==std::string("upload compact matrix input: ")+cudaGetErrorString(async_fault::copy_error);}
+            if(!original || state.h2d_calls!=1 || state.h2d_submitted!=1 || state.sync_calls!=1 || state.sync_successes!=1 || !state.same_stream)
+                throw std::runtime_error("compact failed upload did not drain or preserve original error");
+        }
+        expect_task_rejection<std::logic_error>([&]{task.enqueue();},"failed compact task reuse accepted");
+    }
+    std::cout<<"PASS host/compact-input-zeros-fill-order-lifetime-and-failure-cleanup\n";
+}
+
+void test_compact_tile_tails()
+{
+    // Five independent 3x3 blocks: 40 stored inputs, 45 factor slots.
+    // Both entry and copy dimensions cross a 32-wide tile with partial tails.
+    constexpr unsigned blocks=5,copies=33;
+    std::vector<unsigned> columns{0},rows,positions;
+    for(unsigned c=0;c<blocks*3;++c) {
+        for(unsigned r=0;r<3;++r) if(c%3!=1 || r!=2)
+            rows.push_back(c/3*3+r);
+        columns.push_back(unsigned(rows.size()));
+    }
+    for(unsigned block=0;block<blocks;++block)
+        for(unsigned p:{8u,0u,7u,3u,6u,4u,2u,1u})positions.push_back(block*9+p);
+    const auto values=[](unsigned round,unsigned copy) {
+        std::vector<REAL> a(blocks*9,0);
+        for(unsigned b=0;b<blocks;++b) {
+            REAL* p=a.data()+b*9;
+            for(unsigned c=0;c<3;++c)p[c*3+c]=REAL(8+b)+REAL(round)/8+REAL(copy)/128;
+            p[1]=REAL(.5)+REAL(copy)/128;p[2]=1;
+            p[3]=round%2 ? REAL(0):REAL(1);p[6]=REAL(1)+REAL(b)/32;
+            p[7]=round%2 ? REAL(.0625):REAL(0);
+        }
+        return a;
+    };
+    const auto base=values(0,0);
+    std::vector<double> initial;
+    for(unsigned c=0;c<blocks*3;++c)
+        for(unsigned p=columns[c];p<columns[c+1];++p)
+            initial.push_back(base[(c/3)*9+(c%3)*3+rows[p]%3]);
+    std::ostringstream out,err;Symbolic_Matrix matrix(blocks*3,out,err);
+    matrix.fill_in(rows.data(),columns.data());matrix.csr();
+    matrix.predictLU(rows.data(),columns.data(),initial.data());matrix.leveling();
+    if(matrix.nnz!=45 || matrix.val!=base || positions.size()!=40)
+        throw std::runtime_error("compact tile fixture layout changed");
+    for(UpdateMode mode:{UpdateMode::Mapped,UpdateMode::Panel,UpdateMode::PanelTiled})
+    for(bool graph:{false,true}) {
+        GpuMatrix prepared(matrix,positions,1,false,mode);GpuTask task(prepared,copies);
+        if(graph)task.prepare_graph();
+        for(unsigned round=0;round<2;++round) {
+            std::vector<REAL> input;
+            for(unsigned copy=0;copy<copies;++copy) {
+                const auto a=values(round,copy);
+                for(unsigned p:positions)input.push_back(a[p]);
+            }
+            task.upload_compact_input(input.data(),input.size());task.enqueue();task.wait();task.check();
+            Symbolic_Matrix oracle(matrix);
+            for(unsigned copy=0;copy<copies;++copy) {
+                oracle.val=values(round,copy);
+                const double residual=oracle.factor_residual(task.factors(copy));
+                if(!std::isfinite(residual) || residual>(sizeof(REAL)==8 ? 1e-12:1e-5))
+                    throw std::runtime_error("compact entry/copy tile tail residual");
+            }
+        }
+    }
+    std::cout<<"PASS host/compact-entry-and-copy-tile-tails\n";
+}
+
+void test_auto_snapshot()
+{
+    unsigned columns[]{0,2,4},rows[]{0,1,0,1};double input[]{4,2,1,3};
+    const std::vector<REAL> expected{4,REAL(.5),1,REAL(2.5)};
+    std::ostringstream out,err;Symbolic_Matrix matrix(2,out,err);
+    matrix.fill_in(rows,columns);matrix.csr();matrix.predictLU(rows,columns,input);matrix.leveling();
+    const std::pair<UpdateMode,SnapshotPolicy> modes[]{
+        {UpdateMode::Scan,SnapshotPolicy::PerCopy},{UpdateMode::Mapped,SnapshotPolicy::PerCopy},
+        {UpdateMode::Panel,SnapshotPolicy::Shared},{UpdateMode::PanelTiled,SnapshotPolicy::PerCopy}};
+    for(const auto& mode:modes) {
+        GpuMatrix defaults(matrix,1,false,mode.first);
+        if(defaults.snapshot_policy()!=SnapshotPolicy::Auto || defaults.snapshot_setup_ms()!=0)
+            throw std::runtime_error("default template must request Auto without device residency");
+        for(SnapshotPolicy requested:{SnapshotPolicy::Auto,SnapshotPolicy::PerCopy,SnapshotPolicy::Shared,SnapshotPolicy::Device}) {
+            GpuMatrix prepared(matrix,1,false,mode.first,requested);
+            if(prepared.snapshot_policy()!=requested ||
+               prepared.shared_device_bytes()!=defaults.shared_device_bytes()+
+                   (requested==SnapshotPolicy::Device ? matrix.nnz*sizeof(REAL):0))
+                throw std::runtime_error("snapshot request or persistent payload changed");
+            for(unsigned copies:{1u,3u}) {
+                GpuTask task(prepared,copies),default_task(defaults,copies);
+                const auto automatic=copies==1 ? SnapshotPolicy::PerCopy:mode.second;
+                const auto effective=requested==SnapshotPolicy::Auto ? automatic:requested;
+                if(default_task.snapshot_policy()!=automatic)
+                    throw std::runtime_error("default template did not resolve per task geometry");
+                const size_t one=matrix.nnz*sizeof(REAL);
+                const size_t bytes=effective==SnapshotPolicy::Device ? 0:
+                    effective==SnapshotPolicy::Shared ? one:one*copies;
+                const size_t ops=effective==SnapshotPolicy::Device ? 0:
+                    effective==SnapshotPolicy::Shared ? 1:copies;
+                const size_t restores=size_t(effective==SnapshotPolicy::Device ||
+                    (effective==SnapshotPolicy::Shared && copies>1))+
+                    size_t(copies>1 && mode.first!=UpdateMode::Scan);
+                for(bool graph:{false,true}) {
+                    if(graph)task.prepare_graph();
+                    if(task.snapshot_policy()!=effective || task.snapshot_h2d_bytes()!=bytes ||
+                       task.snapshot_h2d_ops()!=ops || task.snapshot_restore_launches()!=restores)
+                        throw std::runtime_error("resolved snapshot diagnostics disagree with task policy");
+                    task.enqueue();task.wait();task.check();
+                    for(unsigned copy=0;copy<copies;++copy)
+                        compare(std::vector<REAL>(task.factors(copy),task.factors(copy)+matrix.nnz),expected,"auto snapshot known LU");
+                }
+            }
+        }
+    }
+    std::cout<<"PASS host/auto-snapshot-per-task-policy-override-and-graph-stability\n";
 }
 
 void test_invalid_factor(REAL value, const char* diagnostic)
@@ -1290,7 +1509,14 @@ int main()
                     for(unsigned path=0;path<3;++path) test_layout(copies,variant,perturb,path);
         test_dense_updates();
         test_panel_boundaries();
+        for(SnapshotPolicy snapshot:{SnapshotPolicy::Shared,SnapshotPolicy::Device})
+            for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped})
+                for(unsigned copies:{1u,3u,33u})for(bool graph:{false,true})
+                    test_repeated_tasks(graph,copies,mode,snapshot);
         test_fresh_inputs();
+        test_compact_inputs();
+        test_compact_tile_tails();
+        test_auto_snapshot();
         test_submission_failure_cleanup();
         test_zero_update_map();
         for (bool one_column : {false,true})

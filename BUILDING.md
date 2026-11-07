@@ -133,6 +133,7 @@ CUDA 后端使用对应构建目录和 `CUDA_VISIBLE_DEVICES`。测试需要可�
 | `--loops N` | 30 | 计时的完整 LOOP 数，必须大于 0 |
 | `--batch-size N` | 1 | 同模板独立副本的每批上限，每批一条 stream，尾批保留实际数量 |
 | `--graph` | 关闭 | 准备阶段捕获每批数值与输出图，随后重放 |
+| `--snapshot-policy auto\|per-copy\|shared\|device` | `auto` | 自动选择初值恢复方式，或强制逐副本上传、共享上传、设备初值恢复 |
 | `--updates scan\|mapped\|panel\|tiled` | `scan` | 选择扫描、位置映射、依赖窗口目标归约或带局部密集块的归约 |
 | `--submit-threads N` | 1 | 并行提交数值与输出的主机线程数上限，实际不超过批数。输入由主线程提前排队 |
 | `--tmp-slots N` | 32 | scan 每个副本的 scratch 槽数上限，其它策略不使用 scratch |
@@ -166,23 +167,25 @@ task light
 
 清单顺序表示逻辑任务，不表示依赖或到达时间。`--batch-size 1` 按该顺序组织任务，更大批量按模板定义顺序交错分批。并行提交时，实际开始提交的次序可以变化。
 
-### 执行与资源
+### 执行策略与资源
 
-每批使用一条 nonblocking stream，维护 `H2D 初值 → 数值分解 → D2H 因子` 的依赖。每轮先由主线程排队全部输入，再提交数值与输出，上传后没有全局同步。全部任务及输出完成后才能开始下一轮。Graph 捕获数值与每批一次 D2H，H2D 在每轮的 Graph 外排队。不启用 Graph 时，直接提交各项操作并逐副本 D2H。
+每批使用独立 stream，按 `输入恢复与布局准备 → 数值分解 → 完整因子回传` 执行，全部批次完成后开始下一轮。所有输入入口先准备好数值执行布局，`--graph` 只重放每批的数值与输出操作；不启用时直接提交各项操作。Graph 每批一次 D2H，直接提交则逐副本 D2H。
 
 `--submit-threads` 大于 1 时，工作线程并行提交独立批次，只有一批时仍使用主线程。工作线程每轮创建和汇合，相关成本包含在 LOOP 中。主机线程数和逻辑 stream 数都不等于实际 GPU 并发度。
 
-scan 使用每副本独立的 scratch，`--tmp-slots` 控制其槽数上限，实际槽数可能小于请求值。mapped 预计算并共享更新位置，不分配 scratch。mapped 多副本使用额外的交错 values buffer 和行补齐，计时内包含双向布局转换，单副本不做布局转换。
+`scan` 使用每副本独立的 scratch，实际槽数不超过 `--tmp-slots`。`mapped`、`panel`、`tiled` 预先准备共享索引或计划，不使用 scratch；准备成本与额外设备容量随结构和批量变化，需显式选择。`tiled` 在 gfx936 上使用原生矩阵指令，其它目标使用标量回退，不降低所选输入精度。策略可能改变浮点累加次序，应验证所选精度的数值结果。
 
-panel 将 32 层依赖窗口内可延后的贡献按目标归约，及时完成窗口内需要读取的更新。tiled 在 panel 基础上提取符合结构条件的局部密集块，在 gfx936 FP32/FP64 使用原生矩阵指令，其它目标使用标量回退，不通过 TF32 转换降低输入精度。两者只构造自身的分组和索引，不同时保留普通位置映射，也不分配 scratch。它们的准备时间、容量和收益依赖结构及复用条件，需要显式选择。多副本仍包含 SoA 转换，单副本保持 AoS。聚合及矩阵指令会改变浮点累加次序，选择策略时仍需验证所选精度的数值结果。
+Snapshot 指模板的不可变默认初值，每轮完整恢复，各副本独立分解。`auto` 在每批创建时选择：panel 多副本使用 `shared`，上传一份后广播；这里的 shared 表示共享一次上传，不是 GPU shared memory。单副本及 scan/mapped/tiled 使用 `per-copy`。可显式指定二者覆盖该规则。Auto 不改变数值策略、Graph 或提交线程配置。
 
-C++ 任务接口可通过 `upload_input(values, elements)` 上传固定执行符号结构下的新数值。输入采用因子槽位顺序，各副本以 AoS 连续存放，元素数严格等于 `factor_nnz × batch_size`。调用者保持源内存可读且不变，直到 `enqueue()` 和 `wait()` 完成，pinned host 内存可支持异步上传。提交失败会尽力等待已排队操作结束，再抛出原异常，失败任务需重建。它复用已有 Graph，不替换模板默认输入，不接受与 perturbation 同用。原始矩阵非零模式相同并不自动保证重排、填充和主元安排不变，调用者须保持执行结构一致。
+`device` 仅显式启用，在准备时额外保留每模板一份只读设备初值，直到模板释放，计入共享设备载荷。它不属于 Auto 的候选方式。
 
-程序预检映射或更新计划及任务缓冲能否放入当前空闲显存，失败时明确退出，不自动调整任务、批量或槽数。mapped 多副本要求每层的有效 source-target 对数不超过设备 `grid.x` 上限，panel/tiled 也检查计划执行网格，超限时明确报错。预检不包含运行时内部开销，也不保证后续设备或 pinned host 分配成功。
+批内副本数和跨轮复用次数分别决定并行规模与准备成本的摊销。长期复用时保留模板、任务和已准备的 Graph，逐轮上传新值或恢复默认初值，然后提交、等待并消费结果；无需逐轮重新分配或捕获。固定结构的异值输入也可复用这些对象，但不能利用默认初值相同的快照共享。跨轮数值不变时可比较 `device`，是否采用仍取决于每轮收益与额外设备容量；复用上千轮不意味着它必然更快。按实际复用轮数比较含准备的完成时间，避免仅凭稳态耗时选择准备更重的数值策略。
+
+程序对显存容量与执行网格做预检，超限时明确报错，不自动调整任务、批量或槽数。容量预检只统计显式缓冲区，不保证后续设备或 pinned host 分配成功。
 
 ### 计时与结果
 
-一次 LOOP 包含全部任务的 H2D、数值提交与执行、D2H、线程创建与汇合及轮末等待。预处理、资源和 Graph 准备、数值检查、solve、输出文件和释放资源不计入 LOOP。
+一次 LOOP 包含全部任务的输入恢复、数值提交与执行、D2H、线程创建与汇合及轮末等待。预处理、资源和 Graph 准备、数值检查、solve、输出文件和释放资源不计入 LOOP。
 
 | JSON 字段 | 含义 |
 | --- | --- |
@@ -192,8 +195,11 @@ C++ 任务接口可通过 `upload_input(values, elements)` 上传固定执行符
 | `native_mmac` | 至少一个模板具有使用原生矩阵指令的密集 tile。标量回退或无 tile 时为 false |
 | `warmup_ms` | 全部预热耗时，包含可能的首次重放开销 |
 | `loop_ms` / `ms_per_loop` | 主机单调时钟测量的逐轮完整耗时及算术平均值 |
+| `factor_output_ready_ms` | 从预处理前至最后一轮全因子可读的实际墙钟，包含准备、预热与计时轮；检查、solve、报告与释放在外。固定N任务比较时用`--warmup 0` |
 | `validation_ms` | 计时结束后检查全部任务的耗时 |
-| `task_device_bytes` / `shared_device_bytes` | 任务缓冲及模板共享设备缓冲的载荷，分别统计，后者包含所选位置映射或更新计划 |
+| `task_device_bytes` / `shared_device_bytes` | 任务缓冲及模板共享设备缓冲载荷，后者包含位置映射、更新计划及Device策略的只读初值 |
+| `snapshot_policy` / `snapshot_setup_ms` | 请求的初值恢复策略及设备初值准备分量，后者已计入setup |
+| `batch_snapshot_policies` | 按批顺序记录实际恢复策略；Auto 的单副本尾批可与前面批次不同 |
 | `update_map_bytes` | 共享设备缓冲中的位置映射载荷 |
 | `pinned_bytes` | 模板共享初值与各独立副本因子输出的 pinned host 载荷 |
 | `templates[].effective_tmp_slots` | 实际 scratch 槽数，其它策略为 0 |
@@ -210,10 +216,11 @@ C++ 任务接口可通过 `upload_input(values, elements)` 上传固定执行符
 | `submit_thread_cpu_ms` / `drain_thread_cpu_ms` | 主线程在提交及等待阶段的 CPU 时间，分别统计，不含其他线程的 CPU 时间 |
 | `submit_workers_cpu_ms` | 全部提交工作线程的 CPU 时间之和，可大于提交墙钟。单线程时为 0 |
 | `submit_worker_max_wall_ms` | 最慢提交工作线程的墙钟耗时。单线程时为 0 |
-| `launches_per_loop` | 每轮底层 GPU kernel 次数，Graph 重放时不等于主机 launch API 次数 |
+| `launches_per_loop` | 每轮数值与输出布局转换kernel次数；Graph重放不等于主机launch API次数 |
+| `input_restore_launches_per_loop` | 每轮快照广播、设备恢复及输入布局转换kernel次数；所有输入布局准备均在数值Graph之外 |
 | `wide_blocks_per_loop` | scan/mapped 每轮宽层数值 kernel 的线程块总数，包含适用路径的归一化与目标更新。panel/tiled 返回 0 表示不适用 |
 | `template_work` | 每模板的层宽及 L 非空源列的结构目标数量，各批实际启动次数另计。panel/tiled 不适用的层内启动字段为 null |
-| `h2d_bytes_per_loop` / `d2h_bytes_per_loop` | 每轮按逻辑副本数统计的传输字节 |
+| `h2d_bytes_per_loop` / `d2h_bytes_per_loop` | 每轮所选快照策略的实际传输载荷；完整因子D2H按全部逻辑副本统计 |
 | `h2d_copy_ops_per_loop` / `d2h_copy_ops_per_loop` | 每轮 H2D/D2H 操作次数，字节相同不代表操作次数相同 |
 
 每轮 `submit_ms + drain_ms = loop_ms`。CPU 时间与墙钟分别解释，主线程 CPU 时间下降不代表全部线程工作减少。诊断统计不包括准备阶段，统计输出在计时区间外。
@@ -226,4 +233,32 @@ C++ 任务接口可通过 `upload_input(values, elements)` 上传固定执行符
 
 GPU、检查或输出失败均以非零状态退出。为每次运行指定独立输出路径，避免误读先前的成功文件。
 
-C++ 执行接口的所有权、调用顺序和线程约束见 [numeric.h](include/numeric.h)，因子残差接口见 [symbolic.h](include/symbolic.h)。
+## C++ 数值任务接口
+
+[numeric.h](include/numeric.h) 提供可复用的 `GpuMatrix` 模板和 `GpuTask`，支持下列三种输入用法。`SnapshotPolicy` 只控制不可变默认初值的恢复方式，不选择输入格式。模板默认请求 `SnapshotPolicy::Auto`，也可显式选择 `PerCopy/Shared/Device`；`GpuMatrix::snapshot_policy()` 返回请求，`GpuTask::snapshot_policy()` 返回该批已确定的实际策略。修改默认初值或执行结构需要重建模板。以下接口均可复用已准备的 Graph，调用者上传新值不更新模板默认初值。
+
+| 调用 | 输入与元素数 |
+| --- | --- |
+| `upload_input()` | 恢复模板默认初值；省略此调用时，`enqueue()` 自动恢复 |
+| `upload_input(values, elements)` | 连续 `[copy][factor slot]`，元素数为 `factor_nnz × copies` |
+| `upload_compact_input(values, elements)` | 连续 `[copy][input position]`，元素数为 `compact_input_elements() × copies`；须先准备位置表 |
+
+紧凑位置表是 `symbolic.val` 中非空、唯一且有界的索引序列。它须包含全部合法存储位置及显式零，允许这些位置逐轮改变数值；每次紧凑上传时，未列出槽位视为零。不能按初值是否非零筛选位置。排列、缩放、重复项处理和固定执行结构由调用者保证，接口不重新预处理原始矩阵；位置集合或顺序改变时重建模板。
+
+以下示例假定 `symbolic` 已准备，`input_positions` 和主机数组 `host_values` 满足上述顺序与大小要求：
+
+```cpp
+GpuMatrix prepared(symbolic, input_positions, 32, false, UpdateMode::Mapped);
+GpuTask task(prepared, copies);
+task.prepare_graph(); // Optional; call before queuing input.
+task.upload_compact_input(host_values, prepared.compact_input_elements() * copies);
+task.enqueue();
+task.wait();
+const REAL* factors = task.factors(0);
+```
+
+每个任务一次只能排队一份输入、保留一个未完成提交。源数组须保持可读且不变直到对应 `enqueue()`、`wait()` 完成；pinned host 内存支持异步上传。结果只能在成功 `wait()` 后读取，并在下一次上传、提交或销毁前完成消费。显式 fresh/compact 输入不能与扰动同用；GPU 错误抛出异常，提交失败会尝试排空已排队工作并保留原异常，失败任务需重建。
+
+调用者可直接生产到最终输入缓冲；独立任务还可交替使用多个输入缓冲和共享模板的 `GpuTask`，以重叠生产与执行。各任务拥有独立数值缓冲、stream、Graph 和主机输出，按对应 `wait()` 与消费完成时机复用。库不自动组织流水，增加任务会增加设备与 pinned 容量，也不保证吞吐改善；调用者分配的输入数组需另计容量。
+
+所有权、线程约束、资源与诊断接口的完整契约见 [numeric.h](include/numeric.h)，因子残差接口见 [symbolic.h](include/symbolic.h)。

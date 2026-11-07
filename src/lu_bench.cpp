@@ -40,6 +40,7 @@ struct Options {
     unsigned slots = 32, batch_size = 1;
     size_t submit_threads = 1;
     UpdateMode updates = UpdateMode::Scan;
+    SnapshotPolicy snapshot = SnapshotPolicy::Auto;
     std::string output;
     std::string check = "full";
     bool diagnostics = false;
@@ -48,6 +49,15 @@ struct Options {
         return task_templates.empty() ? task%inputs.size() : task_templates[task];
     }
 };
+const char* snapshot_name(SnapshotPolicy policy) {
+    switch(policy) {
+        case SnapshotPolicy::Auto:return "auto";
+        case SnapshotPolicy::PerCopy:return "per-copy";
+        case SnapshotPolicy::Shared:return "shared";
+        case SnapshotPolicy::Device:return "device";
+    }
+    throw std::invalid_argument("invalid snapshot policy");
+}
 const char* update_name(UpdateMode mode) {
     switch(mode) {
         case UpdateMode::Scan:return "scan";
@@ -132,6 +142,13 @@ Options parse(int argc, char** argv) {
             else if (value == "tiled") o.updates=UpdateMode::PanelTiled;
             else throw std::invalid_argument("updates must be scan, mapped, panel or tiled");
         }
+        else if (key == "--snapshot-policy") {
+            if(value=="auto")o.snapshot=SnapshotPolicy::Auto;
+            else if(value=="per-copy")o.snapshot=SnapshotPolicy::PerCopy;
+            else if(value=="shared")o.snapshot=SnapshotPolicy::Shared;
+            else if(value=="device")o.snapshot=SnapshotPolicy::Device;
+            else throw std::invalid_argument("snapshot policy must be auto, per-copy, shared or device");
+        }
         else if (key == "--batch-size") {
             const size_t count=number(value);
             if (count>std::numeric_limits<unsigned>::max()) throw std::invalid_argument("batch size overflow");
@@ -178,7 +195,7 @@ struct Matrix {
     NicsState nics;
     std::unique_ptr<Symbolic_Matrix> symbolic;
     std::unique_ptr<GpuMatrix> gpu;
-    Matrix(const std::string& path, unsigned slots, UpdateMode updates) {
+    Matrix(const std::string& path, unsigned slots, UpdateMode updates,SnapshotPolicy snapshot) {
         InputArrays a;
         if (preprocess(path.c_str(), &nics.state, &a.values, &a.rows, &a.columns))
             throw std::runtime_error("preprocess failed: " + path);
@@ -188,7 +205,7 @@ struct Matrix {
         symbolic->csr();
         symbolic->predictLU(a.rows,a.columns,a.values);
         symbolic->leveling();
-        gpu.reset(new GpuMatrix(*symbolic,slots,false,updates));
+        gpu.reset(new GpuMatrix(*symbolic,slots,false,updates,snapshot));
     }
 };
 
@@ -221,6 +238,7 @@ int main(int argc, char** argv) {
                   << "  [--warmup 5] [--loops 30] [--tmp-slots 32] [--output result.json]\n"
                   << "  [--check full|basic] [--diagnostics] [--graph] [--batch-size 1]\n"
                   << "  [--updates scan|mapped|panel|tiled] [--submit-threads 1]\n"
+                  << "  [--snapshot-policy auto|per-copy|shared|device]\n"
                   << "One stream per homogeneous batch; explicit logical workload or round-robin inputs; no perturbation.\n";
         return 0;
     }
@@ -228,7 +246,7 @@ int main(int argc, char** argv) {
         const Options o=parse(argc,argv);
         const auto setup_start=Clock::now();
         std::vector<std::unique_ptr<Matrix>> matrices;
-        for (const auto& path : o.inputs) matrices.emplace_back(new Matrix(path,o.slots,o.updates));
+        for (const auto& path : o.inputs) matrices.emplace_back(new Matrix(path,o.slots,o.updates,o.snapshot));
         size_t device_bytes=0, pinned_bytes=0, shared_device_bytes=0, update_map_bytes=0,update_plan_bytes=0;
         double update_map_setup_ms=0,update_plan_setup_ms=0;
         for (const auto& m : matrices) {
@@ -273,6 +291,8 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        double snapshot_setup_ms=0;
+        for(const auto& matrix:matrices)snapshot_setup_ms+=matrix->gpu->snapshot_setup_ms();
         const auto graph_start=Clock::now();
         if (o.graph) for (auto& t : tasks) t->prepare_graph();
         const double graph_setup_ms=o.graph ? elapsed(graph_start) : 0;
@@ -354,6 +374,7 @@ int main(int argc, char** argv) {
                 loop_ms[i]=elapsed(start);
             }
         }
+        const double factor_output_ready_ms=elapsed(setup_start);
         const auto check_start=Clock::now();
         const double tolerance=sizeof(REAL)==8 ? 1e-10 : 1e-3;
         double max_residual=0;
@@ -411,6 +432,7 @@ int main(int argc, char** argv) {
                << ",\n  \"setup_ms\": " << setup_ms << ", \"validation_ms\": " << check_ms
                << ", \"graph\": " << (o.graph ? "true" : "false") << ", \"graph_setup_ms\": " << graph_setup_ms << ", \"warmup_ms\": " << warmup_ms
                << ", \"ms_per_loop\": " << total_ms/o.loops
+               << ", \"factor_output_ready_ms\": " << factor_output_ready_ms
                << ",\n  \"check_mode\": " << quoted(o.check)
                << ",\n  \"validation\": " << quoted(o.check == "full"
                    ? "all-tasks-final-loop-full-factor-residual-and-finite-solve"
@@ -420,8 +442,16 @@ int main(int argc, char** argv) {
         report << ", \"factor_residual_tolerance\": ";
         if (o.check == "full") report << tolerance; else report << "null";
         report << ",\n  \"diagnostics\": " << (o.diagnostics ? "true" : "false");
+        report << ",\n  \"snapshot_policy\": " << quoted(snapshot_name(o.snapshot))
+               << ", \"snapshot_setup_ms\": " << snapshot_setup_ms;
+        report << ",\n  \"batch_snapshot_policies\": [";
+        for(size_t i=0;i<tasks.size();++i) {
+            if(i)report << ',';
+            report << quoted(snapshot_name(tasks[i]->snapshot_policy()));
+        }
+        report << ']';
         if (o.diagnostics) {
-            size_t launches=0,transfer_bytes=0,h2d_ops=0,wide_blocks=0;
+            size_t launches=0,transfer_bytes=0,h2d_ops=0,wide_blocks=0,h2d_bytes=0,restore_launches=0;
             report << ",\n  \"template_work\": [";
             for(size_t i=0;i<matrices.size();++i) {
                 const auto& a=*matrices[i]->symbolic;
@@ -458,7 +488,9 @@ int main(int argc, char** argv) {
                     const unsigned copies=t.batch_size();
                     add_bytes(launches,t.numeric_launches());
                     add_bytes(wide_blocks,t.numeric_wide_blocks());
-                    add_bytes(h2d_ops,copies);
+                    add_bytes(h2d_ops,t.snapshot_h2d_ops());
+                    add_bytes(h2d_bytes,t.snapshot_h2d_bytes());
+                    add_bytes(restore_launches,t.snapshot_restore_launches());
                 }
                 add_bytes(transfer_bytes,multiplied_bytes(o.counts[i],matrices[i]->gpu->task_host_bytes()));
                 if(i) report << ',';
@@ -471,7 +503,8 @@ int main(int argc, char** argv) {
             }
             report << "],\n  \"launches_per_loop\": " << launches
                    << ", \"wide_blocks_per_loop\": " << wide_blocks
-                   << ", \"h2d_bytes_per_loop\": " << transfer_bytes
+                   << ", \"h2d_bytes_per_loop\": " << h2d_bytes
+                   << ", \"input_restore_launches_per_loop\": " << restore_launches
                    << ", \"d2h_bytes_per_loop\": " << transfer_bytes
                    << ", \"h2d_copy_ops_per_loop\": " << h2d_ops
                    << ", \"d2h_copy_ops_per_loop\": " << (o.graph ? tasks.size() : o.tasks);

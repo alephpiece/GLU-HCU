@@ -450,6 +450,13 @@ __global__ void RL_onecol_cleartmpMem(
 
 
 namespace {
+// Resolve once per task, including its actual tail-batch size. Keep execution
+// and diagnostics on the same effective policy; Auto never adds device residency.
+SnapshotPolicy resolve_snapshot_policy(SnapshotPolicy requested,UpdateMode mode,unsigned copies) {
+    if(requested!=SnapshotPolicy::Auto)return requested;
+    return copies>1 && mode==UpdateMode::Panel
+        ? SnapshotPolicy::Shared : SnapshotPolicy::PerCopy;
+}
 // Copy lanes fill naturally up to the fixed kernel cap. This is also the
 // physical row alignment, so tiny batches do not pay a 32-column allocation.
 unsigned filled_copy_bits(unsigned copies,unsigned cap) {
@@ -483,6 +490,11 @@ size_t checked_sum(size_t a, size_t b) {
     return a+b;
 }
 
+const std::vector<unsigned>& require_compact_order(const std::vector<unsigned>& positions) {
+    if(positions.empty())throw std::invalid_argument("compact input order must not be empty");
+    return positions;
+}
+
 template<class T, bool Pinned = false> struct Buffer {
     T* ptr = nullptr;
     size_t bytes = 0;
@@ -506,13 +518,52 @@ template<class T, bool Pinned = false> struct Buffer {
 };
 }
 
+// Separate destinations let all copies factor independently. For Shared, the
+// first uploaded copy is read-only until this stream finishes the broadcast.
+__global__ void restore_snapshot(REAL* destination,const REAL* source,unsigned nnz) {
+    const size_t at=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(at<nnz) destination[size_t(blockIdx.y)*nnz+at]=source[at];
+}
+
+__global__ void scatter_compact_input(REAL* values,const REAL* compact,
+                                     const unsigned* positions,unsigned count,unsigned nnz) {
+    const size_t at=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(at<count)values[size_t(blockIdx.y)*nnz+positions[at]]=compact[size_t(blockIdx.y)*count+at];
+}
+
+// Fuse the input transpose with scatter instead of materializing full AoS first.
+// A shared tile gives contiguous compact-entry loads and SoA-copy stores.
+// Positions need not be ordered. Unwritten factor slots and padding are cleared
+// before this launch; each listed position is unique across the entire input.
+__global__ void scatter_compact_input_soa(REAL* values,const REAL* compact,
+                                         const unsigned* positions,unsigned count,
+                                         unsigned copies,unsigned stride) {
+    __shared__ REAL tile[32][33];
+    const unsigned entry_base=blockIdx.x*32,copy_base=blockIdx.y*32;
+    const unsigned entry=entry_base+threadIdx.x,copy=copy_base+threadIdx.y;
+    for(unsigned offset=0;offset<32;offset+=8)
+        if(entry<count && copy+offset<copies)
+            tile[threadIdx.y+offset][threadIdx.x]=compact[size_t(copy+offset)*count+entry];
+    __syncthreads();
+    const unsigned output_copy=copy_base+threadIdx.x;
+    for(unsigned offset=0;offset<32;offset+=8) {
+        const unsigned input_entry=entry_base+threadIdx.y+offset;
+        if(input_entry<count && output_copy<copies)
+            values[size_t(positions[input_entry])*stride+output_copy]=tile[threadIdx.x][threadIdx.y+offset];
+    }
+}
+
 struct GpuMatrix::Impl {
     unsigned n, nnz, slots, max_batch, max_grid_x;
     unsigned deferred_columns_count=0;
     bool perturb;
     UpdateMode update_mode;
+    SnapshotPolicy snapshot_policy;
     size_t shared_bytes = 0, map_bytes = 0, plan_bytes = 0;
     double map_setup_ms = 0, plan_setup_ms = 0;
+    double snapshot_setup_ms=0;
+    double compact_setup_ms=0;
+    unsigned compact_elements=0;
     bool panel_mode=false,native_mmac=false;
     REAL threshold = 0;
     std::string device;
@@ -530,6 +581,8 @@ struct GpuMatrix::Impl {
     Buffer<DenseUpdateTile> dense_tiles;
     Buffer<unsigned> dense_indices;
     Buffer<REAL, true> input;
+    Buffer<REAL> initial_values;
+    Buffer<unsigned> input_positions;
 
     unsigned value_pitch(unsigned copies) const {
         if(!copies || copies>max_batch) throw std::invalid_argument("batch size exceeds device grid limit");
@@ -540,8 +593,10 @@ struct GpuMatrix::Impl {
         return unsigned(pitch);
     }
 
-    Impl(const Symbolic_Matrix& a, unsigned requested_slots, bool use_perturb, UpdateMode mode)
+    Impl(const Symbolic_Matrix& a, unsigned requested_slots, bool use_perturb, UpdateMode mode,SnapshotPolicy snapshot,
+         const std::vector<unsigned>& positions)
         : n(a.n), nnz(a.nnz), slots(0), perturb(use_perturb), update_mode(mode),
+          snapshot_policy(snapshot),
           levels(a.level_ptr), columns(a.level_idx), csr_rows(a.csr_r_ptr),
           csr_diags(a.csr_diag_ptr), diagonals(a.l_col_ptr)
     {
@@ -549,6 +604,20 @@ struct GpuMatrix::Impl {
             throw std::invalid_argument("empty matrix or zero scratch slots");
         if (mode != UpdateMode::Scan && mode != UpdateMode::Mapped && mode != UpdateMode::Panel && mode != UpdateMode::PanelTiled)
             throw std::invalid_argument("invalid update mode");
+        if(snapshot!=SnapshotPolicy::Auto && snapshot!=SnapshotPolicy::PerCopy &&
+           snapshot!=SnapshotPolicy::Shared && snapshot!=SnapshotPolicy::Device)
+            throw std::invalid_argument("invalid snapshot policy");
+        if(!positions.empty()) {
+            const auto start=std::chrono::steady_clock::now();
+            if(positions.size()>nnz)throw std::invalid_argument("too many compact input positions");
+            std::vector<unsigned char> seen(nnz,0);
+            for(unsigned p:positions) {
+                if(p>=nnz || seen[p])throw std::invalid_argument("compact input positions must be unique factor slots");
+                seen[p]=1;
+            }
+            compact_elements=unsigned(positions.size());
+            compact_setup_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        }
         panel_mode=mode==UpdateMode::Panel || mode==UpdateMode::PanelTiled;
         GpuMatrix::select_device();
         cudaDeviceProp prop;
@@ -618,6 +687,18 @@ struct GpuMatrix::Impl {
             shared_bytes = checked_sum(shared_bytes, bytes);
         input.allocate(nnz);
         std::copy(a.val.begin(), a.val.end(), input.ptr);
+        if(!positions.empty()) {
+            const auto start=std::chrono::steady_clock::now();
+            input_positions.upload(positions);
+            shared_bytes=checked_sum(shared_bytes,input_positions.bytes);
+            compact_setup_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        }
+        if(snapshot_policy==SnapshotPolicy::Device) {
+            const auto start=std::chrono::steady_clock::now();
+            initial_values.upload(a.val);
+            shared_bytes=checked_sum(shared_bytes,initial_values.bytes);
+            snapshot_setup_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        }
         if (perturb) {
             for (unsigned j=0; j<n; ++j) {
                 REAL sum = 0;
@@ -681,7 +762,8 @@ struct GpuMatrix::Impl {
 
 struct GpuTask::Impl {
     std::shared_ptr<const GpuMatrix::Impl> matrix;
-    Buffer<REAL> values, scratch, interleaved_values;
+    const SnapshotPolicy snapshot_policy;
+    Buffer<REAL> values, scratch, interleaved_values,compact_values;
     Buffer<REAL, true> output;
     cudaStream_t stream = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
@@ -689,11 +771,13 @@ struct GpuTask::Impl {
     bool pending=false,ready=false,failed=false,input_queued=false;
     unsigned copy_tiles(unsigned bits) const { return (copies+(1u<<bits)-1)>>bits; }
     explicit Impl(std::shared_ptr<const GpuMatrix::Impl> m,unsigned batch)
-        : matrix(std::move(m)),copies(batch),copy_bits(filled_copy_bits(batch,5)),soa_stride(matrix->value_pitch(batch)) {
+        : matrix(std::move(m)),snapshot_policy(resolve_snapshot_policy(matrix->snapshot_policy,matrix->update_mode,batch)),
+          copies(batch),copy_bits(filled_copy_bits(batch,5)),soa_stride(matrix->value_pitch(batch)) {
         if(soa_stride && !matrix->panel_mode)for(size_t lev=0;lev+1<matrix->levels.size();++lev)
             if(matrix->target_prefix[matrix->levels[lev+1]]-matrix->target_prefix[matrix->levels[lev]]>matrix->max_grid_x)
                 throw std::invalid_argument("mapped level targets exceed device grid limit");
         values.allocate(matrix->nnz,copies);
+        if(matrix->compact_elements)compact_values.allocate(matrix->compact_elements,copies);
         if(soa_stride) {
             const uint64_t tiles=uint64_t(matrix->nnz/32+(matrix->nnz%32!=0))*(copies/32+(copies%32!=0));
             if(tiles>matrix->max_grid_x) throw std::invalid_argument("SoA transpose grid exceeds device limit");
@@ -709,10 +793,48 @@ struct GpuTask::Impl {
             }
         } catch(...) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); throw; }
     }
-    void enqueue_input(const REAL* input=nullptr) {
+    void enqueue_aos_input(const REAL* input) {
+        if(input) {
+            gpu_check(cudaMemcpyAsync(values.ptr,input,values.bytes,cudaMemcpyHostToDevice,stream),"upload matrix input");
+            return;
+        }
+        if(snapshot_policy==SnapshotPolicy::Device) {
+            restore_snapshot<<<dim3(matrix->nnz/256u+(matrix->nnz%256u!=0),copies),256,0,stream>>>(
+                values.ptr,matrix->initial_values.ptr,matrix->nnz);
+            gpu_check(cudaGetLastError(),"restore device snapshot");
+            return;
+        }
+        if(snapshot_policy==SnapshotPolicy::Shared && copies>1) {
+            gpu_check(cudaMemcpyAsync(values.ptr,matrix->input.ptr,matrix->input.bytes,cudaMemcpyHostToDevice,stream),"upload shared snapshot");
+            restore_snapshot<<<dim3(matrix->nnz/256u+(matrix->nnz%256u!=0),copies-1),256,0,stream>>>(
+                values.ptr+matrix->nnz,values.ptr,matrix->nnz);
+            gpu_check(cudaGetLastError(),"broadcast shared snapshot");
+            return;
+        }
         for(unsigned copy=0;copy<copies;++copy)
-            gpu_check(cudaMemcpyAsync(values.ptr+size_t(copy)*matrix->nnz,input ? input+size_t(copy)*matrix->nnz : matrix->input.ptr,
+            gpu_check(cudaMemcpyAsync(values.ptr+size_t(copy)*matrix->nnz,matrix->input.ptr,
                 size_t(matrix->nnz)*sizeof(REAL),cudaMemcpyHostToDevice,stream),"upload matrix input");
+    }
+    void enqueue_input(const REAL* input=nullptr) {
+        enqueue_aos_input(input);
+        // Every input path prepares the execution layout before numeric work.
+        // This boundary is independent of compact support and Graph capture.
+        if(soa_stride)transpose(true);
+    }
+    void enqueue_compact(const REAL* input) {
+        gpu_check(cudaMemcpyAsync(compact_values.ptr,input,compact_values.bytes,cudaMemcpyHostToDevice,stream),"upload compact matrix input");
+        // Clear the whole execution allocation, including SoA padding: omitted
+        // input positions must not inherit fill values from a previous LU.
+        if(soa_stride) {
+            gpu_check(cudaMemsetAsync(interleaved_values.ptr,0,interleaved_values.bytes,stream),"clear SoA factor slots for compact input");
+            scatter_compact_input_soa<<<dim3(matrix->compact_elements/32u+(matrix->compact_elements%32u!=0),copies/32u+(copies%32u!=0)),dim3(32,8),0,stream>>>(
+                interleaved_values.ptr,compact_values.ptr,matrix->input_positions.ptr,matrix->compact_elements,copies,soa_stride);
+        } else {
+            gpu_check(cudaMemsetAsync(values.ptr,0,values.bytes,stream),"clear factor slots for compact input");
+            scatter_compact_input<<<dim3(matrix->compact_elements/256u+(matrix->compact_elements%256u!=0),copies),256,0,stream>>>(
+                values.ptr,compact_values.ptr,matrix->input_positions.ptr,matrix->compact_elements,matrix->nnz);
+        }
+        gpu_check(cudaGetLastError(),"scatter compact matrix input");
     }
     void transpose(bool to_interleaved) {
         const unsigned rows=to_interleaved ? copies : matrix->nnz,columns=to_interleaved ? matrix->nnz : copies;
@@ -727,7 +849,6 @@ struct GpuTask::Impl {
         const auto& a=*matrix;
         const unsigned column_threads=copies>=16 ? 256 : 1024;
         const bool soa=soa_stride!=0;
-        if(soa) transpose(true);
         if constexpr(Mode==UpdateMode::Mapped)if(a.panel_mode) {
             REAL* data=soa ? interleaved_values.ptr : values.ptr;
             const unsigned bits=soa ? copy_bits : 0,stride=soa ? soa_stride : 1,rows=256u>>bits;
@@ -870,8 +991,10 @@ struct GpuTask::Impl {
     }
 };
 
-GpuMatrix::GpuMatrix(const Symbolic_Matrix& a, unsigned slots, bool perturb, UpdateMode mode)
-    : impl_(std::make_shared<Impl>(a, slots, perturb, mode)) {}
+GpuMatrix::GpuMatrix(const Symbolic_Matrix& a, unsigned slots, bool perturb, UpdateMode mode,SnapshotPolicy snapshot)
+    : impl_(std::make_shared<Impl>(a, slots, perturb, mode,snapshot,std::vector<unsigned>{})) {}
+GpuMatrix::GpuMatrix(const Symbolic_Matrix& a,const std::vector<unsigned>& positions,unsigned slots,bool perturb,UpdateMode mode,SnapshotPolicy snapshot)
+    : impl_(std::make_shared<Impl>(a, slots, perturb, mode,snapshot,require_compact_order(positions))) {}
 GpuMatrix::~GpuMatrix() = default;
 unsigned GpuMatrix::tmp_slots() const { return impl_->slots; }
 size_t GpuMatrix::task_device_bytes(unsigned copies) const {
@@ -880,9 +1003,14 @@ size_t GpuMatrix::task_device_bytes(unsigned copies) const {
     const size_t scratch=checked_bytes(uint64_t(impl_->n)*impl_->slots,sizeof(REAL));
     bytes=checked_sum(bytes,checked_bytes(scratch,copies));
     if(pitch) bytes=checked_sum(bytes,checked_bytes(uint64_t(impl_->nnz)*pitch,sizeof(REAL)));
+    bytes=checked_sum(bytes,checked_bytes(uint64_t(impl_->compact_elements)*copies,sizeof(REAL)));
     return bytes;
 }
 size_t GpuMatrix::task_host_bytes() const { return size_t(impl_->nnz)*sizeof(REAL); }
+SnapshotPolicy GpuMatrix::snapshot_policy() const { return impl_->snapshot_policy; }
+double GpuMatrix::snapshot_setup_ms() const { return impl_->snapshot_setup_ms; }
+size_t GpuMatrix::compact_input_elements() const { return impl_->compact_elements; }
+double GpuMatrix::compact_input_setup_ms() const { return impl_->compact_setup_ms; }
 size_t GpuMatrix::shared_device_bytes() const { return impl_->shared_bytes; }
 size_t GpuMatrix::update_map_bytes() const { return impl_->map_bytes; }
 double GpuMatrix::update_map_setup_ms() const { return impl_->map_setup_ms; }
@@ -903,6 +1031,23 @@ size_t GpuMatrix::free_device_bytes() {
 }
 GpuTask::GpuTask(const GpuMatrix& matrix,unsigned batch) : impl_(new Impl(matrix.impl_,batch)) {}
 unsigned GpuTask::batch_size() const { return impl_->copies; }
+SnapshotPolicy GpuTask::snapshot_policy() const { return impl_->snapshot_policy; }
+size_t GpuTask::snapshot_h2d_bytes() const {
+    const auto& t=*impl_;
+    if(t.snapshot_policy==SnapshotPolicy::Device)return 0;
+    return t.snapshot_policy==SnapshotPolicy::Shared ? t.matrix->input.bytes : t.values.bytes;
+}
+size_t GpuTask::snapshot_h2d_ops() const {
+    const auto& t=*impl_;
+    if(t.snapshot_policy==SnapshotPolicy::Device)return 0;
+    return t.snapshot_policy==SnapshotPolicy::PerCopy ? t.copies : 1;
+}
+size_t GpuTask::snapshot_restore_launches() const {
+    const auto& t=*impl_;
+    const bool restore=t.snapshot_policy==SnapshotPolicy::Device ||
+        (t.snapshot_policy==SnapshotPolicy::Shared && t.copies>1);
+    return size_t(restore)+size_t(t.soa_stride!=0);
+}
 GpuTask::~GpuTask() = default;
 
 unsigned GpuTask::update_copy_tile_size() const { return impl_->soa_stride ? 1u<<impl_->copy_bits : 1; }
@@ -912,7 +1057,8 @@ bool GpuTask::normalizes_each_level() const { return impl_->matrix->panel_mode |
 
 size_t GpuTask::numeric_launches() const {
     const auto& t=*impl_;const auto& a=*t.matrix;
-    size_t count=t.soa_stride ? 2 : 0;
+    // Input paths prepare the execution layout; numeric work converts only output.
+    size_t count=t.soa_stride ? 1 : 0;
     if(a.panel_mode) {
         count+=a.levels.size()-1;
         for(const auto r:a.panel_immediate)count+=r.end>r.begin;
@@ -979,8 +1125,18 @@ void GpuTask::upload_input(const REAL* values,size_t elements) {
     if(t.failed || t.pending || t.input_queued)throw std::logic_error("cannot queue task input in this state");
     t.ready=false;
     try {t.enqueue_input(values);t.input_queued=true;}
-    // Earlier copies may already be queued. Drain before the caller can release
+    // An upload may have queued work. Drain before the caller can release
     // the external input; a cleanup error must not replace the original error.
+    catch(...) {t.failed=true;cudaStreamSynchronize(t.stream);throw;}
+}
+void GpuTask::upload_compact_input(const REAL* values,size_t elements) {
+    auto& t=*impl_;
+    if(!t.matrix->compact_elements || !values || elements!=size_t(t.matrix->compact_elements)*t.copies)
+        throw std::invalid_argument("compact input must match a prepared compact order and batch size");
+    if(t.matrix->perturb)throw std::invalid_argument("fresh input requires an explicit perturbation threshold policy");
+    if(t.failed || t.pending || t.input_queued)throw std::logic_error("cannot queue task input in this state");
+    t.ready=false;
+    try {t.enqueue_compact(values);t.input_queued=true;}
     catch(...) {t.failed=true;cudaStreamSynchronize(t.stream);throw;}
 }
 void GpuTask::enqueue() {
