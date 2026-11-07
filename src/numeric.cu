@@ -710,8 +710,12 @@ struct GpuTask::Impl {
         } catch(...) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); throw; }
     }
     void enqueue_input(const REAL* input=nullptr) {
+        if(input) {
+            gpu_check(cudaMemcpyAsync(values.ptr,input,values.bytes,cudaMemcpyHostToDevice,stream),"upload matrix input");
+            return;
+        }
         for(unsigned copy=0;copy<copies;++copy)
-            gpu_check(cudaMemcpyAsync(values.ptr+size_t(copy)*matrix->nnz,input ? input+size_t(copy)*matrix->nnz : matrix->input.ptr,
+            gpu_check(cudaMemcpyAsync(values.ptr+size_t(copy)*matrix->nnz,matrix->input.ptr,
                 size_t(matrix->nnz)*sizeof(REAL),cudaMemcpyHostToDevice,stream),"upload matrix input");
     }
     void transpose(bool to_interleaved) {
@@ -979,7 +983,7 @@ void GpuTask::upload_input(const REAL* values,size_t elements) {
     if(t.failed || t.pending || t.input_queued)throw std::logic_error("cannot queue task input in this state");
     t.ready=false;
     try {t.enqueue_input(values);t.input_queued=true;}
-    // Earlier copies may already be queued. Drain before the caller can release
+    // An upload may have queued work. Drain before the caller can release
     // the external input; a cleanup error must not replace the original error.
     catch(...) {t.failed=true;cudaStreamSynchronize(t.stream);throw;}
 }

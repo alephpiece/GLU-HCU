@@ -33,12 +33,14 @@ cudaError_t memcpy_async(void* destination,const void* source,size_t bytes,
         else state->same_stream=state->same_stream && state->stream==stream;
         unsigned& calls=kind==cudaMemcpyHostToDevice ? state->h2d_calls : state->d2h_calls;
         ++calls;
-        if((state->fail_upload && kind==cudaMemcpyHostToDevice && calls==2) ||
-           (!state->fail_upload && kind==cudaMemcpyDeviceToHost && calls==1))
+        if(!state->fail_upload && kind==cudaMemcpyDeviceToHost && calls==1)
             return copy_error;
     }
     const auto status=cudaMemcpyAsync(destination,source,bytes,kind,stream);
     if(state && kind==cudaMemcpyHostToDevice && status==cudaSuccess) ++state->h2d_submitted;
+    // A failed upload must drain even if the batch DMA was already queued.
+    if(state && state->fail_upload && kind==cudaMemcpyHostToDevice && status==cudaSuccess)
+        return copy_error;
     return status;
 }
 
@@ -1085,11 +1087,11 @@ void test_submission_failure_cleanup()
         if(diagnostic!=expected)
             throw std::runtime_error("submission failure lost original error: "+diagnostic);
         // Assert before task destruction can drain anything. The pinned AoS
-        // source remains alive, including while enqueue drains earlier uploads.
-        if(state.h2d_calls!=copies || state.h2d_submitted!=(fail_upload ? 1u : copies) ||
+        // source remains alive, including while enqueue drains the batch upload.
+        if(state.h2d_calls!=1 || state.h2d_submitted!=1 ||
            state.d2h_calls!=(fail_upload ? 0u : 1u) || !state.same_stream ||
            state.sync_calls!=1 || state.sync_successes!=1)
-            throw std::runtime_error("submission failure did not drain prior copies on its stream");
+            throw std::runtime_error("submission failure did not drain the batch upload on its stream");
         expect_task_rejection<std::logic_error>([&] { task.enqueue(); },
             "failed task accepted enqueue");
         expect_task_rejection<std::logic_error>([&] { task.upload_input(); },
