@@ -1243,6 +1243,173 @@ void test_fresh_inputs()
     std::cout<<"PASS host/fresh-input-fixed-structure-known-LU-and-state-contract\n";
 }
 
+void test_compact_inputs() {
+    // One omitted input position becomes a nonzero fill value during LU.
+    // Another stored input starts at zero and changes legally across rounds.
+    const unsigned n=3;
+    std::vector<unsigned> columns{0,3,5,8},rows{0,1,2,0,1,0,1,2};
+    const std::vector<unsigned> positions{8,0,7,3,6,4,2,1}; // Deliberately not sorted.
+    const auto dense_values=[](unsigned round,unsigned copy) {
+        std::vector<REAL> a(9,0);
+        for(unsigned c=0;c<3;++c)a[c*3+c]=REAL(4)+REAL(round)/8+REAL(copy)/64;
+        a[1]=REAL(.5)+REAL(copy)/64;a[2]=1;a[3]=round%2 ? REAL(0):REAL(1);
+        a[6]=REAL(1)+REAL(round)/64;a[7]=round%2 ? REAL(.0625):REAL(0);
+        return a;
+    };
+    const auto factor=[](std::vector<REAL> a) {
+        for(unsigned c=0;c<3;++c) {
+            for(unsigned r=c+1;r<3;++r)a[c*3+r]/=a[c*3+c];
+            for(unsigned j=c+1;j<3;++j)for(unsigned r=c+1;r<3;++r)a[j*3+r]-=a[c*3+r]*a[j*3+c];
+        }
+        return a;
+    };
+    const auto base=dense_values(0,0);
+    std::vector<double> initial;
+    for(unsigned c=0;c<n;++c)for(unsigned p=columns[c];p<columns[c+1];++p)initial.push_back(base[c*3+rows[p]]);
+    std::ostringstream out,err;
+    Symbolic_Matrix matrix(n,out,err);matrix.fill_in(rows.data(),columns.data());matrix.csr();
+    matrix.predictLU(rows.data(),columns.data(),initial.data());matrix.leveling();
+    if(matrix.nnz!=9 || matrix.val!=base)throw std::runtime_error("compact fixture must have a zero fill slot");
+    for(const auto& invalid:std::vector<std::vector<unsigned>>{{},{0,0},{9}})
+        expect_task_rejection<std::invalid_argument>([&]{GpuMatrix rejected(matrix,invalid,1,false,UpdateMode::Mapped);},"invalid compact order accepted");
+    {
+        GpuMatrix ordinary(matrix,1,false,UpdateMode::Mapped);GpuTask task(ordinary);
+        expect_task_rejection<std::invalid_argument>([&]{task.upload_compact_input(base.data(),base.size());},"compact upload without an order accepted");
+    }
+    for(SnapshotPolicy snapshot:{SnapshotPolicy::Auto,SnapshotPolicy::PerCopy,SnapshotPolicy::Shared,SnapshotPolicy::Device})
+    for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped,UpdateMode::Panel,UpdateMode::PanelTiled})
+        for(unsigned copies:{1u,3u,33u})for(bool graph:{false,true}) {
+        std::unique_ptr<GpuTask> task;
+        {
+            GpuMatrix ordinary(matrix,1,false,mode,snapshot),compact(matrix,positions,1,false,mode,snapshot);
+            if(compact.compact_input_elements()!=positions.size() || ordinary.compact_input_elements()!=0 ||
+               compact.shared_device_bytes()!=ordinary.shared_device_bytes()+positions.size()*sizeof(unsigned) ||
+               compact.task_device_bytes(copies)!=ordinary.task_device_bytes(copies)+positions.size()*copies*sizeof(REAL))
+                throw std::runtime_error("compact input payload accounting");
+            task.reset(new GpuTask(compact,copies));
+            GpuTask ordinary_task(ordinary,copies);
+            if(task->numeric_launches()!=ordinary_task.numeric_launches() ||
+               task->snapshot_restore_launches()!=ordinary_task.snapshot_restore_launches())
+                throw std::runtime_error("compact numeric/input layout launch accounting");
+            if(graph)task->prepare_graph();
+        } // Task must retain its compact position map and default snapshot.
+        const auto check=[&](const std::vector<REAL>& inputs) {
+            task->check();Symbolic_Matrix oracle(matrix);
+            for(unsigned copy=0;copy<copies;++copy) {
+                const auto first=inputs.begin()+size_t(copy)*matrix.nnz;
+                std::vector<REAL> one(first,first+matrix.nnz);oracle.val=one;
+                compare(std::vector<REAL>(task->factors(copy),task->factors(copy)+matrix.nnz),factor(one),"compact input independent CPU LU");
+                const double residual=oracle.factor_residual(task->factors(copy));
+                if(!std::isfinite(residual) || residual>(sizeof(REAL)==8 ? 1e-12:1e-5))throw std::runtime_error("compact factor residual");
+            }
+        };
+        std::vector<REAL> defaults;
+        for(unsigned copy=0;copy<copies;++copy)defaults.insert(defaults.end(),base.begin(),base.end());
+        task->enqueue();task->wait();check(defaults);
+        const size_t elements=positions.size()*copies;
+        expect_task_rejection<std::invalid_argument>([&]{task->upload_compact_input(nullptr,elements);},"null compact source accepted");
+        expect_task_rejection<std::invalid_argument>([&]{task->upload_compact_input(defaults.data(),elements-1);},"incorrect compact count accepted");
+        check(defaults);
+        for(unsigned round=0;round<4;++round) {
+            std::vector<REAL> inputs,compact;
+            for(unsigned copy=0;copy<copies;++copy) {
+                const auto a=dense_values(round,copy);inputs.insert(inputs.end(),a.begin(),a.end());
+                for(unsigned p:positions)compact.push_back(a[p]);
+            }
+            task->upload_compact_input(compact.data(),compact.size());
+            expect_task_rejection<std::logic_error>([&]{task->upload_compact_input(compact.data(),compact.size());},"duplicate compact upload accepted");
+            expect_task_rejection<std::logic_error>([&]{task->wait();},"compact-only wait accepted");
+            task->enqueue();
+            expect_task_rejection<std::logic_error>([&]{task->upload_compact_input(compact.data(),compact.size());},"pending compact upload accepted");
+            task->wait();check(inputs);
+            if(round==0) {
+                // The full API may write a slot omitted by compact input. The
+                // next compact round must clear it instead of retaining it.
+                for(unsigned copy=0;copy<copies;++copy)inputs[size_t(copy)*matrix.nnz+5]=REAL(.125);
+                task->upload_input(inputs.data(),inputs.size());task->enqueue();task->wait();check(inputs);
+            }
+        }
+        task->enqueue();task->wait();check(defaults);
+    }
+    {
+        GpuMatrix compact(matrix,positions,1,true,UpdateMode::Mapped);GpuTask task(compact);
+        std::vector<REAL> source(positions.size(),REAL(1));
+        expect_task_rejection<std::invalid_argument>([&]{task.upload_compact_input(source.data(),source.size());},"perturbed compact upload accepted");
+        task.enqueue();task.wait();task.check();
+    }
+    for(bool override_sync:{false,true}) {
+        GpuMatrix compact(matrix,positions,1,false,UpdateMode::Mapped);GpuTask task(compact,3);
+        std::vector<REAL> source(positions.size()*3,REAL(1));
+        async_fault::State state;state.fail_upload=true;state.override_sync=override_sync;
+        {
+            async_fault::Scope scope(state);bool original=false;
+            try{task.upload_compact_input(source.data(),source.size());}
+            catch(const std::runtime_error& e){original=std::string(e.what())==std::string("upload compact matrix input: ")+cudaGetErrorString(async_fault::copy_error);}
+            if(!original || state.h2d_calls!=1 || state.h2d_submitted!=1 || state.sync_calls!=1 || state.sync_successes!=1 || !state.same_stream)
+                throw std::runtime_error("compact failed upload did not drain or preserve original error");
+        }
+        expect_task_rejection<std::logic_error>([&]{task.enqueue();},"failed compact task reuse accepted");
+    }
+    std::cout<<"PASS host/compact-input-zeros-fill-order-lifetime-and-failure-cleanup\n";
+}
+
+void test_compact_tile_tails()
+{
+    // Five independent 3x3 blocks: 40 stored inputs, 45 factor slots.
+    // Both entry and copy dimensions cross a 32-wide tile with partial tails.
+    constexpr unsigned blocks=5,copies=33;
+    std::vector<unsigned> columns{0},rows,positions;
+    for(unsigned c=0;c<blocks*3;++c) {
+        for(unsigned r=0;r<3;++r) if(c%3!=1 || r!=2)
+            rows.push_back(c/3*3+r);
+        columns.push_back(unsigned(rows.size()));
+    }
+    for(unsigned block=0;block<blocks;++block)
+        for(unsigned p:{8u,0u,7u,3u,6u,4u,2u,1u})positions.push_back(block*9+p);
+    const auto values=[](unsigned round,unsigned copy) {
+        std::vector<REAL> a(blocks*9,0);
+        for(unsigned b=0;b<blocks;++b) {
+            REAL* p=a.data()+b*9;
+            for(unsigned c=0;c<3;++c)p[c*3+c]=REAL(8+b)+REAL(round)/8+REAL(copy)/128;
+            p[1]=REAL(.5)+REAL(copy)/128;p[2]=1;
+            p[3]=round%2 ? REAL(0):REAL(1);p[6]=REAL(1)+REAL(b)/32;
+            p[7]=round%2 ? REAL(.0625):REAL(0);
+        }
+        return a;
+    };
+    const auto base=values(0,0);
+    std::vector<double> initial;
+    for(unsigned c=0;c<blocks*3;++c)
+        for(unsigned p=columns[c];p<columns[c+1];++p)
+            initial.push_back(base[(c/3)*9+(c%3)*3+rows[p]%3]);
+    std::ostringstream out,err;Symbolic_Matrix matrix(blocks*3,out,err);
+    matrix.fill_in(rows.data(),columns.data());matrix.csr();
+    matrix.predictLU(rows.data(),columns.data(),initial.data());matrix.leveling();
+    if(matrix.nnz!=45 || matrix.val!=base || positions.size()!=40)
+        throw std::runtime_error("compact tile fixture layout changed");
+    for(UpdateMode mode:{UpdateMode::Mapped,UpdateMode::Panel,UpdateMode::PanelTiled})
+    for(bool graph:{false,true}) {
+        GpuMatrix prepared(matrix,positions,1,false,mode);GpuTask task(prepared,copies);
+        if(graph)task.prepare_graph();
+        for(unsigned round=0;round<2;++round) {
+            std::vector<REAL> input;
+            for(unsigned copy=0;copy<copies;++copy) {
+                const auto a=values(round,copy);
+                for(unsigned p:positions)input.push_back(a[p]);
+            }
+            task.upload_compact_input(input.data(),input.size());task.enqueue();task.wait();task.check();
+            Symbolic_Matrix oracle(matrix);
+            for(unsigned copy=0;copy<copies;++copy) {
+                oracle.val=values(round,copy);
+                const double residual=oracle.factor_residual(task.factors(copy));
+                if(!std::isfinite(residual) || residual>(sizeof(REAL)==8 ? 1e-12:1e-5))
+                    throw std::runtime_error("compact entry/copy tile tail residual");
+            }
+        }
+    }
+    std::cout<<"PASS host/compact-entry-and-copy-tile-tails\n";
+}
+
 void test_auto_snapshot()
 {
     unsigned columns[]{0,2,4},rows[]{0,1,0,1};double input[]{4,2,1,3};
@@ -1347,6 +1514,8 @@ int main()
                 for(unsigned copies:{1u,3u,33u})for(bool graph:{false,true})
                     test_repeated_tasks(graph,copies,mode,snapshot);
         test_fresh_inputs();
+        test_compact_inputs();
+        test_compact_tile_tails();
         test_auto_snapshot();
         test_submission_failure_cleanup();
         test_zero_update_map();

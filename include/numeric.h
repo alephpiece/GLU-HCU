@@ -25,14 +25,23 @@ public:
     explicit GpuMatrix(const Symbolic_Matrix&, unsigned tmp_slots = 32, bool perturb = false,
                        UpdateMode update_mode = UpdateMode::Scan,
                        SnapshotPolicy snapshot_policy = SnapshotPolicy::Auto);
+    // Fixed compact order: nonempty, unique indices < factor_nnz, including
+    // explicit zeros that may change. Omitted slots are zero on each compact upload.
+    // Caller performs any preprocessing/permutation/scaling before supplying values.
+    GpuMatrix(const Symbolic_Matrix&, const std::vector<unsigned>& input_positions,
+              unsigned tmp_slots = 32, bool perturb = false,
+              UpdateMode update_mode = UpdateMode::Scan,
+              SnapshotPolicy snapshot_policy = SnapshotPolicy::Auto);
     ~GpuMatrix();
     unsigned tmp_slots() const; // Effective scratch slots; zero outside Scan.
     size_t task_device_bytes(unsigned batch_size = 1) const; // Exact buffers for one batch.
     size_t task_host_bytes() const; // Bytes of one pinned input/output vector.
     SnapshotPolicy snapshot_policy() const; // Requested policy; Auto resolves separately for each task.
     double snapshot_setup_ms() const; // Device initial allocation and upload only.
+    size_t compact_input_elements() const; // Per copy; zero without a compact order.
+    double compact_input_setup_ms() const; // Validation and position-map upload.
     // Device allocation payloads, excluding allocator/stream/Graph overhead.
-    // Shared bytes include maps/plans and a Device snapshot,
+    // Shared bytes include maps/plans, compact positions and a Device snapshot,
     // when enabled, paid once per template.
     size_t shared_device_bytes() const;
     size_t update_map_bytes() const;
@@ -68,7 +77,7 @@ public:
     bool normalizes_each_level() const;
     size_t numeric_launches() const; // Numeric work and output conversion; excludes input preparation.
     size_t numeric_wide_blocks() const; // Scan/Mapped only; zero means not applicable for panel modes.
-    // Default snapshot diagnostics; explicit fresh uploads bypass these.
+    // Default snapshot diagnostics; explicit fresh/compact uploads bypass these.
     size_t snapshot_h2d_bytes() const;
     size_t snapshot_h2d_ops() const;
     size_t snapshot_restore_launches() const; // Default-input kernels, including any input layout conversion.
@@ -94,6 +103,10 @@ public:
     // Not available with perturbation (whose threshold belongs to the snapshot).
     // On submission failure, attempt to drain before rethrowing; rebuild the task.
     void upload_input(const REAL* values, size_t elements);
+    // AoS [copy][fixed compact input position]. Exactly compact_input_elements
+    // * copies values. Same source lifetime, state, and perturbation constraints
+    // as fresh upload_input. Omitted slots reset to zero; the default is unchanged.
+    void upload_compact_input(const REAL* values, size_t elements);
     // Complete submitted work and propagate asynchronous errors. Upload-only
     // state is rejected because numeric work and output have not been enqueued.
     void wait();

@@ -235,10 +235,30 @@ GPU、检查或输出失败均以非零状态退出。为每次运行指定独�
 
 ## C++ 数值任务接口
 
-[numeric.h](include/numeric.h) 提供可复用的 `GpuMatrix` 模板和 `GpuTask`。模板持有不可变结构与默认初值，Task持有独立数值与输出。`SnapshotPolicy` 只控制默认初值恢复，默认请求 `Auto`，也可显式选择 `PerCopy/Shared/Device`；模板的 `snapshot_policy()` 返回请求，Task的同名接口返回按实际批量确定的策略。
+[numeric.h](include/numeric.h) 提供可复用的 `GpuMatrix` 模板和 `GpuTask`，支持下列三种输入用法。`SnapshotPolicy` 只控制不可变默认初值的恢复方式，不选择输入格式。模板默认请求 `SnapshotPolicy::Auto`，也可显式选择 `PerCopy/Shared/Device`；`GpuMatrix::snapshot_policy()` 返回请求，`GpuTask::snapshot_policy()` 返回该批已确定的实际策略。修改默认初值或执行结构需要重建模板。以下接口均可复用已准备的 Graph，调用者上传新值不更新模板默认初值。
 
-`upload_input()` 恢复默认初值，省略时由 `enqueue()` 自动执行。`upload_input(values, elements)` 接受连续 `[copy][factor slot]` 新值批，元素数为 `factor_nnz × copies`，不改变默认初值。两种入口先准备执行布局，再进入同一数值Graph；Graph可在输入排队前通过 `prepare_graph()` 准备并跨轮复用。
+| 调用 | 输入与元素数 |
+| --- | --- |
+| `upload_input()` | 恢复模板默认初值；省略此调用时，`enqueue()` 自动恢复 |
+| `upload_input(values, elements)` | 连续 `[copy][factor slot]`，元素数为 `factor_nnz × copies` |
+| `upload_compact_input(values, elements)` | 连续 `[copy][input position]`，元素数为 `compact_input_elements() × copies`；须先准备位置表 |
 
-调用者保证固定的预处理结构、排列和缩放；修改默认初值或执行结构需要重建模板。显式新值不能与静态主元扰动同用。源数组须保持可读且不变直到对应 `enqueue()`、`wait()` 完成，结果须在下一次上传、提交或销毁前消费。提交失败会尝试排空已排队工作，失败Task需要重建。
+紧凑位置表是 `symbolic.val` 中非空、唯一且有界的索引序列。它须包含全部合法存储位置及显式零，允许这些位置逐轮改变数值；每次紧凑上传时，未列出槽位视为零。不能按初值是否非零筛选位置。排列、缩放、重复项处理和固定执行结构由调用者保证，接口不重新预处理原始矩阵；位置集合或顺序改变时重建模板。
 
-调用者可直接生产到最终输入缓冲，并按独立工作及容量条件安排多个Task。库不自动组织生产线程或流水。完整所有权、线程约束与诊断契约见 [numeric.h](include/numeric.h)。
+以下示例假定 `symbolic` 已准备，`input_positions` 和主机数组 `host_values` 满足上述顺序与大小要求：
+
+```cpp
+GpuMatrix prepared(symbolic, input_positions, 32, false, UpdateMode::Mapped);
+GpuTask task(prepared, copies);
+task.prepare_graph(); // Optional; call before queuing input.
+task.upload_compact_input(host_values, prepared.compact_input_elements() * copies);
+task.enqueue();
+task.wait();
+const REAL* factors = task.factors(0);
+```
+
+每个任务一次只能排队一份输入、保留一个未完成提交。源数组须保持可读且不变直到对应 `enqueue()`、`wait()` 完成；pinned host 内存支持异步上传。结果只能在成功 `wait()` 后读取，并在下一次上传、提交或销毁前完成消费。显式 fresh/compact 输入不能与扰动同用；GPU 错误抛出异常，提交失败会尝试排空已排队工作并保留原异常，失败任务需重建。
+
+调用者可直接生产到最终输入缓冲；独立任务还可交替使用多个输入缓冲和共享模板的 `GpuTask`，以重叠生产与执行。各任务拥有独立数值缓冲、stream、Graph 和主机输出，按对应 `wait()` 与消费完成时机复用。库不自动组织流水，增加任务会增加设备与 pinned 容量，也不保证吞吐改善；调用者分配的输入数组需另计容量。
+
+所有权、线程约束、资源与诊断接口的完整契约见 [numeric.h](include/numeric.h)，因子残差接口见 [symbolic.h](include/symbolic.h)。
