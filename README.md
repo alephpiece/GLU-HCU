@@ -4,12 +4,14 @@ Last update: March 19, 2026
 
 ## CUDA / HIP build
 
-This branch provides native CUDA and HIP builds of the command-line solver,
-using FP64 by default. It also provides `glu_bench` for repeatable single- and
-multi-matrix workloads with one stream per homogeneous batch, completion of all
-tasks each loop, and full final-loop factor checks. See [BUILDING.md](BUILDING.md) for build and test commands
-and the optional FP32 configuration. The Python extension remains CUDA-only
-and has not been validated with this branch's FP64 default.
+This branch provides native CUDA and HIP builds of `lu_cmd` and `glu_bench`,
+using FP64 by default. `glu_bench` supports repeatable single- and multi-matrix
+factorization workloads.
+
+See [BUILDING.md](BUILDING.md) for build and regression test commands, and the
+[documentation index](docs/README.md) for usage, C++ integration and algorithm
+references. The Python extension remains CUDA-only and has not been validated
+with this branch's FP64 default.
 
 ## Authors:
 Shaoyi Peng (speng004@ucr.edu)\
@@ -28,7 +30,7 @@ https://sheldonucr.github.io/GLU_public/
 USB 3-Clause License 
 
 ## Sub-directories
-docs: contains some related document's and publications for GLU
+docs: usage manuals, algorithm introductions and related publications for GLU
 src: contains all the source codes for GLU
 pyglu: Python package (bindings for the GPU solver)
 

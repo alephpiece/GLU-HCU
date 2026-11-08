@@ -1,4 +1,4 @@
-# 构建与运行
+# 构建与验证
 
 GLU 使用同一份源码构建 CUDA 或原生 HIP 版本，生成求解程序 `lu_cmd` 和性能测试程序 `glu_bench`。计算精度由构建选项决定，默认 FP64。
 
@@ -69,28 +69,6 @@ make -j64 CUDA_ARCH=sm_90
 
 生成的程序为 `src/lu_cmd`。修改目标架构或编译参数后，应先清理构建产物再重新编译。此入口在源码目录内生成对象文件，可在独立 worktree 中使用。
 
-## 运行
-
-`lu_cmd` 每次读取一个矩阵，求解右端向量全为 1 的线性系统，并将解写入当前目录的 `x.dat`。在独立输出目录运行，以免覆盖已有结果：
-
-```bash
-mkdir -p /path/to/output
-cd /path/to/output
-/path/to/build-hip/lu_cmd -i /path/to/matrix.mtx
-```
-
-CUDA 版本使用相应构建目录中的 `lu_cmd`。两个程序均选择第一个可见 GPU，可通过 `CUDA_VISIBLE_DEVICES` 或 `HIP_VISIBLE_DEVICES` 指定设备。
-
-输入采用实数方阵的坐标格式：尺寸行包含行数、列数和非零元素数，随后每行包含从 1 开始的行索引、列索引和值。元素需先按列、再按行排序，并显式提供全部非零元素。读取器不自动展开对称存储，`.mtx` 扩展名本身也不保证满足这些要求。
-
-加入 `-p` 可启用静态主元扰动：
-
-```bash
-/path/to/build-hip/lu_cmd -i /path/to/matrix.mtx -p
-```
-
-扰动会改变分解。程序先检查解是否有限，再写入 `x.dat`，保留所选精度往返转换所需的有效数字。GPU 操作、因子检查、解检查或文件读写失败时，程序以非零状态退出。退出码为零表示执行完成，数值正确性仍需通过残差或参考解检查。
-
 ## GPU 数值回归测试
 
 在已配置的构建目录启用测试，然后重新构建并运行：
@@ -104,161 +82,14 @@ HIP_VISIBLE_DEVICES=0 ctest --test-dir /path/to/build-hip --output-on-failure
 
 CUDA 后端使用对应构建目录和 `CUDA_VISIBLE_DEVICES`。测试需要可用 GPU，覆盖数值 kernel、批量任务与 Graph、任务生命周期，以及 CLI 输出和错误处理。具体回归用例维护在 [tests/](tests/)。
 
-## 多矩阵性能测试
+## 运行检查
 
-`glu_bench` 与 `lu_cmd` 共用 GPU 执行实现，使用相同输入格式，支持 CUDA/HIP 和所选构建精度。benchmark 不启用扰动，参数概要可用 `glu_bench --help` 查看。命令示例：
-
-```bash
-# 单任务
-/path/to/build/glu_bench -i /path/to/matrix.mtx --output single.json
-
-# 同一模板的 12 个独立任务，每批最多 4 个副本
-/path/to/build/glu_bench -i /path/to/matrix.mtx \
-  --tasks 12 --batch-size 4 --updates mapped --graph --output repeated.json
-
-# 三模板循环分配：3、3、2 个任务
-/path/to/build/glu_bench \
-  -i /path/to/matrix-a.mtx -i /path/to/matrix-b.mtx -i /path/to/matrix-c.mtx \
-  --tasks 8 --output multiple.json
-```
-
-### 参数
-
-| 参数 | 默认值 | 含义 |
-| --- | --- | --- |
-| `-i PATH` | 与 `--workload` 二选一，可重复 | 按给定顺序组成模板列表，任务循环引用它们 |
-| `--workload FILE` | 与 `-i` 二选一 | 从显式清单读取模板与有序任务，不能同时指定 `--tasks` |
-| `--tasks N` | `-i` 模板数 | 仅用于 `-i` 模式，独立任务总数必须至少覆盖全部模板 |
-| `--warmup N` | 5 | 预热的完整 LOOP 数，允许 0 |
-| `--loops N` | 30 | 计时的完整 LOOP 数，必须大于 0 |
-| `--batch-size N` | 1 | 同模板独立副本的每批上限，每批一条 stream，尾批保留实际数量 |
-| `--graph` | 关闭 | 准备阶段捕获每批数值与输出图，随后重放 |
-| `--snapshot-policy auto\|per-copy\|shared\|device` | `auto` | 自动选择初值恢复方式，或强制逐副本上传、共享上传、设备初值恢复 |
-| `--updates scan\|mapped\|panel\|tiled` | `scan` | 选择扫描、位置映射、依赖窗口目标归约或带局部密集块的归约 |
-| `--submit-threads N` | 1 | 并行提交数值与输出的主机线程数上限，实际不超过批数。输入由主线程提前排队 |
-| `--tmp-slots N` | 32 | scan 每个副本的 scratch 槽数上限，其它策略不使用 scratch |
-| `--check full\|basic` | `full` | 完整因子残差检查，或轻量有限性检查 |
-| `--diagnostics` | 关闭 | 输出提交与等待的墙钟、线程 CPU 时间、kernel 次数和传输量 |
-| `--output PATH` | 无 | 成功后写 JSON，程序同时在标准输出打印日志和结果 |
-
-任务数、批量上限、线程数和槽数均须为正整数。每个模板只预处理和准备一次，各任务拥有独立数值区和因子输出。同模板副本使用相同的不可变初值，每轮完整恢复，不模拟逐轮变化的输入。合批改变执行组织，不改变逻辑任务数。
-
-### 显式任务清单
-
-需要不均匀的模板频率或指定逻辑任务顺序时，使用 `--workload FILE` 替代 `-i` 和 `--tasks`：
-
-```text
-glu-workload 1
-matrix light "inputs/light.mtx"
-matrix heavy "inputs/heavy.mtx"
-task light
-task heavy
-task light
-```
+构建后可在独立输出目录运行求解器：
 
 ```bash
-/path/to/build/glu_bench --workload /path/to/case.workload \
-  --batch-size 4 --updates mapped --graph --output case.json
+mkdir -p /path/to/output
+cd /path/to/output
+/path/to/build-hip/lu_cmd -i /path/to/matrix.mtx
 ```
 
-首条有效记录必须是版本头，随后定义全部 `matrix ID PATH`，再列出 `task ID`。ID 必须唯一、先定义后引用，全部模板都必须被使用。每个 ID 只准备一次模板，不按文件路径或内容自动合并不同 ID。
-
-路径相对于清单目录解析，也可使用绝对路径。包含空格时用双引号，双引号和反斜杠可用反斜杠转义。允许空行和以 `#` 开头的整行注释。未知记录、额外字段、无效 ID 及与 `-i` / `--tasks` 混用均报错。
-
-清单顺序表示逻辑任务，不表示依赖或到达时间。`--batch-size 1` 按该顺序组织任务，更大批量按模板定义顺序交错分批。并行提交时，实际开始提交的次序可以变化。
-
-### 执行策略与资源
-
-每批使用独立 stream，按 `输入恢复与布局准备 → 数值分解 → 完整因子回传` 执行，全部批次完成后开始下一轮。所有输入入口先准备好数值执行布局，`--graph` 只重放每批的数值与输出操作；不启用时直接提交各项操作。Graph 每批一次 D2H，直接提交则逐副本 D2H。
-
-`--submit-threads` 大于 1 时，工作线程并行提交独立批次，只有一批时仍使用主线程。工作线程每轮创建和汇合，相关成本包含在 LOOP 中。主机线程数和逻辑 stream 数都不等于实际 GPU 并发度。
-
-`scan` 使用每副本独立的 scratch，实际槽数不超过 `--tmp-slots`。`mapped`、`panel`、`tiled` 预先准备共享索引或计划，不使用 scratch；准备成本与额外设备容量随结构和批量变化，需显式选择。`tiled` 在 gfx936 上使用原生矩阵指令，其它目标使用标量回退，不降低所选输入精度。策略可能改变浮点累加次序，应验证所选精度的数值结果。
-
-Snapshot 指模板的不可变默认初值，每轮完整恢复，各副本独立分解。`auto` 在每批创建时选择：panel 多副本使用 `shared`，上传一份后广播；这里的 shared 表示共享一次上传，不是 GPU shared memory。单副本及 scan/mapped/tiled 使用 `per-copy`。可显式指定二者覆盖该规则。Auto 不改变数值策略、Graph 或提交线程配置。
-
-`device` 仅显式启用，在准备时额外保留每模板一份只读设备初值，直到模板释放，计入共享设备载荷。它不属于 Auto 的候选方式。
-
-批内副本数和跨轮复用次数分别决定并行规模与准备成本的摊销。长期复用时保留模板、任务和已准备的 Graph，逐轮上传新值或恢复默认初值，然后提交、等待并消费结果；无需逐轮重新分配或捕获。固定结构的异值输入也可复用这些对象，但不能利用默认初值相同的快照共享。跨轮数值不变时可比较 `device`，是否采用仍取决于每轮收益与额外设备容量；复用上千轮不意味着它必然更快。按实际复用轮数比较含准备的完成时间，避免仅凭稳态耗时选择准备更重的数值策略。
-
-程序对显存容量与执行网格做预检，超限时明确报错，不自动调整任务、批量或槽数。容量预检只统计显式缓冲区，不保证后续设备或 pinned host 分配成功。
-
-### 计时与结果
-
-一次 LOOP 包含全部任务的输入恢复、数值提交与执行、D2H、线程创建与汇合及轮末等待。预处理、资源和 Graph 准备、数值检查、solve、输出文件和释放资源不计入 LOOP。
-
-| JSON 字段 | 含义 |
-| --- | --- |
-| `setup_ms` / `graph_setup_ms` | 准备总耗时及其中的 Graph 捕获与实例化耗时，准备时不执行分解 |
-| `update_map_setup_ms` | mapped 路径的映射及辅助元数据准备耗时，包含在 `setup_ms` 中 |
-| `update_plan_bytes` / `update_plan_setup_ms` | panel/tiled 的设备计划载荷与构造上传时间，包含在共享载荷和 `setup_ms` 中 |
-| `native_mmac` | 至少一个模板具有使用原生矩阵指令的密集 tile。标量回退或无 tile 时为 false |
-| `warmup_ms` | 全部预热耗时，包含可能的首次重放开销 |
-| `loop_ms` / `ms_per_loop` | 主机单调时钟测量的逐轮完整耗时及算术平均值 |
-| `factor_output_ready_ms` | 从预处理前至最后一轮全因子可读的实际墙钟，包含准备、预热与计时轮；检查、solve、报告与释放在外。固定N任务比较时用`--warmup 0` |
-| `validation_ms` | 计时结束后检查全部任务的耗时 |
-| `task_device_bytes` / `shared_device_bytes` | 任务缓冲及模板共享设备缓冲载荷，后者包含位置映射、更新计划及Device策略的只读初值 |
-| `snapshot_policy` / `snapshot_setup_ms` | 请求的初值恢复策略及设备初值准备分量，后者已计入setup |
-| `batch_snapshot_policies` | 按批顺序记录实际恢复策略；Auto 的单副本尾批可与前面批次不同 |
-| `update_map_bytes` | 共享设备缓冲中的位置映射载荷 |
-| `pinned_bytes` | 模板共享初值与各独立副本因子输出的 pinned host 载荷 |
-| `templates[].effective_tmp_slots` | 实际 scratch 槽数，其它策略为 0 |
-| `task_templates` | 按逻辑任务顺序记录的零起始模板索引 |
-| `batch_templates` / `batch_sizes` / `ordering` | 各批的模板、实际副本数与提交策略。并行时不表示实际提交时序 |
-
-容量字段统计显式缓冲区载荷，不包含 allocator、stream、Graph 和运行时内部资源，也不代表进程峰值显存。报告还记录后端、精度、设备、检查模式和实际任务覆盖。
-
-启用 `--diagnostics` 后另报：
-
-| JSON 字段 | 含义 |
-| --- | --- |
-| `submit_ms` / `drain_ms` | 提交全部任务及随后等待的墙钟分段。submit 可含运行时等待，drain 不等于全部 GPU 时间 |
-| `submit_thread_cpu_ms` / `drain_thread_cpu_ms` | 主线程在提交及等待阶段的 CPU 时间，分别统计，不含其他线程的 CPU 时间 |
-| `submit_workers_cpu_ms` | 全部提交工作线程的 CPU 时间之和，可大于提交墙钟。单线程时为 0 |
-| `submit_worker_max_wall_ms` | 最慢提交工作线程的墙钟耗时。单线程时为 0 |
-| `launches_per_loop` | 每轮数值与输出布局转换kernel次数；Graph重放不等于主机launch API次数 |
-| `input_restore_launches_per_loop` | 每轮快照广播、设备恢复及输入布局转换kernel次数；所有输入布局准备均在数值Graph之外 |
-| `wide_blocks_per_loop` | scan/mapped 每轮宽层数值 kernel 的线程块总数，包含适用路径的归一化与目标更新。panel/tiled 返回 0 表示不适用 |
-| `template_work` | 每模板的层宽及 L 非空源列的结构目标数量，各批实际启动次数另计。panel/tiled 不适用的层内启动字段为 null |
-| `h2d_bytes_per_loop` / `d2h_bytes_per_loop` | 每轮所选快照策略的实际传输载荷；完整因子D2H按全部逻辑副本统计 |
-| `h2d_copy_ops_per_loop` / `d2h_copy_ops_per_loop` | 每轮 H2D/D2H 操作次数，字节相同不代表操作次数相同 |
-
-每轮 `submit_ms + drain_ms = loop_ms`。CPU 时间与墙钟分别解释，主线程 CPU 时间下降不代表全部线程工作减少。诊断统计不包括准备阶段，统计输出在计时区间外。
-
-### 正确性与检查
-
-默认 `--check full` 在计时后检查最后一轮的全部任务：有限因子、非零主元、全 1 RHS 的有限解，以及预处理矩阵的完整因子残差 `||B−LU||∞ / ||B||∞`。FP64 上限为 `1e-10`，FP32 为 `1e-3`。这检验分解质量，不保证病态原问题的前向精度。完整残差计算可能耗时较长，单列为 `validation_ms`。
-
-`--check basic` 保留全部任务的有限因子、非零主元和有限解检查，跳过因子残差，残差及容差字段输出为 `null`。`status=ok` 仅表示所选检查通过，basic 通过不等于 full 验收。两种模式都只检查最后一轮，计时中检查提交与等待的 GPU 错误。
-
-GPU、检查或输出失败均以非零状态退出。为每次运行指定独立输出路径，避免误读先前的成功文件。
-
-## C++ 数值任务接口
-
-[numeric.h](include/numeric.h) 提供可复用的 `GpuMatrix` 模板和 `GpuTask`，支持下列三种输入用法。`SnapshotPolicy` 只控制不可变默认初值的恢复方式，不选择输入格式。模板默认请求 `SnapshotPolicy::Auto`，也可显式选择 `PerCopy/Shared/Device`；`GpuMatrix::snapshot_policy()` 返回请求，`GpuTask::snapshot_policy()` 返回该批已确定的实际策略。修改默认初值或执行结构需要重建模板。以下接口均可复用已准备的 Graph，调用者上传新值不更新模板默认初值。
-
-| 调用 | 输入与元素数 |
-| --- | --- |
-| `upload_input()` | 恢复模板默认初值；省略此调用时，`enqueue()` 自动恢复 |
-| `upload_input(values, elements)` | 连续 `[copy][factor slot]`，元素数为 `factor_nnz × copies` |
-| `upload_compact_input(values, elements)` | 连续 `[copy][input position]`，元素数为 `compact_input_elements() × copies`；须先准备位置表 |
-
-紧凑位置表是 `symbolic.val` 中非空、唯一且有界的索引序列。它须包含全部合法存储位置及显式零，允许这些位置逐轮改变数值；每次紧凑上传时，未列出槽位视为零。不能按初值是否非零筛选位置。排列、缩放、重复项处理和固定执行结构由调用者保证，接口不重新预处理原始矩阵；位置集合或顺序改变时重建模板。
-
-以下示例假定 `symbolic` 已准备，`input_positions` 和主机数组 `host_values` 满足上述顺序与大小要求：
-
-```cpp
-GpuMatrix prepared(symbolic, input_positions, 32, false, UpdateMode::Mapped);
-GpuTask task(prepared, copies);
-task.prepare_graph(); // Optional; call before queuing input.
-task.upload_compact_input(host_values, prepared.compact_input_elements() * copies);
-task.enqueue();
-task.wait();
-const REAL* factors = task.factors(0);
-```
-
-每个任务一次只能排队一份输入、保留一个未完成提交。源数组须保持可读且不变直到对应 `enqueue()`、`wait()` 完成；pinned host 内存支持异步上传。结果只能在成功 `wait()` 后读取，并在下一次上传、提交或销毁前完成消费。显式 fresh/compact 输入不能与扰动同用；GPU 错误抛出异常，提交失败会尝试排空已排队工作并保留原异常，失败任务需重建。
-
-调用者可直接生产到最终输入缓冲；独立任务还可交替使用多个输入缓冲和共享模板的 `GpuTask`，以重叠生产与执行。各任务拥有独立数值缓冲、stream、Graph 和主机输出，按对应 `wait()` 与消费完成时机复用。库不自动组织流水，增加任务会增加设备与 pinned 容量，也不保证吞吐改善；调用者分配的输入数组需另计容量。
-
-所有权、线程约束、资源与诊断接口的完整契约见 [numeric.h](include/numeric.h)，因子残差接口见 [symbolic.h](include/symbolic.h)。
+程序求解右端向量全为 1 的线性系统，将解写入 `x.dat`。矩阵格式与运行用法见[命令行求解](docs/solver.md)。
