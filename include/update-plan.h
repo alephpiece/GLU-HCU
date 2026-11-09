@@ -205,6 +205,45 @@ struct PanelUpdatePlan {
     uint64_t immediate_products=0,deferred_products=0;
     uint64_t inline_singletons=0;
 };
+// A tagged 64-bit record stores either three 21-bit singleton positions or a
+// 21-bit destination, 27-bit pair offset and 15-bit count. Wider templates keep
+// their original groups; pair operands and contribution order stay unchanged.
+constexpr uint64_t packed_update_single_bit=uint64_t(1)<<63;
+constexpr unsigned packed_update_position_mask=(1u<<21)-1;
+constexpr unsigned packed_update_pair_mask=(1u<<27)-1;
+constexpr unsigned packed_update_count_mask=(1u<<15)-1;
+inline uint64_t pack_update_range(unsigned destination,unsigned begin,unsigned count) {
+    if(destination>packed_update_position_mask || begin>packed_update_pair_mask ||
+       !count || count>packed_update_count_mask ||
+       uint64_t(begin)+count>uint64_t(packed_update_pair_mask)+1)
+        throw std::invalid_argument("packed update range");
+    return uint64_t(destination)|(uint64_t(begin)<<21)|(uint64_t(count)<<48);
+}
+inline std::vector<uint64_t> pack_update_groups(const PanelUpdatePlan& plan,unsigned nnz,bool inline_singletons) {
+    if(nnz>=(1u<<21) || plan.pairs.size()>uint64_t(packed_update_pair_mask)+1)return {};
+    // Decide once for the whole template before allocating or encoding records.
+    for(const auto& group:plan.groups) {
+        const bool single=inline_singletons && (group.destination&inline_update_pair_bit);
+        const unsigned destination=single ? group.destination&~inline_update_pair_bit : group.destination;
+        if(destination>=nnz)throw std::logic_error("packed update destination range");
+        if(!single) {
+            if(group.begin>=group.end || group.end>plan.pairs.size())throw std::logic_error("packed update pair range");
+            if(group.end-group.begin>packed_update_count_mask)return {};
+        }
+    }
+    std::vector<uint64_t> records;
+    records.reserve(plan.groups.size());
+    for(const auto& group:plan.groups) {
+        const bool single=inline_singletons && (group.destination&inline_update_pair_bit);
+        const unsigned destination=single ? group.destination&~inline_update_pair_bit : group.destination;
+        if(single || group.end-group.begin==1) {
+            const auto pair=single ? NormalizedUpdatePair{group.begin,group.end} : plan.pairs[group.begin];
+            if(pair.lower>=nnz || pair.pivot>=nnz)throw std::logic_error("packed update operand range");
+            records.push_back(packed_update_single_bit|uint64_t(destination)|(uint64_t(pair.lower)<<21)|(uint64_t(pair.pivot)<<42));
+        } else records.push_back(pack_update_range(destination,group.begin,group.end-group.begin));
+    }
+    return records;
+}
 // Keep destinations read anywhere in this dependency window current at each
 // level. Only unread destinations may be grouped across levels and applied at
 // the window end; dense extraction partitions those same deferred contributions.
