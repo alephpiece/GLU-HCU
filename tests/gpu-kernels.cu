@@ -1475,6 +1475,151 @@ void test_invalid_factor(REAL value, const char* diagnostic)
 
 } // namespace
 
+void test_packed_update_groups_codec()
+{
+    static_assert(packed_update_single_bit==(uint64_t(1)<<63) &&
+        packed_update_position_mask==((1u<<21)-1) &&
+        packed_update_pair_mask==((1u<<27)-1) && packed_update_count_mask==((1u<<15)-1),
+        "packed update field widths changed");
+    auto range=[](uint64_t record,unsigned destination,unsigned begin,unsigned count) {
+        if((record&(uint64_t(1)<<63)) || unsigned(record&((uint64_t(1)<<21)-1))!=destination ||
+           unsigned((record>>21)&((uint64_t(1)<<27)-1))!=begin || unsigned(record>>48)!=count)
+            throw std::runtime_error("packed range field boundary");
+    };
+    const unsigned pair_limit=1u<<27;
+    range(pack_update_range(packed_update_position_mask,packed_update_pair_mask,1),
+        packed_update_position_mask,packed_update_pair_mask,1);
+    range(pack_update_range(packed_update_position_mask,pair_limit-packed_update_count_mask,packed_update_count_mask),
+        packed_update_position_mask,pair_limit-packed_update_count_mask,packed_update_count_mask);
+    auto rejects=[](unsigned destination,unsigned begin,unsigned count) {
+        bool rejected=false;
+        try { (void)pack_update_range(destination,begin,count); }
+        catch(const std::invalid_argument&) { rejected=true; }
+        if(!rejected)throw std::runtime_error("packed range accepted an invalid field");
+    };
+    rejects(packed_update_position_mask+1,0,1);
+    rejects(0,packed_update_pair_mask+1,1);
+    rejects(0,0,0);
+    rejects(0,0,packed_update_count_mask+1);
+    rejects(0,packed_update_pair_mask,2);
+    // Exercise 32-bit pair positions without allocating a 2^27-entry vector.
+    rejects(0,1u<<31,2);
+    rejects(0,std::numeric_limits<unsigned>::max(),2);
+
+    const unsigned top=packed_update_position_mask-1;
+    PanelUpdatePlan ordinary;
+    ordinary.groups={{top,0,1}};ordinary.pairs={{top,top-1}};
+    const uint64_t expected=(uint64_t(1)<<63)|uint64_t(top)|(uint64_t(top)<<21)|(uint64_t(top-1)<<42);
+    const auto first=pack_update_groups(ordinary,packed_update_position_mask,false);
+    PanelUpdatePlan inlined;inlined.groups={{inline_update_pair_bit|top,top,top-1}};
+    const auto second=pack_update_groups(inlined,packed_update_position_mask,true);
+    if(first.size()!=1 || first[0]!=expected || second!=first)
+        throw std::runtime_error("packed ordinary/inline singleton boundary");
+    if(!pack_update_groups(ordinary,1u<<21,false).empty() ||
+       ordinary.groups.size()!=1 || ordinary.groups[0].destination!=top ||
+       ordinary.groups[0].begin!=0 || ordinary.groups[0].end!=1 ||
+       ordinary.pairs.size()!=1 || ordinary.pairs[0].lower!=top || ordinary.pairs[0].pivot!=top-1)
+        throw std::runtime_error("packed nnz fallback changed the original plan");
+
+    PanelUpdatePlan multiple;
+    multiple.groups={{1,0,3}};multiple.pairs={{2,3},{4,5},{6,7}};
+    const auto third=pack_update_groups(multiple,8,false);
+    if(third.size()!=1)throw std::runtime_error("packed multi record count");
+    range(third[0],1,0,3);
+    const NormalizedUpdatePair original_pairs[]={{2,3},{4,5},{6,7}};
+    if(multiple.groups[0].destination!=1 || multiple.groups[0].begin!=0 || multiple.groups[0].end!=3 ||
+       std::memcmp(multiple.pairs.data(),original_pairs,sizeof(original_pairs)))
+        throw std::runtime_error("packed multi contribution order changed");
+
+    // The preceding singleton must not leave a partially packed template when
+    // a real, in-bounds multi group exceeds the fixed 15-bit count limit.
+    PanelUpdatePlan excessive;
+    excessive.pairs.resize(size_t(packed_update_count_mask)+1,NormalizedUpdatePair{0,0});
+    excessive.groups={{inline_update_pair_bit|1u,0,0},{0,0,packed_update_count_mask+1}};
+    if(!pack_update_groups(excessive,2,true).empty() || excessive.groups.size()!=2 ||
+       excessive.groups[0].destination!=(inline_update_pair_bit|1u) || excessive.groups[1].begin!=0 ||
+       excessive.groups[1].end!=packed_update_count_mask+1 || excessive.pairs.size()!=size_t(packed_update_count_mask)+1)
+        throw std::runtime_error("packed long-group fallback changed the original plan");
+    excessive.pairs.pop_back();--excessive.groups[1].end;
+    const auto maximum=pack_update_groups(excessive,2,true);
+    if(maximum.size()!=2 || maximum[0]!=(packed_update_single_bit|1u))
+        throw std::runtime_error("packed maximum-length template was rejected");
+    range(maximum[1],0,0,packed_update_count_mask);
+    PanelUpdatePlan invalid;invalid.groups={{0,0,2}};invalid.pairs={{0,0}};
+    bool rejected=false;
+    try { (void)pack_update_groups(invalid,1,false); }
+    catch(const std::logic_error&) { rejected=true; }
+    if(!rejected)throw std::runtime_error("packed invalid pair range was silently accepted");
+    std::cout<<"PASS panel/packed-codec-boundaries-singletons-and-template-fallback\n";
+}
+
+void test_inline_update_groups()
+{
+    Stream stream;
+    for(unsigned copies:{1u,3u,33u})for(bool nonfinite:{false,true}) {
+        const unsigned bits=filled_copy_bits(copies,5),lanes=1u<<bits;
+        const unsigned stride=(copies+lanes-1)/lanes*lanes;
+        std::vector<REAL> input(size_t(18)*stride,REAL(123.5));
+        for(unsigned copy=0;copy<copies;++copy) {
+            auto at=[&](unsigned position)->REAL& {return input[size_t(position)*stride+copy];};
+            at(0)=10;at(1)=20;at(2)=30;
+            at(8)=REAL(2)+REAL(copy)/8;at(9)=REAL(.5);
+            // The small final term is lost if it is moved before cancellation.
+            const REAL large=std::ldexp(REAL(1),std::numeric_limits<REAL>::digits+8);
+            at(10)=large;at(11)=1;at(12)=-large;at(13)=1;at(16)=1;at(17)=1;
+            at(14)=nonfinite && copy%2==0 ? REAL(0) : REAL(4);
+            at(15)=nonfinite && copy%2==0 ? std::numeric_limits<REAL>::infinity() : REAL(.125);
+        }
+        for(unsigned format:{0u,1u,2u}) {
+            const bool compact=format!=0,packed=format==2;
+            std::vector<UpdateContribution> ops{{0,8,9},{1,10,11},{1,12,13},{1,16,17},{2,14,15}};
+            std::vector<UpdateGroup> groups{{0,0,0}};
+            std::vector<NormalizedUpdatePair> pairs{{0,0}};
+            append_update_groups(ops,groups,pairs,compact);
+            if(groups.size()!=4 || pairs.size()!=(compact ? 4u : 6u))
+                throw std::runtime_error("inline group storage or prefix changed");
+            std::vector<uint64_t> records(1,0);
+            if(packed) {
+                PanelUpdatePlan plan;
+                // The fake group prefix is not a valid contribution group.
+                // Keep the real pair prefix so begin offsets remain nonzero.
+                plan.groups.assign(groups.begin()+1,groups.end());plan.pairs=pairs;
+                records=pack_update_groups(plan,18,compact);
+                if(records.size()!=3)throw std::runtime_error("packed group oracle unexpectedly fell back");
+                records.insert(records.begin(),0);
+            }
+            DeviceBuffer<REAL> values(input);
+            DeviceBuffer<UpdateGroup> device_groups(groups);
+            DeviceBuffer<NormalizedUpdatePair> device_pairs(pairs);
+            DeviceBuffer<uint64_t> device_records(records);
+            if(packed)
+                packed_group_update<<<dim3(1,(copies+lanes-1)/lanes),256,0,stream.value>>>(
+                    values.data(),copies,stride,bits,device_records.data(),device_pairs.data(),1,4);
+            else
+                mapped_group_update<<<dim3(1,(copies+lanes-1)/lanes),256,0,stream.value>>>(
+                    values.data(),copies,stride,bits,device_groups.data(),device_pairs.data(),1,4,compact);
+            check_gpu(cudaGetLastError(),"launch inline group oracle");
+            check_gpu(cudaStreamSynchronize(stream.value),"wait inline group oracle");
+            const auto actual=values.read();
+            for(unsigned position=0;position<18;++position)for(unsigned copy=0;copy<stride;++copy) {
+                const size_t at=size_t(position)*stride+copy;
+                if(position<3 && copy<copies) {
+                    REAL expected=input[at];
+                    for(const auto& u:ops)if(u.destination==position) {
+                        const REAL factor=input[size_t(u.lower)*stride+copy];
+                        if(factor!=REAL(0))expected-=factor*input[size_t(u.pivot)*stride+copy];
+                    }
+                    if(!std::isfinite(actual[at]) || actual[at]!=expected)
+                        throw std::runtime_error("inline group oracle or zero-factor semantics");
+                } else if(std::memcmp(&actual[at],&input[at],sizeof(REAL))!=0) {
+                    throw std::runtime_error("inline group operand or padding changed");
+                }
+            }
+        }
+    }
+    std::cout<<"PASS panel/ordinary-inline-packed-groups-order-prefix-tail-and-nonfinite\n";
+}
+
 int main()
 {
     try {
@@ -1508,6 +1653,8 @@ int main()
                 for(bool perturb : {false,true})
                     for(unsigned path=0;path<3;++path) test_layout(copies,variant,perturb,path);
         test_dense_updates();
+        test_packed_update_groups_codec();
+        test_inline_update_groups();
         test_panel_boundaries();
         for(SnapshotPolicy snapshot:{SnapshotPolicy::Shared,SnapshotPolicy::Device})
             for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped})
