@@ -60,6 +60,10 @@ if(GLU_BUILD_TESTS)
     glu_configure_target(fused-execution-tests)
     add_test(NAME fused-execution COMMAND fused-execution-tests)
     set_tests_properties(fused-execution PROPERTIES TIMEOUT 120)
+    add_executable(task-set-tests tests/task-set.cpp src/numeric.cu src/symbolic.cc)
+    glu_configure_target(task-set-tests)
+    add_test(NAME task-set COMMAND task-set-tests)
+    set_tests_properties(task-set PROPERTIES TIMEOUT 120)
     add_test(NAME cli-output COMMAND ${CMAKE_COMMAND}
         -DGLU_EXECUTABLE=$<TARGET_FILE:lu_cmd>
         -DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/cli-output-test

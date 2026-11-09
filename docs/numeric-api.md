@@ -101,6 +101,30 @@ const REAL* factors = task.factors(0);
 
 长期重复分解可保留模板、任务与 Graph，每轮只恢复默认初值或上传新值，再提交、等待并消费结果。调用者可直接生产到最终输入缓冲。独立批次还可使用多个缓冲和共享模板的任务，让生产与执行形成流水线。缓冲按对应 `wait()` 和结果消费完成的时机复用，流水线由调用者组织。
 
+## 异构任务集合
+
+`GpuTaskSet` 执行由不同 `Fused` 模板组成的独立任务集合。调用者给出模板列表和逻辑任务的模板下标，每个任务仍有独立数值；重复下标共享同一个不可变计划。它与 `GpuTask` 共用块内分解实现。
+
+```cpp
+GpuMatrix a(symbolic_a, positions_a, 32, false, UpdateMode::Fused);
+GpuMatrix b(symbolic_b, positions_b, 32, false, UpdateMode::Fused);
+GpuTaskSet tasks({&a, &b}, {1, 0, 1});
+// Produce values in logical task order into a caller-owned pinned array.
+const size_t elements = tasks.compact_input_offset(tasks.task_count());
+tasks.upload_compact_input(host_values, elements);
+tasks.enqueue();
+tasks.wait();
+const REAL* first = tasks.factors(0); // A factorization of template b.
+```
+
+集合分别按完整因子数和紧凑位置数计算前缀偏移，`factor_offset(t)` 与 `compact_input_offset(t)` 给出第 `t` 个任务的起点，终点下标 `task_count()` 返回总元素数。完整输入按 `[task][factor slot]` 拼接，紧凑输入按 `[task][input position]` 拼接。紧凑上传要求全部任务的模板都已准备位置表，完整输入和默认恢复不要求位置表。
+
+每轮一次 H2D 上传、一次 grid 启动与一次 D2H 输出。紧凑输入在各任务的线程块内完成清零与 scatter，再开始分解。集合使用一个 stream，直接提交，不支持 Graph。完整因子缓冲保持普通 AoS 布局。
+
+`upload_input()` 或没有显式输入的 `enqueue()` 恢复各模板的默认初值。集合首次默认恢复时建立连续 pinned 缓存，此后复用；模板的 `SnapshotPolicy` 用于 `GpuTask`，集合始终使用自己的连续主机初值。新值上传不修改缓存，含静态主元扰动的集合只接受默认初值。
+
+上传、排队、等待、结果生存期和错误后的重建规则与 `GpuTask` 一致，`wait()` 一次完成整个集合。任务保留模板所有权，模板包装对象可以先销毁。`device_bytes()` 统计集合数值缓冲、紧凑缓冲和任务描述，模板计划另计；`pinned_bytes()` 随默认缓存的首次分配变化，`default_input_setup_ms()` 单列这次打包准备。
+
 ## 容量统计
 
 `GpuMatrix::shared_device_bytes()` 统计模板结构、映射或计划、紧凑位置表及可选设备初值。按实际副本数调用 `task_device_bytes(copies)`，得到包含布局补齐与紧凑输入缓冲的任务设备缓冲字节数。

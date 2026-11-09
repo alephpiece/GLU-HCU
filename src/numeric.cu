@@ -419,11 +419,10 @@ struct FusedStep { UpdateRange columns,immediate,deferred; };
 // One matrix per block, independent of template reuse. Values stay in their
 // ordinary AoS allocation; only execution boundaries change.
 template<bool Perturb,bool Packed>
-__global__ void fused_panel_factorize(REAL* values,unsigned nnz,const unsigned* col,
+__device__ void fused_panel_compute(REAL* values,const unsigned* col,
         const unsigned* diag,const int* order,const FusedStep* steps,unsigned count,
         const UpdateGroup* groups,const uint64_t* records,const NormalizedUpdatePair* pairs,
         bool inline_singletons,REAL threshold) {
-    values+=size_t(blockIdx.x)*nnz;
     const unsigned lane=threadIdx.x%GLU_GROUP_SIZE,group=threadIdx.x/GLU_GROUP_SIZE;
     for(unsigned level=0;level<count;++level) {
         const auto step=steps[level];
@@ -446,6 +445,52 @@ __global__ void fused_panel_factorize(REAL* values,unsigned nnz,const unsigned* 
                 apply_update_group<Packed>(values,1,0,groups,records,pairs,unsigned(p),inline_singletons);
             __syncthreads();
         }
+    }
+}
+
+template<bool Perturb,bool Packed>
+__global__ void fused_panel_factorize(REAL* values,unsigned nnz,const unsigned* col,
+        const unsigned* diag,const int* order,const FusedStep* steps,unsigned count,
+        const UpdateGroup* groups,const uint64_t* records,const NormalizedUpdatePair* pairs,
+        bool inline_singletons,REAL threshold) {
+    fused_panel_compute<Perturb,Packed>(values+size_t(blockIdx.x)*nnz,col,diag,order,steps,
+        count,groups,records,pairs,inline_singletons,threshold);
+}
+
+struct FusedTaskDescriptor {
+    size_t factor_offset,compact_offset;
+    unsigned nnz,compact_count,levels;
+    const unsigned *col,*diag,*positions;
+    const int* order;
+    const FusedStep* steps;
+    const UpdateGroup* groups;
+    const uint64_t* records;
+    const NormalizedUpdatePair* pairs;
+    bool inline_singletons,perturb;
+    REAL threshold;
+};
+
+__global__ void fused_task_set(REAL* factors,const REAL* input,
+                              const FusedTaskDescriptor* tasks,bool compact) {
+    const auto task=tasks[blockIdx.x];
+    REAL* values=factors+task.factor_offset;
+    if(compact) {
+        for(size_t p=threadIdx.x;p<task.nnz;p+=blockDim.x)values[p]=REAL(0);
+        __syncthreads();
+        for(size_t p=threadIdx.x;p<task.compact_count;p+=blockDim.x)
+            values[task.positions[p]]=input[task.compact_offset+p];
+        __syncthreads();
+    }
+    if(task.perturb) {
+        if(task.records)fused_panel_compute<true,true>(values,task.col,task.diag,task.order,task.steps,
+            task.levels,task.groups,task.records,task.pairs,task.inline_singletons,task.threshold);
+        else fused_panel_compute<true,false>(values,task.col,task.diag,task.order,task.steps,
+            task.levels,task.groups,task.records,task.pairs,task.inline_singletons,task.threshold);
+    } else {
+        if(task.records)fused_panel_compute<false,true>(values,task.col,task.diag,task.order,task.steps,
+            task.levels,task.groups,task.records,task.pairs,task.inline_singletons,task.threshold);
+        else fused_panel_compute<false,false>(values,task.col,task.diag,task.order,task.steps,
+            task.levels,task.groups,task.records,task.pairs,task.inline_singletons,task.threshold);
     }
 }
 
@@ -1285,6 +1330,129 @@ void GpuTask::check() const {
             if (!std::isfinite(values[p])) throw std::runtime_error("LU data check: NaN/Inf found");
         for (unsigned j=0; j<a.n; ++j)
             if (values[a.diagonals[j]] == REAL(0)) throw std::runtime_error("LU data check: zero diagonal");
+    }
+}
+
+struct GpuTaskSet::Impl {
+    std::vector<std::shared_ptr<const GpuMatrix::Impl>> templates;
+    std::vector<size_t> task_templates,full_offsets{0},compact_offsets{0};
+    Buffer<REAL> values,compact_values;
+    Buffer<REAL,true> output,default_input;
+    Buffer<FusedTaskDescriptor> tasks;
+    cudaStream_t stream=nullptr;
+    bool all_compact=true,perturb=false,compact_queued=false;
+    bool pending=false,ready=false,failed=false,input_queued=false;
+    double default_setup_ms=0;
+
+    Impl(const std::vector<const GpuMatrix*>& matrices,const std::vector<size_t>& indices)
+        : task_templates(indices) {
+        if(indices.empty())throw std::invalid_argument("task set must not be empty");
+        for(const auto* matrix:matrices) {
+            if(!matrix || matrix->impl_->update_mode!=UpdateMode::Fused)
+                throw std::invalid_argument("task set requires Fused templates");
+            templates.push_back(matrix->impl_);
+        }
+        std::vector<FusedTaskDescriptor> descriptors;
+        for(size_t index:indices) {
+            if(index>=templates.size())throw std::out_of_range("task template index");
+            const auto& a=*templates[index];
+            if(indices.size()>a.max_grid_x)throw std::invalid_argument("task set exceeds device grid limit");
+            descriptors.push_back({full_offsets.back(),compact_offsets.back(),a.nnz,a.compact_elements,
+                unsigned(a.levels.size()-1),a.col.ptr,a.diag.ptr,a.input_positions.ptr,a.level_idx.ptr,
+                a.fused_steps.ptr,a.panel_groups.ptr,a.panel_records.ptr,a.panel_pairs.ptr,a.inline_singletons,
+                a.perturb,a.threshold});
+            full_offsets.push_back(checked_sum(full_offsets.back(),a.nnz));
+            compact_offsets.push_back(checked_sum(compact_offsets.back(),a.compact_elements));
+            all_compact=all_compact && a.compact_elements!=0;
+            perturb=perturb || a.perturb;
+        }
+        values.allocate(full_offsets.back());output.allocate(full_offsets.back());
+        if(all_compact)compact_values.allocate(compact_offsets.back());
+        tasks.upload(descriptors);
+        gpu_check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking),"create task set stream");
+    }
+    ~Impl() {
+        if(stream) {cudaStreamSynchronize(stream);cudaStreamDestroy(stream);}
+    }
+    void require_upload() const {
+        if(failed || pending || input_queued)throw std::logic_error("cannot queue task set input in this state");
+    }
+    void upload(const REAL* input,bool compact) {
+        require_upload();ready=false;
+        try {
+            auto& destination=compact ? compact_values : values;
+            gpu_check(cudaMemcpyAsync(destination.ptr,input,destination.bytes,cudaMemcpyHostToDevice,stream),"upload task set input");
+            compact_queued=compact;input_queued=true;
+        } catch(...) {failed=true;cudaStreamSynchronize(stream);throw;}
+    }
+    void upload_default() {
+        require_upload();
+        if(!default_input.ptr) {
+            const auto start=std::chrono::steady_clock::now();
+            default_input.allocate(full_offsets.back());
+            for(size_t task=0;task<task_templates.size();++task) {
+                const auto& a=*templates[task_templates[task]];
+                std::copy(a.input.ptr,a.input.ptr+a.nnz,default_input.ptr+full_offsets[task]);
+            }
+            default_setup_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        }
+        upload(default_input.ptr,false);
+    }
+};
+
+GpuTaskSet::GpuTaskSet(const std::vector<const GpuMatrix*>& matrices,const std::vector<size_t>& indices)
+    : impl_(new Impl(matrices,indices)) {}
+GpuTaskSet::~GpuTaskSet()=default;
+size_t GpuTaskSet::task_count() const {return impl_->task_templates.size();}
+size_t GpuTaskSet::factor_offset(size_t task) const {return impl_->full_offsets.at(task);}
+size_t GpuTaskSet::compact_input_offset(size_t task) const {return impl_->compact_offsets.at(task);}
+size_t GpuTaskSet::device_bytes() const {return checked_sum(checked_sum(impl_->values.bytes,impl_->compact_values.bytes),impl_->tasks.bytes);}
+size_t GpuTaskSet::pinned_bytes() const {return checked_sum(impl_->output.bytes,impl_->default_input.bytes);}
+double GpuTaskSet::default_input_setup_ms() const {return impl_->default_setup_ms;}
+void GpuTaskSet::upload_input() {impl_->upload_default();}
+void GpuTaskSet::upload_input(const REAL* input,size_t elements) {
+    if(!input || elements!=impl_->full_offsets.back())throw std::invalid_argument("input must match task set factor slots");
+    if(impl_->perturb)throw std::invalid_argument("fresh input requires an explicit perturbation threshold policy");
+    impl_->upload(input,false);
+}
+void GpuTaskSet::upload_compact_input(const REAL* input,size_t elements) {
+    if(!impl_->all_compact || !input || elements!=impl_->compact_offsets.back())
+        throw std::invalid_argument("compact input must match all prepared task set input positions");
+    if(impl_->perturb)throw std::invalid_argument("fresh input requires an explicit perturbation threshold policy");
+    impl_->upload(input,true);
+}
+void GpuTaskSet::enqueue() {
+    auto& t=*impl_;
+    if(t.failed || t.pending)throw std::logic_error("task set is failed or pending");
+    if(!t.input_queued)t.upload_default();
+    t.ready=false;t.pending=true;t.input_queued=false;
+    try {
+        fused_task_set<<<unsigned(task_count()),256,0,t.stream>>>(t.values.ptr,t.compact_values.ptr,t.tasks.ptr,t.compact_queued);
+        gpu_check(cudaGetLastError(),"factor task set");
+        gpu_check(cudaMemcpyAsync(t.output.ptr,t.values.ptr,t.output.bytes,cudaMemcpyDeviceToHost,t.stream),"download task set factors");
+    } catch(...) {t.failed=true;cudaStreamSynchronize(t.stream);throw;}
+}
+void GpuTaskSet::wait() {
+    auto& t=*impl_;
+    if(t.input_queued)throw std::logic_error("enqueue task set numeric work before waiting");
+    if(t.pending) {
+        const auto status=cudaStreamSynchronize(t.stream);t.pending=false;
+        if(status!=cudaSuccess) {t.failed=true;gpu_check(status,"wait for task set");}
+        if(!t.failed)t.ready=true;
+    }
+    if(t.failed)throw std::runtime_error("task set submission failed; rebuild before reuse");
+}
+const REAL* GpuTaskSet::factors(size_t task) const {
+    if(task>=task_count())throw std::out_of_range("task set result index");
+    if(impl_->failed || !impl_->ready)throw std::logic_error("task set results are not ready");
+    return impl_->output.ptr+impl_->full_offsets[task];
+}
+void GpuTaskSet::check() const {
+    for(size_t task=0;task<task_count();++task) {
+        const auto& a=*impl_->templates[impl_->task_templates[task]];
+        const REAL* data=factors(task);
+        for(unsigned p=0;p<a.nnz;++p)if(!std::isfinite(data[p]))throw std::runtime_error("LU data check: NaN/Inf found");
+        for(unsigned p:a.diagonals)if(data[p]==REAL(0))throw std::runtime_error("LU data check: zero diagonal");
     }
 }
 
