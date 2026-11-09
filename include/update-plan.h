@@ -13,7 +13,11 @@
 // sorting changes ownership, never the contribution set.
 struct UpdateContribution { unsigned destination, lower, pivot; };
 struct NormalizedUpdatePair { unsigned lower, pivot; };
+// With inline singletons enabled, the destination high bit marks an inline
+// lower/pivot pair in begin/end. Templates outside this range keep normal pairs.
+constexpr unsigned inline_update_pair_bit=1u<<31;
 struct UpdateGroup { unsigned destination, begin, end; };
+static_assert(sizeof(UpdateGroup)==12 && sizeof(NormalizedUpdatePair)==8,"update plan record layout changed");
 inline std::vector<UpdateContribution> level_contributions(const Symbolic_Matrix& a,unsigned level) {
     std::vector<UpdateContribution> out;
     for(int k=a.level_ptr[level];k<a.level_ptr[level+1];++k) {
@@ -34,18 +38,23 @@ inline std::vector<UpdateContribution> level_contributions(const Symbolic_Matrix
     return out;
 }
 inline void append_update_groups(std::vector<UpdateContribution>& ops,std::vector<UpdateGroup>& groups,
-                                 std::vector<NormalizedUpdatePair>& pairs) {
+                                 std::vector<NormalizedUpdatePair>& pairs,bool inline_singletons=false) {
     std::stable_sort(ops.begin(),ops.end(),[](const auto& x,const auto& y){return x.destination<y.destination;});
     if(ops.size()>std::numeric_limits<unsigned>::max()-pairs.size()) throw std::overflow_error("aggregation pair capacity");
     for(size_t first=0;first<ops.size();) {
         size_t last=first+1;
         while(last<ops.size() && ops[last].destination==ops[first].destination) ++last;
-        const unsigned begin=unsigned(pairs.size());
-        for(size_t i=first;i<last;++i) {
-            pairs.push_back({ops[i].lower,ops[i].pivot});
-        }
         if(groups.size()==std::numeric_limits<unsigned>::max()) throw std::overflow_error("aggregation group capacity");
-        groups.push_back({ops[first].destination,begin,unsigned(pairs.size())});first=last;
+        if(inline_singletons && last-first==1) {
+            const auto u=ops[first];
+            if(u.destination>=inline_update_pair_bit)throw std::logic_error("inline update destination range");
+            groups.push_back({u.destination|inline_update_pair_bit,u.lower,u.pivot});
+        } else {
+            const unsigned begin=unsigned(pairs.size());
+            for(size_t i=first;i<last;++i)pairs.push_back({ops[i].lower,ops[i].pivot});
+            groups.push_back({ops[first].destination,begin,unsigned(pairs.size())});
+        }
+        first=last;
     }
 }
 struct UpdateRange { unsigned begin,end; };
@@ -194,12 +203,14 @@ struct PanelUpdatePlan {
     std::vector<UpdateRange> dense_ranges;
     uint64_t dense_products=0;
     uint64_t immediate_products=0,deferred_products=0;
+    uint64_t inline_singletons=0;
 };
 // Keep destinations read anywhere in this dependency window current at each
 // level. Only unread destinations may be grouped across levels and applied at
 // the window end; dense extraction partitions those same deferred contributions.
-inline PanelUpdatePlan make_panel_update_plan(const Symbolic_Matrix& a,unsigned window,bool dense=false) {
+inline PanelUpdatePlan make_panel_update_plan(const Symbolic_Matrix& a,unsigned window,bool dense=false,bool inline_singletons=false) {
     if(!window)throw std::invalid_argument("zero aggregation window");
+    inline_singletons=inline_singletons && a.nnz<inline_update_pair_bit;
     PanelUpdatePlan plan;plan.immediate.resize(a.num_lev);plan.deferred.resize(a.num_lev);plan.dense_ranges.resize(a.num_lev);
     for(unsigned begin=0;begin<unsigned(a.num_lev);begin+=window) {
         const unsigned end=std::min(unsigned(a.num_lev),begin+window);
@@ -221,7 +232,7 @@ inline PanelUpdatePlan make_panel_update_plan(const Symbolic_Matrix& a,unsigned 
                 if(needed[u.destination])now.push_back(u);else delayed.push_back(u);
             }
             plan.immediate_products+=now.size();
-            const unsigned first=unsigned(plan.groups.size());append_update_groups(now,plan.groups,plan.pairs);
+            const unsigned first=unsigned(plan.groups.size());append_update_groups(now,plan.groups,plan.pairs,inline_singletons);
             plan.immediate[lev]={first,unsigned(plan.groups.size())};
         }
         plan.deferred_products+=delayed.size();
@@ -231,12 +242,13 @@ inline PanelUpdatePlan make_panel_update_plan(const Symbolic_Matrix& a,unsigned 
             plan.dense_products+=before-delayed.size();
         }
         plan.dense_ranges[end-1]={dense_first,unsigned(plan.dense_tiles.size())};
-        const unsigned first=unsigned(plan.groups.size());append_update_groups(delayed,plan.groups,plan.pairs);
+        const unsigned first=unsigned(plan.groups.size());append_update_groups(delayed,plan.groups,plan.pairs,inline_singletons);
         plan.deferred[end-1]={first,unsigned(plan.groups.size())};
         // Every generated record takes exactly one branch above. Sorting only
         // permutes records; it cannot lose or duplicate an individual product.
     }
-    if(plan.pairs.size()+plan.dense_products!=plan.immediate_products+plan.deferred_products)throw std::runtime_error("aggregation contribution accounting");
+    if(inline_singletons)for(const auto& group:plan.groups)plan.inline_singletons+=(group.destination&inline_update_pair_bit)!=0;
+    if(plan.pairs.size()+plan.inline_singletons+plan.dense_products!=plan.immediate_products+plan.deferred_products)throw std::runtime_error("aggregation contribution accounting");
     return plan;
 }
 #endif

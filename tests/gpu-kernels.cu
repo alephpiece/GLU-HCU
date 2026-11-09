@@ -1475,6 +1475,55 @@ void test_invalid_factor(REAL value, const char* diagnostic)
 
 } // namespace
 
+void test_inline_update_groups()
+{
+    Stream stream;
+    for(unsigned copies:{1u,3u,33u})for(bool nonfinite:{false,true}) {
+        const unsigned bits=filled_copy_bits(copies,5),lanes=1u<<bits;
+        const unsigned stride=(copies+lanes-1)/lanes*lanes;
+        std::vector<REAL> input(size_t(18)*stride,REAL(123.5));
+        for(unsigned copy=0;copy<copies;++copy) {
+            auto at=[&](unsigned position)->REAL& {return input[size_t(position)*stride+copy];};
+            at(0)=10;at(1)=20;at(2)=30;
+            at(8)=REAL(2)+REAL(copy)/8;at(9)=REAL(.5);
+            at(10)=3;at(11)=2;at(12)=-2;at(13)=REAL(.25);
+            at(14)=nonfinite && copy%2==0 ? REAL(0) : REAL(4);
+            at(15)=nonfinite && copy%2==0 ? std::numeric_limits<REAL>::infinity() : REAL(.125);
+        }
+        for(bool compact:{false,true}) {
+            std::vector<UpdateContribution> ops{{0,8,9},{1,10,11},{1,12,13},{2,14,15}};
+            std::vector<UpdateGroup> groups{{0,0,0}};
+            std::vector<NormalizedUpdatePair> pairs{{0,0}};
+            append_update_groups(ops,groups,pairs,compact);
+            if(groups.size()!=4 || pairs.size()!=(compact ? 3u : 5u))
+                throw std::runtime_error("inline group storage or prefix changed");
+            DeviceBuffer<REAL> values(input);
+            DeviceBuffer<UpdateGroup> device_groups(groups);
+            DeviceBuffer<NormalizedUpdatePair> device_pairs(pairs);
+            mapped_group_update<<<dim3(1,(copies+lanes-1)/lanes),256,0,stream.value>>>(
+                values.data(),copies,stride,bits,device_groups.data(),device_pairs.data(),1,4,compact);
+            check_gpu(cudaGetLastError(),"launch inline group oracle");
+            check_gpu(cudaStreamSynchronize(stream.value),"wait inline group oracle");
+            const auto actual=values.read();
+            for(unsigned position=0;position<18;++position)for(unsigned copy=0;copy<stride;++copy) {
+                const size_t at=size_t(position)*stride+copy;
+                if(position<3 && copy<copies) {
+                    REAL expected=input[at];
+                    for(const auto& u:ops)if(u.destination==position) {
+                        const REAL factor=input[size_t(u.lower)*stride+copy];
+                        if(factor!=REAL(0))expected-=factor*input[size_t(u.pivot)*stride+copy];
+                    }
+                    if(!std::isfinite(actual[at]) || actual[at]!=expected)
+                        throw std::runtime_error("inline group oracle or zero-factor semantics");
+                } else if(std::memcmp(&actual[at],&input[at],sizeof(REAL))!=0) {
+                    throw std::runtime_error("inline group operand or padding changed");
+                }
+            }
+        }
+    }
+    std::cout<<"PASS panel/inline-singletons-mixed-groups-prefix-tail-and-nonfinite\n";
+}
+
 int main()
 {
     try {
@@ -1508,6 +1557,7 @@ int main()
                 for(bool perturb : {false,true})
                     for(unsigned path=0;path<3;++path) test_layout(copies,variant,perturb,path);
         test_dense_updates();
+        test_inline_update_groups();
         test_panel_boundaries();
         for(SnapshotPolicy snapshot:{SnapshotPolicy::Shared,SnapshotPolicy::Device})
             for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped})

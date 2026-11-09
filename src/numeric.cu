@@ -360,17 +360,25 @@ __global__ void mapped_level_update_soa(
 
 // Each destination/copy has one writer; preserve zero-factor skipping.
 __global__ void mapped_group_update(REAL* values,unsigned copies,unsigned stride,unsigned copy_bits,
-        const UpdateGroup* groups,const NormalizedUpdatePair* pairs,unsigned begin,unsigned end) {
+        const UpdateGroup* groups,const NormalizedUpdatePair* pairs,unsigned begin,unsigned end,bool inline_singletons) {
     const unsigned lanes=1u<<copy_bits,rows=blockDim.x>>copy_bits;
     const unsigned copy=blockIdx.y*lanes+(threadIdx.x&(lanes-1));
     const size_t index=size_t(begin)+size_t(blockIdx.x)*rows+(threadIdx.x>>copy_bits);
     if(copy>=copies || index>=end)return;
-    const auto g=groups[index];REAL acc=values[size_t(g.destination)*stride+copy];
-    for(unsigned p=g.begin;p<g.end;++p) {
-        const auto u=pairs[p];const REAL factor=values[size_t(u.lower)*stride+copy];
-        if(factor!=REAL(0))acc-=factor*values[size_t(u.pivot)*stride+copy];
+    const auto g=groups[index];
+    const bool single=inline_singletons && (g.destination&inline_update_pair_bit);
+    const unsigned destination=single ? g.destination&~inline_update_pair_bit : g.destination;
+    REAL acc=values[size_t(destination)*stride+copy];
+    if(single) {
+        const REAL factor=values[size_t(g.begin)*stride+copy];
+        if(factor!=REAL(0))acc-=factor*values[size_t(g.end)*stride+copy];
+    } else {
+        for(unsigned p=g.begin;p<g.end;++p) {
+            const auto u=pairs[p];const REAL factor=values[size_t(u.lower)*stride+copy];
+            if(factor!=REAL(0))acc-=factor*values[size_t(u.pivot)*stride+copy];
+        }
     }
-    values[size_t(g.destination)*stride+copy]=acc;
+    values[size_t(destination)*stride+copy]=acc;
 }
 
 #include "update-tiles.cuh"
@@ -576,6 +584,7 @@ struct GpuMatrix::Impl {
     Buffer<uint64_t> map_bases;
     Buffer<unsigned> map_destinations, map_pivots;
     std::vector<UpdateRange> panel_immediate,panel_deferred,panel_dense;
+    bool inline_singletons=false;
     Buffer<UpdateGroup> panel_groups;
     Buffer<NormalizedUpdatePair> panel_pairs;
     Buffer<DenseUpdateTile> dense_tiles;
@@ -645,7 +654,8 @@ struct GpuMatrix::Impl {
         level_idx.upload(a.level_idx);
         if(panel_mode) {
             const auto begin=std::chrono::steady_clock::now();
-            auto plan=make_panel_update_plan(a,32,mode==UpdateMode::PanelTiled);
+            inline_singletons=a.nnz<inline_update_pair_bit;
+            auto plan=make_panel_update_plan(a,32,mode==UpdateMode::PanelTiled,inline_singletons);
             for(size_t bytes:{checked_bytes(plan.groups.size(),sizeof(UpdateGroup)),checked_bytes(plan.pairs.size(),sizeof(NormalizedUpdatePair)),
                               checked_bytes(plan.dense_tiles.size(),sizeof(DenseUpdateTile)),checked_bytes(plan.dense_indices.size(),sizeof(unsigned))})
                 plan_bytes=checked_sum(plan_bytes,bytes);
@@ -855,7 +865,7 @@ struct GpuTask::Impl {
             auto update=[&](UpdateRange range) {
                 if(range.end>range.begin)
                     mapped_group_update<<<dim3((range.end-range.begin+rows-1)/rows,copy_tiles(bits)),256,0,stream>>>(
-                        data,copies,stride,bits,a.panel_groups.ptr,a.panel_pairs.ptr,range.begin,range.end);
+                        data,copies,stride,bits,a.panel_groups.ptr,a.panel_pairs.ptr,range.begin,range.end,a.inline_singletons);
             };
             for(size_t lev=0;lev+1<a.levels.size();++lev) {
                 const unsigned begin=a.levels[lev],width=a.levels[lev+1]-begin;
