@@ -681,6 +681,7 @@ struct GpuMatrix::Impl {
             const auto begin=std::chrono::steady_clock::now();
             inline_singletons=a.nnz<inline_update_pair_bit;
             auto plan=make_panel_update_plan(a,32,mode==UpdateMode::PanelTiled,inline_singletons);
+            sort_deferred_groups_locally(plan,inline_singletons);
             auto records=pack_update_groups(plan,nnz,inline_singletons);
             plan_bytes=records.empty() ? checked_bytes(plan.groups.size(),sizeof(UpdateGroup)) : checked_bytes(records.size(),sizeof(uint64_t));
             for(size_t bytes:{checked_bytes(plan.pairs.size(),sizeof(NormalizedUpdatePair)),

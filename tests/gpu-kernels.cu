@@ -1475,6 +1475,96 @@ void test_invalid_factor(REAL value, const char* diagnostic)
 
 } // namespace
 
+void test_local_deferred_group_order()
+{
+    auto same=[](const auto& a,const auto& b) {
+        return a.size()==b.size() && (a.empty() || !std::memcmp(a.data(),b.data(),a.size()*sizeof(a[0])));
+    };
+    // Two disjoint deferred ranges, with immediate groups before, between and
+    // after them. Vary prefixes and tails independently of the eight-target grid.
+    for(unsigned prefix=0;prefix<10;++prefix)for(unsigned count=0;count<20;++count)
+        for(unsigned pattern=0;pattern<4;++pattern) {
+        const unsigned second=prefix+count+3,last=second+(count+5)%17,total=last+2;
+        std::vector<unsigned> lengths(total),expected_order;
+        for(unsigned i=0;i<total;++i)
+            lengths[i]=pattern==0 ? 1 : pattern==1 ? 4 :
+                (i%3==0 ? 1 : pattern==2 ? 2+(total-i)%4 : 2+(i*7)%11);
+        // Ordinary, fully inlined and mixed singleton representations must all
+        // produce the same logical target order without changing contribution order.
+        for(unsigned format=0;format<3;++format) {
+            PanelUpdatePlan plan;
+            plan.immediate={{0,prefix},{prefix+count,second},{last,total}};
+            plan.deferred={{prefix,prefix+count},{second,last},{total,total}};
+            plan.dense_ranges={{0,0},{0,1},{1,1}};
+            plan.dense_tiles={{0,2,4,1,1,2,0,0}};
+            plan.dense_indices={7,0,8,9,10,11};plan.dense_products=2;
+            for(unsigned i=0;i<total;++i) {
+                const unsigned destination=i+1;
+                const bool single=lengths[i]==1 && (format==1 || (format==2 && i%2));
+                if(single) {
+                    plan.groups.push_back({destination|inline_update_pair_bit,100+2*destination,10+destination});
+                    ++plan.inline_singletons;
+                } else {
+                    const unsigned begin=unsigned(plan.pairs.size());
+                    for(unsigned q=0;q<lengths[i];++q)plan.pairs.push_back({100+2*destination+q,10+destination+q});
+                    plan.groups.push_back({destination,begin,unsigned(plan.pairs.size())});
+                }
+                if((i>=prefix && i<prefix+count) || (i>=second && i<last))plan.deferred_products+=lengths[i];
+                else plan.immediate_products+=lengths[i];
+            }
+            plan.deferred_products+=plan.dense_products;
+            const auto before=plan;
+            sort_deferred_groups_locally(plan,format!=0);
+            if(!same(plan.pairs,before.pairs) || !same(plan.immediate,before.immediate) ||
+               !same(plan.deferred,before.deferred) || !same(plan.dense_ranges,before.dense_ranges) ||
+               !same(plan.dense_tiles,before.dense_tiles) || plan.dense_indices!=before.dense_indices ||
+               plan.immediate_products!=before.immediate_products || plan.deferred_products!=before.deferred_products ||
+               plan.dense_products!=before.dense_products || plan.inline_singletons!=before.inline_singletons ||
+               plan.groups.size()!=before.groups.size())
+                throw std::runtime_error("local group order changed plan payload or accounting");
+            std::vector<unsigned> order;
+            std::vector<bool> seen(total,false);
+            for(unsigned i=0;i<total;++i) {
+                const auto g=plan.groups[i];
+                const unsigned source=(g.destination&~inline_update_pair_bit)-1;
+                if(source>=total || seen[source] || std::memcmp(&g,&before.groups[source],sizeof(g)))
+                    throw std::runtime_error("local group order lost or changed a target contribution tuple");
+                seen[source]=true;order.push_back(source);
+                unsigned begin=total,end=total;
+                for(const auto r:before.deferred)if(i>=r.begin && i<r.end){begin=r.begin;end=r.end;}
+                if(begin==total || lengths[source]==1) {
+                    if(source!=i)throw std::runtime_error("local group order moved an immediate or singleton slot");
+                } else if(source<begin || source>=end || (source-begin)/8!=(i-begin)/8)
+                    throw std::runtime_error("local group order crossed a range or eight-target boundary");
+            }
+            for(const auto r:plan.deferred)for(unsigned base=r.begin;base<r.end;base+=8) {
+                unsigned previous=total;
+                for(unsigned i=base;i<std::min(base+8,r.end);++i)if(lengths[order[i]]>1) {
+                    const unsigned source=order[i];
+                    if(previous!=total && (lengths[previous]>lengths[source] ||
+                       (lengths[previous]==lengths[source] && previous>source)))
+                        throw std::runtime_error("local group order is not stable by contribution count");
+                    previous=source;
+                }
+            }
+            if(!format)expected_order=order;
+            else if(order!=expected_order)throw std::runtime_error("local group order depends on singleton representation");
+            const auto ordered=plan.groups;
+            sort_deferred_groups_locally(plan,format!=0);
+            if(!same(plan.groups,ordered))throw std::runtime_error("local group order is not idempotent");
+        }
+    }
+    // A high destination bit is data when ordinary groups cannot use inline tags.
+    PanelUpdatePlan wide;
+    wide.groups={{inline_update_pair_bit,0,4},{inline_update_pair_bit+1,4,6},{inline_update_pair_bit+2,6,7}};
+    wide.deferred={{0,3}};
+    sort_deferred_groups_locally(wide,false);
+    if(wide.groups[0].destination!=inline_update_pair_bit+1 || wide.groups[1].destination!=inline_update_pair_bit ||
+       wide.groups[2].destination!=inline_update_pair_bit+2)
+        throw std::runtime_error("local group order mistook an ordinary destination for an inline tag");
+    std::cout<<"PASS panel/local-deferred-order-contributions-singletons-ranges-and-representations\n";
+}
+
 void test_packed_update_groups_codec()
 {
     static_assert(packed_update_single_bit==(uint64_t(1)<<63) &&
@@ -1653,6 +1743,7 @@ int main()
                 for(bool perturb : {false,true})
                     for(unsigned path=0;path<3;++path) test_layout(copies,variant,perturb,path);
         test_dense_updates();
+        test_local_deferred_group_order();
         test_packed_update_groups_codec();
         test_inline_update_groups();
         test_panel_boundaries();

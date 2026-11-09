@@ -205,6 +205,30 @@ struct PanelUpdatePlan {
     uint64_t immediate_products=0,deferred_products=0;
     uint64_t inline_singletons=0;
 };
+// A grouped-update CTA has at least eight target slots (256 threads / at most
+// 32 copy lanes). Align chunks to each range start to retain CTA target sets
+// across copy geometries. Preserve singleton slots and equal-length order.
+inline void sort_deferred_groups_locally(PanelUpdatePlan& plan,bool inline_singletons) {
+    constexpr unsigned width=8;
+    for(const auto range:plan.deferred)for(size_t base=range.begin;base<range.end;base+=width) {
+        UpdateGroup sorted[width];
+        unsigned slots[width],count=0;
+        for(unsigned slot=0;slot<width && base+slot<range.end;++slot) {
+            const auto group=plan.groups[base+slot];
+            if((inline_singletons && (group.destination&inline_update_pair_bit)) ||
+               group.end-group.begin<=1)continue;
+            slots[count]=slot;
+            unsigned at=count++;
+            const unsigned length=group.end-group.begin;
+            while(at && sorted[at-1].end-sorted[at-1].begin>length) {
+                sorted[at]=sorted[at-1];
+                --at;
+            }
+            sorted[at]=group;
+        }
+        for(unsigned at=0;at<count;++at)plan.groups[base+slots[at]]=sorted[at];
+    }
+}
 // A tagged 64-bit record stores either three 21-bit singleton positions or a
 // 21-bit destination, 27-bit pair offset and 15-bit count. Wider templates keep
 // their original groups; pair operands and contribution order stay unchanged.
