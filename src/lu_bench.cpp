@@ -64,6 +64,7 @@ const char* update_name(UpdateMode mode) {
         case UpdateMode::Mapped:return "mapped";
         case UpdateMode::Panel:return "panel";
         case UpdateMode::PanelTiled:return "tiled";
+        case UpdateMode::Fused:return "fused";
     }
     throw std::invalid_argument("invalid update mode");
 }
@@ -140,7 +141,8 @@ Options parse(int argc, char** argv) {
             else if (value == "mapped") o.updates=UpdateMode::Mapped;
             else if (value == "panel") o.updates=UpdateMode::Panel;
             else if (value == "tiled") o.updates=UpdateMode::PanelTiled;
-            else throw std::invalid_argument("updates must be scan, mapped, panel or tiled");
+            else if (value == "fused") o.updates=UpdateMode::Fused;
+            else throw std::invalid_argument("updates must be scan, mapped, panel, tiled or fused");
         }
         else if (key == "--snapshot-policy") {
             if(value=="auto")o.snapshot=SnapshotPolicy::Auto;
@@ -237,7 +239,7 @@ int main(int argc, char** argv) {
         std::cout << "Usage: glu_bench (-i MATRIX [-i MATRIX ...] [--tasks N] | --workload FILE)\n"
                   << "  [--warmup 5] [--loops 30] [--tmp-slots 32] [--output result.json]\n"
                   << "  [--check full|basic] [--diagnostics] [--graph] [--batch-size 1]\n"
-                  << "  [--updates scan|mapped|panel|tiled] [--submit-threads 1]\n"
+                  << "  [--updates scan|mapped|panel|tiled|fused] [--submit-threads 1]\n"
                   << "  [--snapshot-policy auto|per-copy|shared|device]\n"
                   << "One stream per homogeneous batch; explicit logical workload or round-robin inputs; no perturbation.\n";
         return 0;
@@ -494,7 +496,7 @@ int main(int argc, char** argv) {
                 }
                 add_bytes(transfer_bytes,multiplied_bytes(o.counts[i],matrices[i]->gpu->task_host_bytes()));
                 if(i) report << ',';
-                const bool panel=o.updates==UpdateMode::Panel || o.updates==UpdateMode::PanelTiled;
+                const bool panel=o.updates==UpdateMode::Panel || o.updates==UpdateMode::PanelTiled || o.updates==UpdateMode::Fused;
                 report << "{\"levels\":" << a.num_lev << ",\"max_width\":" << max_width
                        << ",\"wide_levels\":" << wide_levels << ",\"wide_source_columns\":" << wide_columns
                        << ",\"wide_target_levels\":" << wide_target_levels << ",\"wide_target_pairs\":" << wide_targets

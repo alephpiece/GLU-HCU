@@ -7,7 +7,7 @@
 using namespace std;
 
 // Execution strategy; its representation is shared by independent value copies.
-enum class UpdateMode { Scan, Mapped, Panel, PanelTiled };
+enum class UpdateMode { Scan, Mapped, Panel, PanelTiled, Fused };
 
 // A snapshot is the immutable default input, restored before each factorization.
 // Caller-provided values bypass this policy and never replace the snapshot.

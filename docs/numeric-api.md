@@ -40,6 +40,9 @@ void factor_repeated(const Symbolic_Matrix& symbolic, unsigned copies, unsigned 
 | `Mapped` | 预计算更新位置，直接读取 L 值，不使用 scratch |
 | `Panel` | 按依赖层窗口聚合同目标贡献，准备目标分组与 L/U 位置计划 |
 | `PanelTiled` | 从窗口更新中提取局部矩形，在 gfx936 使用原生矩阵指令，其它目标采用标量回退 |
+| `Fused` | 一个线程块完成一个矩阵的全部依赖层，复用 Panel 分组计划，采用 AoS 数值布局 |
+
+`Fused` 由独立矩阵提供块间并行，适合大量小矩阵；较大矩阵仍需实测块内串行推进的成本。
 
 映射和计划由同模板任务共享。调用者按结构、准备时间、设备容量和实际复用次数选择策略。`PanelTiled` 保持所选输入精度，各策略仍可能改变浮点累加次序，需要相应的数值检查。任务内部完成 AoS/SoA 布局准备，调用者始终按下面的输入顺序提供数值。
 
