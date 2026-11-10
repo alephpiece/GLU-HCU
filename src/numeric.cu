@@ -414,58 +414,77 @@ __global__ void packed_group_update(REAL* values,unsigned copies,unsigned stride
     apply_update_group<true>(values,stride,copy,nullptr,groups,pairs,unsigned(index),false);
 }
 
-struct FusedStep { UpdateRange columns,immediate,deferred; };
+struct FusedNormalization { unsigned position,diagonal; };
+struct FusedStep { UpdateRange columns,immediate,deferred,strips,normalization; };
 
-// One matrix per block, independent of template reuse. Values stay in their
-// ordinary AoS allocation; only execution boundaries change.
+// One matrix per block, independent of template reuse. Lanes own independent
+// update targets, and factors stay in their ordinary AoS allocation.
 template<bool Perturb,bool Packed>
-__device__ void fused_panel_compute(REAL* values,const unsigned* col,
-        const unsigned* diag,const int* order,const FusedStep* steps,unsigned count,
+__device__ void fused_panel_compute(REAL* values,const unsigned* diag,
+        const int* order,const FusedStep* steps,unsigned count,
         const UpdateGroup* groups,const uint64_t* records,const NormalizedUpdatePair* pairs,
+        const DeferredUpdateStrip* strips,const unsigned* destinations,const FusedNormalization* normalizations,
         bool inline_singletons,REAL threshold) {
     const unsigned lane=threadIdx.x%GLU_GROUP_SIZE,group=threadIdx.x/GLU_GROUP_SIZE;
     for(unsigned level=0;level<count;++level) {
         const auto step=steps[level];
-        for(unsigned p=step.columns.begin+group;p<step.columns.end;p+=blockDim.x/GLU_GROUP_SIZE) {
-            const unsigned column=unsigned(order[p]),diagonal=diag[column];
-            REAL divisor=0;
-            if(lane==0) {
-                divisor=values[diagonal];
-                if constexpr(Perturb)if(fabs(divisor)<threshold) {divisor=threshold;values[diagonal]=divisor;}
+        if constexpr(Perturb) {
+            for(unsigned p=step.columns.begin+threadIdx.x;p<step.columns.end;p+=blockDim.x) {
+                const unsigned diagonal=diag[unsigned(order[p])];
+                if(fabs(values[diagonal])<threshold)values[diagonal]=threshold;
             }
-            divisor=gpuShuffle32(divisor,0);
-            for(unsigned pos=diagonal+1+lane;pos<col[column+1];pos+=GLU_GROUP_SIZE)values[pos]/=divisor;
+            __syncthreads();
+        }
+        for(unsigned p=step.normalization.begin+threadIdx.x;p<step.normalization.end;p+=blockDim.x) {
+            const auto entry=normalizations[p];values[entry.position]/=values[entry.diagonal];
         }
         __syncthreads();
         for(size_t p=size_t(step.immediate.begin)+threadIdx.x;p<step.immediate.end;p+=blockDim.x)
             apply_update_group<Packed>(values,1,0,groups,records,pairs,unsigned(p),inline_singletons);
         __syncthreads();
-        if(step.deferred.begin!=step.deferred.end) {
+        if(step.deferred.begin!=step.deferred.end || step.strips.begin!=step.strips.end) {
             for(size_t p=size_t(step.deferred.begin)+threadIdx.x;p<step.deferred.end;p+=blockDim.x)
                 apply_update_group<Packed>(values,1,0,groups,records,pairs,unsigned(p),inline_singletons);
+            for(unsigned p=step.strips.begin+group;p<step.strips.end;p+=blockDim.x/GLU_GROUP_SIZE) {
+                const auto strip=strips[p];
+                if(lane<strip.count) {
+                    const unsigned destination=destinations[strip.destinations+lane];
+                    REAL acc=values[destination];
+                    for(unsigned q=0;q<strip.length;++q) {
+                        const auto pair=pairs[strip.pairs+q*strip.count+lane];
+                        const REAL factor=values[pair.lower];
+                        if(factor!=REAL(0))acc-=factor*values[pair.pivot];
+                    }
+                    values[destination]=acc;
+                }
+            }
             __syncthreads();
         }
     }
 }
 
 template<bool Perturb,bool Packed>
-__global__ void fused_panel_factorize(REAL* values,unsigned nnz,const unsigned* col,
-        const unsigned* diag,const int* order,const FusedStep* steps,unsigned count,
+__global__ void fused_panel_factorize(REAL* values,unsigned nnz,const unsigned* diag,
+        const int* order,const FusedStep* steps,unsigned count,
         const UpdateGroup* groups,const uint64_t* records,const NormalizedUpdatePair* pairs,
+        const DeferredUpdateStrip* strips,const unsigned* destinations,const FusedNormalization* normalizations,
         bool inline_singletons,REAL threshold) {
-    fused_panel_compute<Perturb,Packed>(values+size_t(blockIdx.x)*nnz,col,diag,order,steps,
-        count,groups,records,pairs,inline_singletons,threshold);
+    fused_panel_compute<Perturb,Packed>(values+size_t(blockIdx.x)*nnz,diag,order,steps,
+        count,groups,records,pairs,strips,destinations,normalizations,inline_singletons,threshold);
 }
 
 struct FusedTaskDescriptor {
     size_t factor_offset,compact_offset;
     unsigned nnz,compact_count,levels;
-    const unsigned *col,*diag,*positions;
+    const unsigned *diag,*positions;
     const int* order;
     const FusedStep* steps;
     const UpdateGroup* groups;
     const uint64_t* records;
     const NormalizedUpdatePair* pairs;
+    const DeferredUpdateStrip* strips;
+    const unsigned* destinations;
+    const FusedNormalization* normalizations;
     bool inline_singletons,perturb;
     REAL threshold;
 };
@@ -482,15 +501,15 @@ __global__ void fused_task_set(REAL* factors,const REAL* input,
         __syncthreads();
     }
     if(task.perturb) {
-        if(task.records)fused_panel_compute<true,true>(values,task.col,task.diag,task.order,task.steps,
-            task.levels,task.groups,task.records,task.pairs,task.inline_singletons,task.threshold);
-        else fused_panel_compute<true,false>(values,task.col,task.diag,task.order,task.steps,
-            task.levels,task.groups,task.records,task.pairs,task.inline_singletons,task.threshold);
+        if(task.records)fused_panel_compute<true,true>(values,task.diag,task.order,task.steps,
+            task.levels,task.groups,task.records,task.pairs,task.strips,task.destinations,task.normalizations,task.inline_singletons,task.threshold);
+        else fused_panel_compute<true,false>(values,task.diag,task.order,task.steps,
+            task.levels,task.groups,task.records,task.pairs,task.strips,task.destinations,task.normalizations,task.inline_singletons,task.threshold);
     } else {
-        if(task.records)fused_panel_compute<false,true>(values,task.col,task.diag,task.order,task.steps,
-            task.levels,task.groups,task.records,task.pairs,task.inline_singletons,task.threshold);
-        else fused_panel_compute<false,false>(values,task.col,task.diag,task.order,task.steps,
-            task.levels,task.groups,task.records,task.pairs,task.inline_singletons,task.threshold);
+        if(task.records)fused_panel_compute<false,true>(values,task.diag,task.order,task.steps,
+            task.levels,task.groups,task.records,task.pairs,task.strips,task.destinations,task.normalizations,task.inline_singletons,task.threshold);
+        else fused_panel_compute<false,false>(values,task.diag,task.order,task.steps,
+            task.levels,task.groups,task.records,task.pairs,task.strips,task.destinations,task.normalizations,task.inline_singletons,task.threshold);
     }
 }
 
@@ -676,6 +695,7 @@ __global__ void scatter_compact_input_soa(REAL* values,const REAL* compact,
 
 struct GpuMatrix::Impl {
     unsigned n, nnz, slots, max_batch, max_grid_x;
+    unsigned fused_block_threads=256;
     unsigned deferred_columns_count=0;
     bool perturb;
     UpdateMode update_mode;
@@ -702,6 +722,9 @@ struct GpuMatrix::Impl {
     Buffer<uint64_t> panel_records;
     Buffer<NormalizedUpdatePair> panel_pairs;
     Buffer<FusedStep> fused_steps;
+    Buffer<DeferredUpdateStrip> fused_strips;
+    Buffer<unsigned> fused_destinations;
+    Buffer<FusedNormalization> fused_normalizations;
     Buffer<DenseUpdateTile> dense_tiles;
     Buffer<unsigned> dense_indices;
     Buffer<REAL, true> input;
@@ -763,7 +786,8 @@ struct GpuMatrix::Impl {
             if (mode == UpdateMode::Scan && width > 16) needed = std::max(needed, width);
         }
         slots = mode == UpdateMode::Scan ? std::min(requested_slots, needed) : 0;
-        col.upload(a.sym_c_ptr); diag.upload(a.l_col_ptr);
+        if(mode!=UpdateMode::Fused)col.upload(a.sym_c_ptr);
+        diag.upload(a.l_col_ptr);
         if(!panel_mode) { csr_row.upload(a.csr_r_ptr);csr_diag.upload(a.csr_diag_ptr); }
         if(mode==UpdateMode::Scan) { row.upload(a.sym_r_idx);csr_col.upload(a.csr_c_idx); }
         level_idx.upload(a.level_idx);
@@ -771,18 +795,34 @@ struct GpuMatrix::Impl {
             const auto begin=std::chrono::steady_clock::now();
             inline_singletons=a.nnz<inline_update_pair_bit;
             auto plan=make_panel_update_plan(a,32,mode==UpdateMode::PanelTiled,inline_singletons);
-            sort_deferred_groups_locally(plan,inline_singletons);
+            // Target parallelism guides this template's block size. A set
+            // uses the widest participating template, preserving one launch.
+            if(mode==UpdateMode::Fused && plan.groups.size()>uint64_t(a.num_lev)*1024)fused_block_threads=1024;
+            if(mode!=UpdateMode::Fused)sort_deferred_groups_locally(plan,inline_singletons);
+            DeferredStripPlan strip_plan;
+            if(mode==UpdateMode::Fused)strip_plan=organize_fused_updates(plan,inline_singletons);
             auto records=pack_update_groups(plan,nnz,inline_singletons);
             std::vector<FusedStep> steps;
+            std::vector<FusedNormalization> normalizations;
             if(mode==UpdateMode::Fused) {
-                for(unsigned lev=0;lev<unsigned(a.num_lev);++lev)
-                    steps.push_back({{unsigned(a.level_ptr[lev]),unsigned(a.level_ptr[lev+1])},plan.immediate[lev],plan.deferred[lev]});
+                for(unsigned lev=0;lev<unsigned(a.num_lev);++lev) {
+                    const unsigned begin=unsigned(normalizations.size());
+                    for(int p=a.level_ptr[lev];p<a.level_ptr[lev+1];++p) {
+                        const unsigned column=unsigned(a.level_idx[p]),diagonal=a.l_col_ptr[column];
+                        for(unsigned position=diagonal+1;position<a.sym_c_ptr[column+1];++position)
+                            normalizations.push_back({position,diagonal});
+                    }
+                    steps.push_back({{unsigned(a.level_ptr[lev]),unsigned(a.level_ptr[lev+1])},plan.immediate[lev],plan.deferred[lev],strip_plan.ranges[lev],{begin,unsigned(normalizations.size())}});
+                }
             }
             plan_bytes=records.empty() ? checked_bytes(plan.groups.size(),sizeof(UpdateGroup)) : checked_bytes(records.size(),sizeof(uint64_t));
             for(size_t bytes:{checked_bytes(plan.pairs.size(),sizeof(NormalizedUpdatePair)),
                               checked_bytes(plan.dense_tiles.size(),sizeof(DenseUpdateTile)),checked_bytes(plan.dense_indices.size(),sizeof(unsigned))})
                 plan_bytes=checked_sum(plan_bytes,bytes);
             plan_bytes=checked_sum(plan_bytes,checked_bytes(steps.size(),sizeof(FusedStep)));
+            plan_bytes=checked_sum(plan_bytes,checked_bytes(strip_plan.strips.size(),sizeof(DeferredUpdateStrip)));
+            plan_bytes=checked_sum(plan_bytes,checked_bytes(strip_plan.destinations.size(),sizeof(unsigned)));
+            plan_bytes=checked_sum(plan_bytes,checked_bytes(normalizations.size(),sizeof(FusedNormalization)));
             if(plan_bytes>GpuMatrix::free_device_bytes())throw std::runtime_error("panel plan exceeds free device memory");
             for(const auto range:plan.immediate)if(range.end-range.begin>max_grid_x)throw std::invalid_argument("panel group grid exceeds device limit");
             for(const auto range:plan.deferred)if(range.end-range.begin>max_grid_x)throw std::invalid_argument("panel group grid exceeds device limit");
@@ -792,6 +832,8 @@ struct GpuMatrix::Impl {
             panel_pairs.upload(plan.pairs);
             dense_tiles.upload(plan.dense_tiles);dense_indices.upload(plan.dense_indices);
             fused_steps.upload(steps);
+            fused_strips.upload(strip_plan.strips);fused_destinations.upload(strip_plan.destinations);
+            fused_normalizations.upload(normalizations);
             plan_setup_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
         }
         if (mode == UpdateMode::Mapped) {
@@ -987,11 +1029,11 @@ struct GpuTask::Impl {
         const bool soa=soa_stride!=0;
         if(a.update_mode==UpdateMode::Fused) {
             if(a.panel_records.ptr)
-                fused_panel_factorize<Perturb,true><<<copies,256,0,stream>>>(values.ptr,a.nnz,a.col.ptr,a.diag.ptr,a.level_idx.ptr,
-                    a.fused_steps.ptr,unsigned(a.levels.size()-1),nullptr,a.panel_records.ptr,a.panel_pairs.ptr,a.inline_singletons,a.threshold);
+                fused_panel_factorize<Perturb,true><<<copies,a.fused_block_threads,0,stream>>>(values.ptr,a.nnz,a.diag.ptr,a.level_idx.ptr,
+                    a.fused_steps.ptr,unsigned(a.levels.size()-1),nullptr,a.panel_records.ptr,a.panel_pairs.ptr,a.fused_strips.ptr,a.fused_destinations.ptr,a.fused_normalizations.ptr,a.inline_singletons,a.threshold);
             else
-                fused_panel_factorize<Perturb,false><<<copies,256,0,stream>>>(values.ptr,a.nnz,a.col.ptr,a.diag.ptr,a.level_idx.ptr,
-                    a.fused_steps.ptr,unsigned(a.levels.size()-1),a.panel_groups.ptr,nullptr,a.panel_pairs.ptr,a.inline_singletons,a.threshold);
+                fused_panel_factorize<Perturb,false><<<copies,a.fused_block_threads,0,stream>>>(values.ptr,a.nnz,a.diag.ptr,a.level_idx.ptr,
+                    a.fused_steps.ptr,unsigned(a.levels.size()-1),a.panel_groups.ptr,nullptr,a.panel_pairs.ptr,a.fused_strips.ptr,a.fused_destinations.ptr,a.fused_normalizations.ptr,a.inline_singletons,a.threshold);
             gpu_check(cudaGetLastError(),"factor fused matrix blocks");
             return;
         }
@@ -1339,6 +1381,7 @@ struct GpuTaskSet::Impl {
     Buffer<REAL> values,compact_values;
     Buffer<REAL,true> output,default_input;
     Buffer<FusedTaskDescriptor> tasks;
+    unsigned block_threads=256;
     cudaStream_t stream=nullptr;
     bool all_compact=true,perturb=false,compact_queued=false;
     bool pending=false,ready=false,failed=false,input_queued=false;
@@ -1356,10 +1399,11 @@ struct GpuTaskSet::Impl {
         for(size_t index:indices) {
             if(index>=templates.size())throw std::out_of_range("task template index");
             const auto& a=*templates[index];
+            block_threads=std::max(block_threads,a.fused_block_threads);
             if(indices.size()>a.max_grid_x)throw std::invalid_argument("task set exceeds device grid limit");
             descriptors.push_back({full_offsets.back(),compact_offsets.back(),a.nnz,a.compact_elements,
-                unsigned(a.levels.size()-1),a.col.ptr,a.diag.ptr,a.input_positions.ptr,a.level_idx.ptr,
-                a.fused_steps.ptr,a.panel_groups.ptr,a.panel_records.ptr,a.panel_pairs.ptr,a.inline_singletons,
+                unsigned(a.levels.size()-1),a.diag.ptr,a.input_positions.ptr,a.level_idx.ptr,
+                a.fused_steps.ptr,a.panel_groups.ptr,a.panel_records.ptr,a.panel_pairs.ptr,a.fused_strips.ptr,a.fused_destinations.ptr,a.fused_normalizations.ptr,a.inline_singletons,
                 a.perturb,a.threshold});
             full_offsets.push_back(checked_sum(full_offsets.back(),a.nnz));
             compact_offsets.push_back(checked_sum(compact_offsets.back(),a.compact_elements));
@@ -1368,6 +1412,7 @@ struct GpuTaskSet::Impl {
         }
         values.allocate(full_offsets.back());output.allocate(full_offsets.back());
         if(all_compact)compact_values.allocate(compact_offsets.back());
+        std::stable_sort(descriptors.begin(),descriptors.end(),[](const auto& x,const auto& y){return x.nnz>y.nnz;});
         tasks.upload(descriptors);
         gpu_check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking),"create task set stream");
     }
@@ -1427,7 +1472,7 @@ void GpuTaskSet::enqueue() {
     if(!t.input_queued)t.upload_default();
     t.ready=false;t.pending=true;t.input_queued=false;
     try {
-        fused_task_set<<<unsigned(task_count()),256,0,t.stream>>>(t.values.ptr,t.compact_values.ptr,t.tasks.ptr,t.compact_queued);
+        fused_task_set<<<unsigned(task_count()),t.block_threads,0,t.stream>>>(t.values.ptr,t.compact_values.ptr,t.tasks.ptr,t.compact_queued);
         gpu_check(cudaGetLastError(),"factor task set");
         gpu_check(cudaMemcpyAsync(t.output.ptr,t.values.ptr,t.output.bytes,cudaMemcpyDeviceToHost,t.stream),"download task set factors");
     } catch(...) {t.failed=true;cudaStreamSynchronize(t.stream);throw;}

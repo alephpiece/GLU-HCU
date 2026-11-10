@@ -7,6 +7,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 // Structural panel plan. Every entry is a multiply-subtract; stable destination
@@ -205,6 +206,71 @@ struct PanelUpdatePlan {
     uint64_t immediate_products=0,deferred_products=0;
     uint64_t inline_singletons=0;
 };
+
+struct DeferredUpdateStrip { unsigned destinations,pairs,count,length; };
+struct DeferredStripPlan {
+    std::vector<DeferredUpdateStrip> strips;
+    std::vector<unsigned> destinations;
+    std::vector<UpdateRange> ranges;
+};
+
+// Stable-partition immediate singletons and organize deferred destinations in
+// equal-length logical32 strips. Each lane keeps its contribution order while
+// adjacent lanes read adjacent pairs. Immediate groups and deferred singletons
+// retain their ordinary encoding.
+inline DeferredStripPlan organize_fused_updates(PanelUpdatePlan& plan,bool inline_singletons) {
+    auto groups=std::move(plan.groups);
+    const auto pairs=std::move(plan.pairs);
+    plan.groups.clear();plan.pairs.clear();
+    DeferredStripPlan out;
+    const auto reserve_index=[](size_t size,size_t extra) {
+        if(size>std::numeric_limits<unsigned>::max() || extra>std::numeric_limits<unsigned>::max()-size)
+            throw std::overflow_error("deferred strip capacity");
+        return unsigned(size);
+    };
+    const auto length=[&](const UpdateGroup& g) {
+        return inline_singletons && (g.destination&inline_update_pair_bit) ? 1u : g.end-g.begin;
+    };
+    const auto append_group=[&](UpdateGroup g) {
+        if(!(inline_singletons && (g.destination&inline_update_pair_bit))) {
+            const unsigned count=g.end-g.begin;
+            const unsigned begin=reserve_index(plan.pairs.size(),count);
+            plan.pairs.insert(plan.pairs.end(),pairs.begin()+g.begin,pairs.begin()+g.end);
+            g.begin=begin;g.end=begin+count;
+        }
+        reserve_index(plan.groups.size(),1);plan.groups.push_back(g);
+    };
+    for(size_t level=0;level<plan.immediate.size();++level) {
+        const auto immediate=plan.immediate[level],deferred=plan.deferred[level];
+        std::stable_partition(groups.begin()+immediate.begin,groups.begin()+immediate.end,
+            [&](const UpdateGroup& g){return length(g)==1;});
+        const unsigned begin=reserve_index(plan.groups.size(),immediate.end-immediate.begin);
+        for(unsigned p=immediate.begin;p<immediate.end;++p)append_group(groups[p]);
+        plan.immediate[level]={begin,unsigned(plan.groups.size())};
+        const unsigned single_begin=reserve_index(plan.groups.size(),0);
+        std::vector<unsigned> multiple;
+        for(unsigned p=deferred.begin;p<deferred.end;++p)
+            if(length(groups[p])==1)append_group(groups[p]);else multiple.push_back(p);
+        plan.deferred[level]={single_begin,unsigned(plan.groups.size())};
+        std::stable_sort(multiple.begin(),multiple.end(),[&](unsigned x,unsigned y) {return length(groups[x])<length(groups[y]);});
+        const unsigned strip_begin=reserve_index(out.strips.size(),0);
+        for(size_t first=0;first<multiple.size();) {
+            const unsigned n=length(groups[multiple[first]]);
+            size_t last=first+1;
+            while(last<multiple.size() && last-first<32 && length(groups[multiple[last]])==n)++last;
+            const unsigned count=unsigned(last-first);
+            const unsigned dst=reserve_index(out.destinations.size(),count);
+            const unsigned pair_begin=reserve_index(plan.pairs.size(),size_t(n)*count);
+            for(size_t p=first;p<last;++p)out.destinations.push_back(groups[multiple[p]].destination);
+            for(unsigned q=0;q<n;++q)for(size_t p=first;p<last;++p)
+                plan.pairs.push_back(pairs[groups[multiple[p]].begin+q]);
+            reserve_index(out.strips.size(),1);out.strips.push_back({dst,pair_begin,count,n});
+            first=last;
+        }
+        out.ranges.push_back({strip_begin,unsigned(out.strips.size())});
+    }
+    return out;
+}
 // A grouped-update CTA has at least eight target slots (256 threads / at most
 // 32 copy lanes). Align chunks to each range start to retain CTA target sets
 // across copy geometries. Preserve singleton slots and equal-length order.

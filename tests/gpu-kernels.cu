@@ -1053,7 +1053,7 @@ void test_fused_ordinary_groups() {
     std::vector<REAL> input,expected;
     for(unsigned copy=0;copy<copies;++copy) {
         const auto l=[copy](unsigned r,unsigned c) {
-            return r==c ? 1.0 : r>c ? double((r+2*c+copy)%7+1)/128.0 : 0.0;
+            return r==c ? 1.0 : r>c ? double((r+2*c+copy)%7)/128.0 : 0.0;
         };
         const auto u=[copy](unsigned r,unsigned c) {
             return r==c ? 8.0+double(r%3)+double(copy)/4 :
@@ -1074,27 +1074,37 @@ void test_fused_ordinary_groups() {
     matrix.predictLU(rows.data(),columns.data(),initial.data());matrix.leveling();
     if(matrix.num_lev!=int(n) || matrix.sym_c_ptr!=columns || matrix.sym_r_idx!=rows)
         throw std::runtime_error("ordinary Fused fixture lost its dense chain layout");
-    DeviceBuffer<unsigned> device_columns(matrix.sym_c_ptr),device_diagonals(matrix.l_col_ptr);
+    DeviceBuffer<unsigned> device_diagonals(matrix.l_col_ptr);
     DeviceBuffer<int> device_order(matrix.level_idx);
     Stream stream;
     for(bool inline_singletons:{false,true}) {
         auto plan=make_panel_update_plan(matrix,32,false,inline_singletons);
-        sort_deferred_groups_locally(plan,inline_singletons);
         if(plan.immediate[0].end-plan.immediate[0].begin<=256 ||
            plan.deferred[31].begin==plan.deferred[31].end)
             throw std::runtime_error("ordinary Fused fixture lost immediate or deferred updates");
+        const auto strip_plan=organize_fused_updates(plan,inline_singletons);
         std::vector<FusedStep> steps;
-        for(unsigned lev=0;lev<n;++lev)
+        std::vector<FusedNormalization> normalizations;
+        for(unsigned lev=0;lev<n;++lev) {
+            const unsigned begin=unsigned(normalizations.size());
+            for(int p=matrix.level_ptr[lev];p<matrix.level_ptr[lev+1];++p) {
+                const unsigned column=unsigned(matrix.level_idx[p]),diagonal=matrix.l_col_ptr[column];
+                for(unsigned pos=diagonal+1;pos<matrix.sym_c_ptr[column+1];++pos)normalizations.push_back({pos,diagonal});
+            }
             steps.push_back({{unsigned(matrix.level_ptr[lev]),unsigned(matrix.level_ptr[lev+1])},
-                             plan.immediate[lev],plan.deferred[lev]});
+                             plan.immediate[lev],plan.deferred[lev],strip_plan.ranges[lev],{begin,unsigned(normalizations.size())}});
+        }
         DeviceBuffer<FusedStep> device_steps(steps);
         DeviceBuffer<UpdateGroup> device_groups(plan.groups);
         DeviceBuffer<NormalizedUpdatePair> device_pairs(plan.pairs);
+        DeviceBuffer<FusedNormalization> device_normalizations(normalizations);
+        DeviceBuffer<DeferredUpdateStrip> device_strips(strip_plan.strips);
+        DeviceBuffer<unsigned> device_destinations(strip_plan.destinations);
         DeviceBuffer<REAL> device_values(input);
-        fused_panel_factorize<false,false><<<copies,256,0,stream.value>>>(
-            device_values.data(),matrix.nnz,device_columns.data(),device_diagonals.data(),
+        fused_panel_factorize<false,false><<<copies,inline_singletons?1024:256,0,stream.value>>>(
+            device_values.data(),matrix.nnz,device_diagonals.data(),
             device_order.data(),device_steps.data(),n,device_groups.data(),nullptr,
-            device_pairs.data(),inline_singletons,REAL(0));
+            device_pairs.data(),device_strips.data(),device_destinations.data(),device_normalizations.data(),inline_singletons,REAL(0));
         check_gpu(cudaGetLastError(),"launch ordinary Fused regression");
         check_gpu(cudaStreamSynchronize(stream.value),"wait ordinary Fused regression");
         compare(device_values.read(),expected,"ordinary Fused independent known LU");

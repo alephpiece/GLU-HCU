@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -14,6 +16,101 @@ void require(bool condition,const char* message) {
 template<class Error,class F> void rejects(F call,const char* message) {
     try { call(); } catch(const Error&) { return; }
     throw std::runtime_error(message);
+}
+
+using OrderedPairs=std::vector<std::pair<unsigned,unsigned>>;
+using StageUpdates=std::map<unsigned,OrderedPairs>;
+StageUpdates decode_groups(const PanelUpdatePlan& plan,UpdateRange range,bool inline_singletons) {
+    require(range.begin<=range.end && range.end<=plan.groups.size(),"invalid ordinary group range");
+    StageUpdates result;
+    for(unsigned p=range.begin;p<range.end;++p) {
+        const auto g=plan.groups[p];
+        const bool tagged=inline_singletons && (g.destination&inline_update_pair_bit);
+        const unsigned destination=tagged ? g.destination&~inline_update_pair_bit : g.destination;
+        OrderedPairs sequence;
+        if(tagged) sequence.emplace_back(g.begin,g.end);
+        else {
+            require(g.begin<g.end && g.end<=plan.pairs.size(),"invalid ordinary pair range");
+            for(unsigned q=g.begin;q<g.end;++q)
+                sequence.emplace_back(plan.pairs[q].lower,plan.pairs[q].pivot);
+        }
+        require(result.emplace(destination,std::move(sequence)).second,"duplicate ordinary stage target");
+    }
+    return result;
+}
+void decode_strips(StageUpdates& result,const PanelUpdatePlan& plan,
+        const DeferredStripPlan& strips,UpdateRange range) {
+    require(range.begin<=range.end && range.end<=strips.strips.size(),"invalid strip range");
+    for(unsigned p=range.begin;p<range.end;++p) {
+        const auto strip=strips.strips[p];
+        require(strip.count>0 && strip.count<=32 && strip.length>1,"invalid strip shape");
+        require(size_t(strip.destinations)+strip.count<=strips.destinations.size() &&
+                size_t(strip.pairs)+size_t(strip.count)*strip.length<=plan.pairs.size(),"strip exceeds storage");
+        for(unsigned lane=0;lane<strip.count;++lane) {
+            OrderedPairs sequence;
+            for(unsigned q=0;q<strip.length;++q) {
+                const auto pair=plan.pairs[size_t(strip.pairs)+size_t(q)*strip.count+lane];
+                sequence.emplace_back(pair.lower,pair.pivot);
+            }
+            require(result.emplace(strips.destinations[strip.destinations+lane],std::move(sequence)).second,
+                    "duplicate deferred target across ordinary groups and strips");
+        }
+    }
+}
+void deferred_conversion() {
+    for(bool inline_singletons:{false,true}) {
+        PanelUpdatePlan plan;
+        // Unreferenced prefix and per-group gaps make original pair offsets
+        // independent of both target order and the converted compact storage.
+        plan.pairs.resize(7,{900001,900002});
+        const auto add=[&](unsigned destination,unsigned length) {
+            OrderedPairs sequence;
+            for(unsigned q=0;q<length;++q)
+                sequence.emplace_back(destination*19+length-q,destination*23+q*7);
+            if(inline_singletons && length==1)
+                plan.groups.push_back({destination|inline_update_pair_bit,sequence[0].first,sequence[0].second});
+            else {
+                plan.pairs.push_back({900003,900004});
+                const unsigned begin=unsigned(plan.pairs.size());
+                for(const auto& pair:sequence)plan.pairs.push_back({pair.first,pair.second});
+                plan.groups.push_back({destination,begin,unsigned(plan.pairs.size())});
+            }
+        };
+        plan.immediate.push_back({0,0});plan.deferred.push_back({0,0});
+        for(unsigned count:{31u,32u,33u}) {
+            unsigned begin=unsigned(plan.groups.size());
+            // Repeated destinations across levels are legal; only ownership
+            // within a stage is unique. Immediate singletons are interspersed.
+            add(81,3);add(82,1);add(83,2);add(84,1);
+            plan.immediate.push_back({begin,unsigned(plan.groups.size())});
+            begin=unsigned(plan.groups.size());
+            add(91,1);add(92,5);
+            for(unsigned i=0;i<count;++i) {
+                add(100+count-i,3);
+                if(i==count/2) {add(93,2);add(94,1);}
+            }
+            add(95,5);add(96,1);
+            plan.deferred.push_back({begin,unsigned(plan.groups.size())});
+        }
+        const unsigned begin=unsigned(plan.groups.size());
+        add(81,1);
+        plan.immediate.push_back({begin,unsigned(plan.groups.size())});
+        plan.deferred.push_back({unsigned(plan.groups.size()),unsigned(plan.groups.size())});
+        plan.immediate.push_back(plan.deferred.back());plan.deferred.push_back(plan.deferred.back());
+        const auto original=plan;
+        const auto strips=organize_fused_updates(plan,inline_singletons);
+        require(plan.immediate.size()==original.immediate.size() &&
+                plan.deferred.size()==original.deferred.size() && strips.ranges.size()==original.deferred.size(),
+                "conversion changed stage count");
+        for(size_t level=0;level<original.immediate.size();++level) {
+            require(decode_groups(plan,plan.immediate[level],inline_singletons)==
+                    decode_groups(original,original.immediate[level],inline_singletons),"conversion changed immediate ordered pairs");
+            auto deferred=decode_groups(plan,plan.deferred[level],inline_singletons);
+            decode_strips(deferred,plan,strips,strips.ranges[level]);
+            require(deferred==decode_groups(original,original.deferred[level],inline_singletons),
+                    "conversion changed deferred ordered pairs");
+        }
+    }
 }
 std::unique_ptr<Symbolic_Matrix> matrix(unsigned n,const std::vector<unsigned>& columns,
         const std::vector<unsigned>& rows,const std::vector<double>& values) {
@@ -181,10 +278,11 @@ void perturbation() {
 
 int main() {
     try {
+        deferred_conversion();
         window_dependencies(8,false); window_dependencies(33,true);
         compact_lifecycle(8,false); compact_lifecycle(33,true);
         perturbation();
-        std::cout<<"PASS Fused window dependencies, AoS copies, compact lifecycle and perturbation\n";
+        std::cout<<"PASS Fused plan conversion, window dependencies, AoS copies, compact lifecycle and perturbation\n";
         return 0;
     } catch(const std::exception& error) { std::cerr<<"Fused regression failed: "<<error.what()<<'\n'; return 1; }
 }
