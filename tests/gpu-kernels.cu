@@ -1107,6 +1107,65 @@ void test_submission_failure_cleanup()
     std::cout<<"PASS host/submission-failure-drain-and-original-error\n";
 }
 
+void test_task_set_submission_failure_cleanup()
+{
+    unsigned columns[]{0,2,4},rows[]{0,1,0,1};
+    double values[]{4,2,1,3};
+    std::ostringstream out,err;
+    Symbolic_Matrix matrix(2,out,err);
+    matrix.fill_in(rows,columns);matrix.csr();
+    matrix.predictLU(rows,columns,values);matrix.leveling();
+    // A distinct compact order and omitted upper slot exercise both upload paths.
+    const std::vector<unsigned> positions{3,1,0};
+    GpuMatrix gpu(matrix,positions,1,false,UpdateMode::Fused);
+    Buffer<REAL,true> full,compact;
+    constexpr size_t count=2;
+    full.allocate(matrix.nnz,count);compact.allocate(positions.size(),count);
+    for(size_t task=0;task<count;++task) {
+        std::copy(matrix.val.begin(),matrix.val.end(),full.ptr+task*matrix.nnz);
+        for(size_t p=0;p<positions.size();++p)compact.ptr[task*positions.size()+p]=matrix.val[positions[p]];
+    }
+
+    for(bool use_compact:{false,true})for(bool fail_upload:{true,false})for(bool override_sync:{false,true}) {
+        GpuTaskSet tasks({&gpu},{0,0});
+        async_fault::State state{fail_upload,override_sync};
+        async_fault::Scope fault(state);
+        const auto upload=[&] {
+            if(use_compact)tasks.upload_compact_input(compact.ptr,count*positions.size());
+            else tasks.upload_input(full.ptr,count*matrix.nnz);
+        };
+        if(!fail_upload) {
+            upload();
+            if(state.sync_calls!=0)
+                throw std::runtime_error("successful task set upload unexpectedly synchronized");
+        }
+        std::string diagnostic;
+        try {
+            if(fail_upload)upload();else tasks.enqueue();
+        } catch(const std::runtime_error& error) {diagnostic=error.what();}
+        const char* operation=fail_upload ? "upload task set input" : "download task set factors";
+        const std::string expected=std::string(operation)+": "+cudaGetErrorString(async_fault::copy_error);
+        if(diagnostic!=expected)
+            throw std::runtime_error("task set submission failure lost original error: "+diagnostic);
+        // Check the drain before wait/destruction can mask a missing cleanup.
+        // Both pinned source buffers remain alive through all submitted work.
+        if(state.h2d_calls!=1 || state.h2d_submitted!=1 ||
+           state.d2h_calls!=(fail_upload ? 0u : 1u) || !state.same_stream ||
+           state.sync_calls!=1 || state.sync_successes!=1)
+            throw std::runtime_error("task set submission failure did not drain its stream");
+        expect_task_rejection<std::logic_error>([&]{tasks.enqueue();},"failed task set accepted enqueue");
+        expect_task_rejection<std::logic_error>([&]{tasks.upload_input();},"failed task set accepted default upload");
+        expect_task_rejection<std::logic_error>([&]{tasks.upload_input(full.ptr,count*matrix.nnz);},
+            "failed task set accepted full upload");
+        expect_task_rejection<std::logic_error>([&]{tasks.upload_compact_input(compact.ptr,count*positions.size());},
+            "failed task set accepted compact upload");
+        expect_task_rejection<std::logic_error>([&]{tasks.factors(0);},"failed task set allowed result access");
+        expect_task_rejection<std::logic_error>([&]{tasks.check();},"failed task set allowed factor checks");
+        expect_task_rejection<std::runtime_error>([&]{tasks.wait();},"failed task set accepted wait");
+    }
+    std::cout<<"PASS host/task-set-full-compact-failure-drain-and-original-error\n";
+}
+
 void test_fresh_inputs()
 {
     // A small closed pattern keeps every round in the same factor-slot layout.
@@ -1756,6 +1815,7 @@ int main()
         test_compact_tile_tails();
         test_auto_snapshot();
         test_submission_failure_cleanup();
+        test_task_set_submission_failure_cleanup();
         test_zero_update_map();
         for (bool one_column : {false,true})
             for (bool perturb : {false,true}) test_distinct_copies(one_column,perturb);

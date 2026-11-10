@@ -52,8 +52,23 @@ cmake --build /path/to/build-hip -j64
 | `GLU_BACKEND` | `CUDA` | 选择 `CUDA` 或 `HIP` 后端 |
 | `GLU_USE_FP32` | `OFF` | 设为 `ON` 时使用 FP32，否则使用 FP64 |
 | `GLU_BUILD_TESTS` | `OFF` | 设为 `ON` 时构建回归测试 |
+| `GLU_EXTRA_BENCHMARK_SOURCE` | 空 | 指定额外数值测量程序的源文件，构建 `glu_extra_bench` |
 
 例如，在新的构建目录配置时加入 `-DGLU_USE_FP32=ON`，即可构建 FP32 版本。
+
+### 自定义数值测量程序
+
+独立的测量程序可通过 `GLU_EXTRA_BENCHMARK_SOURCE` 接入，复用数值与预处理源码、NICSLU，以及同一套后端、精度和架构配置。源文件应包含 `main()`，参数使用绝对路径。
+
+在已配置的 CUDA 或 HIP 构建目录中执行：
+
+```bash
+cmake -S /path/to/GLU_public -B /path/to/build \
+  -DGLU_EXTRA_BENCHMARK_SOURCE=/path/to/driver.cpp
+cmake --build /path/to/build --target glu_extra_bench -j64
+```
+
+程序生成于 `/path/to/build/glu_extra_bench`。该入口与 `lu_cmd`、`glu_bench` 共用编译设置，程序自己的命令行和测量逻辑由源文件定义。
 
 ## CUDA Makefile 入口
 

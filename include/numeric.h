@@ -156,7 +156,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// Compatibility entry: one prepared template, one task, one execution.
+// Single-matrix convenience entry used by the solver CLI.
 bool LUonDevice(Symbolic_Matrix &, ostream &, ostream &, bool);
 
 #endif

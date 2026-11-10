@@ -773,17 +773,16 @@ struct GpuMatrix::Impl {
             auto plan=make_panel_update_plan(a,32,mode==UpdateMode::PanelTiled,inline_singletons);
             sort_deferred_groups_locally(plan,inline_singletons);
             auto records=pack_update_groups(plan,nnz,inline_singletons);
+            std::vector<FusedStep> steps;
             if(mode==UpdateMode::Fused) {
-                std::vector<FusedStep> steps;
                 for(unsigned lev=0;lev<unsigned(a.num_lev);++lev)
                     steps.push_back({{unsigned(a.level_ptr[lev]),unsigned(a.level_ptr[lev+1])},plan.immediate[lev],plan.deferred[lev]});
-                fused_steps.upload(steps);
             }
             plan_bytes=records.empty() ? checked_bytes(plan.groups.size(),sizeof(UpdateGroup)) : checked_bytes(records.size(),sizeof(uint64_t));
             for(size_t bytes:{checked_bytes(plan.pairs.size(),sizeof(NormalizedUpdatePair)),
                               checked_bytes(plan.dense_tiles.size(),sizeof(DenseUpdateTile)),checked_bytes(plan.dense_indices.size(),sizeof(unsigned))})
-            plan_bytes=checked_sum(plan_bytes,bytes);
-            plan_bytes=checked_sum(plan_bytes,fused_steps.bytes);
+                plan_bytes=checked_sum(plan_bytes,bytes);
+            plan_bytes=checked_sum(plan_bytes,checked_bytes(steps.size(),sizeof(FusedStep)));
             if(plan_bytes>GpuMatrix::free_device_bytes())throw std::runtime_error("panel plan exceeds free device memory");
             for(const auto range:plan.immediate)if(range.end-range.begin>max_grid_x)throw std::invalid_argument("panel group grid exceeds device limit");
             for(const auto range:plan.deferred)if(range.end-range.begin>max_grid_x)throw std::invalid_argument("panel group grid exceeds device limit");
@@ -792,6 +791,7 @@ struct GpuMatrix::Impl {
             if(records.empty())panel_groups.upload(plan.groups);else panel_records.upload(records);
             panel_pairs.upload(plan.pairs);
             dense_tiles.upload(plan.dense_tiles);dense_indices.upload(plan.dense_indices);
+            fused_steps.upload(steps);
             plan_setup_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
         }
         if (mode == UpdateMode::Mapped) {
