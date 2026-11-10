@@ -358,6 +358,43 @@ __global__ void mapped_level_update_soa(
     }
 }
 
+// Both execution granularities consume the same ordered destination groups.
+template<bool Packed>
+__device__ inline void apply_update_group(REAL* values,unsigned stride,unsigned copy,
+        const UpdateGroup* groups,const uint64_t* records,const NormalizedUpdatePair* pairs,
+        unsigned index,bool inline_singletons) {
+    unsigned destination,first,last,lower=0,pivot=0;
+    bool single;
+    if constexpr(Packed) {
+        const uint64_t group=records[index];
+        destination=unsigned(group&packed_update_position_mask);
+        single=(group&packed_update_single_bit)!=0;
+        if(single) {
+            lower=unsigned((group>>21)&packed_update_position_mask);
+            pivot=unsigned((group>>42)&packed_update_position_mask);
+            first=last=0;
+        } else {
+            first=unsigned((group>>21)&packed_update_pair_mask);
+            last=first+unsigned(group>>48);
+        }
+    } else {
+        const auto group=groups[index];
+        single=inline_singletons && (group.destination&inline_update_pair_bit);
+        destination=single ? group.destination&~inline_update_pair_bit : group.destination;
+        first=group.begin;last=group.end;
+        if(single) {lower=group.begin;pivot=group.end;}
+    }
+    REAL acc=values[size_t(destination)*stride+copy];
+    if(single) {
+        const REAL factor=values[size_t(lower)*stride+copy];
+        if(factor!=REAL(0))acc-=factor*values[size_t(pivot)*stride+copy];
+    } else for(unsigned p=first;p<last;++p) {
+        const auto pair=pairs[p];const REAL factor=values[size_t(pair.lower)*stride+copy];
+        if(factor!=REAL(0))acc-=factor*values[size_t(pair.pivot)*stride+copy];
+    }
+    values[size_t(destination)*stride+copy]=acc;
+}
+
 // Each destination/copy has one writer; preserve zero-factor skipping.
 __global__ void mapped_group_update(REAL* values,unsigned copies,unsigned stride,unsigned copy_bits,
         const UpdateGroup* groups,const NormalizedUpdatePair* pairs,unsigned begin,unsigned end,bool inline_singletons) {
@@ -365,20 +402,7 @@ __global__ void mapped_group_update(REAL* values,unsigned copies,unsigned stride
     const unsigned copy=blockIdx.y*lanes+(threadIdx.x&(lanes-1));
     const size_t index=size_t(begin)+size_t(blockIdx.x)*rows+(threadIdx.x>>copy_bits);
     if(copy>=copies || index>=end)return;
-    const auto g=groups[index];
-    const bool single=inline_singletons && (g.destination&inline_update_pair_bit);
-    const unsigned destination=single ? g.destination&~inline_update_pair_bit : g.destination;
-    REAL acc=values[size_t(destination)*stride+copy];
-    if(single) {
-        const REAL factor=values[size_t(g.begin)*stride+copy];
-        if(factor!=REAL(0))acc-=factor*values[size_t(g.end)*stride+copy];
-    } else {
-        for(unsigned p=g.begin;p<g.end;++p) {
-            const auto u=pairs[p];const REAL factor=values[size_t(u.lower)*stride+copy];
-            if(factor!=REAL(0))acc-=factor*values[size_t(u.pivot)*stride+copy];
-        }
-    }
-    values[size_t(destination)*stride+copy]=acc;
+    apply_update_group<false>(values,stride,copy,groups,nullptr,pairs,unsigned(index),inline_singletons);
 }
 
 __global__ void packed_group_update(REAL* values,unsigned copies,unsigned stride,unsigned copy_bits,
@@ -387,22 +411,87 @@ __global__ void packed_group_update(REAL* values,unsigned copies,unsigned stride
     const unsigned copy=blockIdx.y*lanes+(threadIdx.x&(lanes-1));
     const size_t index=size_t(begin)+size_t(blockIdx.x)*rows+(threadIdx.x>>copy_bits);
     if(copy>=copies || index>=end)return;
-    const uint64_t group=groups[index];
-    const unsigned destination=unsigned(group&packed_update_position_mask);
-    REAL acc=values[size_t(destination)*stride+copy];
-    if(group&packed_update_single_bit) {
-        const unsigned lower=unsigned((group>>21)&packed_update_position_mask);
-        const unsigned pivot=unsigned((group>>42)&packed_update_position_mask);
-        const REAL factor=values[size_t(lower)*stride+copy];
-        if(factor!=REAL(0))acc-=factor*values[size_t(pivot)*stride+copy];
-    } else {
-        const unsigned first=unsigned((group>>21)&packed_update_pair_mask),last=first+unsigned(group>>48);
-        for(unsigned p=first;p<last;++p) {
-            const auto pair=pairs[p];const REAL factor=values[size_t(pair.lower)*stride+copy];
-            if(factor!=REAL(0))acc-=factor*values[size_t(pair.pivot)*stride+copy];
+    apply_update_group<true>(values,stride,copy,nullptr,groups,pairs,unsigned(index),false);
+}
+
+struct FusedStep { UpdateRange columns,immediate,deferred; };
+
+// One matrix per block, independent of template reuse. Values stay in their
+// ordinary AoS allocation; only execution boundaries change.
+template<bool Perturb,bool Packed>
+__device__ void fused_panel_compute(REAL* values,const unsigned* col,
+        const unsigned* diag,const int* order,const FusedStep* steps,unsigned count,
+        const UpdateGroup* groups,const uint64_t* records,const NormalizedUpdatePair* pairs,
+        bool inline_singletons,REAL threshold) {
+    const unsigned lane=threadIdx.x%GLU_GROUP_SIZE,group=threadIdx.x/GLU_GROUP_SIZE;
+    for(unsigned level=0;level<count;++level) {
+        const auto step=steps[level];
+        for(unsigned p=step.columns.begin+group;p<step.columns.end;p+=blockDim.x/GLU_GROUP_SIZE) {
+            const unsigned column=unsigned(order[p]),diagonal=diag[column];
+            REAL divisor=0;
+            if(lane==0) {
+                divisor=values[diagonal];
+                if constexpr(Perturb)if(fabs(divisor)<threshold) {divisor=threshold;values[diagonal]=divisor;}
+            }
+            divisor=gpuShuffle32(divisor,0);
+            for(unsigned pos=diagonal+1+lane;pos<col[column+1];pos+=GLU_GROUP_SIZE)values[pos]/=divisor;
+        }
+        __syncthreads();
+        for(size_t p=size_t(step.immediate.begin)+threadIdx.x;p<step.immediate.end;p+=blockDim.x)
+            apply_update_group<Packed>(values,1,0,groups,records,pairs,unsigned(p),inline_singletons);
+        __syncthreads();
+        if(step.deferred.begin!=step.deferred.end) {
+            for(size_t p=size_t(step.deferred.begin)+threadIdx.x;p<step.deferred.end;p+=blockDim.x)
+                apply_update_group<Packed>(values,1,0,groups,records,pairs,unsigned(p),inline_singletons);
+            __syncthreads();
         }
     }
-    values[size_t(destination)*stride+copy]=acc;
+}
+
+template<bool Perturb,bool Packed>
+__global__ void fused_panel_factorize(REAL* values,unsigned nnz,const unsigned* col,
+        const unsigned* diag,const int* order,const FusedStep* steps,unsigned count,
+        const UpdateGroup* groups,const uint64_t* records,const NormalizedUpdatePair* pairs,
+        bool inline_singletons,REAL threshold) {
+    fused_panel_compute<Perturb,Packed>(values+size_t(blockIdx.x)*nnz,col,diag,order,steps,
+        count,groups,records,pairs,inline_singletons,threshold);
+}
+
+struct FusedTaskDescriptor {
+    size_t factor_offset,compact_offset;
+    unsigned nnz,compact_count,levels;
+    const unsigned *col,*diag,*positions;
+    const int* order;
+    const FusedStep* steps;
+    const UpdateGroup* groups;
+    const uint64_t* records;
+    const NormalizedUpdatePair* pairs;
+    bool inline_singletons,perturb;
+    REAL threshold;
+};
+
+__global__ void fused_task_set(REAL* factors,const REAL* input,
+                              const FusedTaskDescriptor* tasks,bool compact) {
+    const auto task=tasks[blockIdx.x];
+    REAL* values=factors+task.factor_offset;
+    if(compact) {
+        for(size_t p=threadIdx.x;p<task.nnz;p+=blockDim.x)values[p]=REAL(0);
+        __syncthreads();
+        for(size_t p=threadIdx.x;p<task.compact_count;p+=blockDim.x)
+            values[task.positions[p]]=input[task.compact_offset+p];
+        __syncthreads();
+    }
+    if(task.perturb) {
+        if(task.records)fused_panel_compute<true,true>(values,task.col,task.diag,task.order,task.steps,
+            task.levels,task.groups,task.records,task.pairs,task.inline_singletons,task.threshold);
+        else fused_panel_compute<true,false>(values,task.col,task.diag,task.order,task.steps,
+            task.levels,task.groups,task.records,task.pairs,task.inline_singletons,task.threshold);
+    } else {
+        if(task.records)fused_panel_compute<false,true>(values,task.col,task.diag,task.order,task.steps,
+            task.levels,task.groups,task.records,task.pairs,task.inline_singletons,task.threshold);
+        else fused_panel_compute<false,false>(values,task.col,task.diag,task.order,task.steps,
+            task.levels,task.groups,task.records,task.pairs,task.inline_singletons,task.threshold);
+    }
 }
 
 #include "update-tiles.cuh"
@@ -612,6 +701,7 @@ struct GpuMatrix::Impl {
     Buffer<UpdateGroup> panel_groups;
     Buffer<uint64_t> panel_records;
     Buffer<NormalizedUpdatePair> panel_pairs;
+    Buffer<FusedStep> fused_steps;
     Buffer<DenseUpdateTile> dense_tiles;
     Buffer<unsigned> dense_indices;
     Buffer<REAL, true> input;
@@ -620,7 +710,7 @@ struct GpuMatrix::Impl {
 
     unsigned value_pitch(unsigned copies) const {
         if(!copies || copies>max_batch) throw std::invalid_argument("batch size exceeds device grid limit");
-        if(update_mode==UpdateMode::Scan || copies==1) return 0;
+        if(update_mode==UpdateMode::Scan || update_mode==UpdateMode::Fused || copies==1) return 0;
         const unsigned lanes=1u<<filled_copy_bits(copies,5);
         const uint64_t pitch=(uint64_t(copies)+lanes-1)/lanes*lanes;
         if(pitch>std::numeric_limits<unsigned>::max()) throw std::overflow_error("SoA leading dimension overflow");
@@ -636,7 +726,7 @@ struct GpuMatrix::Impl {
     {
         if (!n || !nnz || !requested_slots || levels.size() < 2)
             throw std::invalid_argument("empty matrix or zero scratch slots");
-        if (mode != UpdateMode::Scan && mode != UpdateMode::Mapped && mode != UpdateMode::Panel && mode != UpdateMode::PanelTiled)
+        if (mode != UpdateMode::Scan && mode != UpdateMode::Mapped && mode != UpdateMode::Panel && mode != UpdateMode::PanelTiled && mode != UpdateMode::Fused)
             throw std::invalid_argument("invalid update mode");
         if(snapshot!=SnapshotPolicy::Auto && snapshot!=SnapshotPolicy::PerCopy &&
            snapshot!=SnapshotPolicy::Shared && snapshot!=SnapshotPolicy::Device)
@@ -652,7 +742,7 @@ struct GpuMatrix::Impl {
             compact_elements=unsigned(positions.size());
             compact_setup_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
         }
-        panel_mode=mode==UpdateMode::Panel || mode==UpdateMode::PanelTiled;
+        panel_mode=mode==UpdateMode::Panel || mode==UpdateMode::PanelTiled || mode==UpdateMode::Fused;
         GpuMatrix::select_device();
         cudaDeviceProp prop;
         gpu_check(cudaGetDeviceProperties(&prop, 0), "get device properties");
@@ -683,10 +773,16 @@ struct GpuMatrix::Impl {
             auto plan=make_panel_update_plan(a,32,mode==UpdateMode::PanelTiled,inline_singletons);
             sort_deferred_groups_locally(plan,inline_singletons);
             auto records=pack_update_groups(plan,nnz,inline_singletons);
+            std::vector<FusedStep> steps;
+            if(mode==UpdateMode::Fused) {
+                for(unsigned lev=0;lev<unsigned(a.num_lev);++lev)
+                    steps.push_back({{unsigned(a.level_ptr[lev]),unsigned(a.level_ptr[lev+1])},plan.immediate[lev],plan.deferred[lev]});
+            }
             plan_bytes=records.empty() ? checked_bytes(plan.groups.size(),sizeof(UpdateGroup)) : checked_bytes(records.size(),sizeof(uint64_t));
             for(size_t bytes:{checked_bytes(plan.pairs.size(),sizeof(NormalizedUpdatePair)),
                               checked_bytes(plan.dense_tiles.size(),sizeof(DenseUpdateTile)),checked_bytes(plan.dense_indices.size(),sizeof(unsigned))})
                 plan_bytes=checked_sum(plan_bytes,bytes);
+            plan_bytes=checked_sum(plan_bytes,checked_bytes(steps.size(),sizeof(FusedStep)));
             if(plan_bytes>GpuMatrix::free_device_bytes())throw std::runtime_error("panel plan exceeds free device memory");
             for(const auto range:plan.immediate)if(range.end-range.begin>max_grid_x)throw std::invalid_argument("panel group grid exceeds device limit");
             for(const auto range:plan.deferred)if(range.end-range.begin>max_grid_x)throw std::invalid_argument("panel group grid exceeds device limit");
@@ -695,6 +791,7 @@ struct GpuMatrix::Impl {
             if(records.empty())panel_groups.upload(plan.groups);else panel_records.upload(records);
             panel_pairs.upload(plan.pairs);
             dense_tiles.upload(plan.dense_tiles);dense_indices.upload(plan.dense_indices);
+            fused_steps.upload(steps);
             plan_setup_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
         }
         if (mode == UpdateMode::Mapped) {
@@ -888,6 +985,16 @@ struct GpuTask::Impl {
         const auto& a=*matrix;
         const unsigned column_threads=copies>=16 ? 256 : 1024;
         const bool soa=soa_stride!=0;
+        if(a.update_mode==UpdateMode::Fused) {
+            if(a.panel_records.ptr)
+                fused_panel_factorize<Perturb,true><<<copies,256,0,stream>>>(values.ptr,a.nnz,a.col.ptr,a.diag.ptr,a.level_idx.ptr,
+                    a.fused_steps.ptr,unsigned(a.levels.size()-1),nullptr,a.panel_records.ptr,a.panel_pairs.ptr,a.inline_singletons,a.threshold);
+            else
+                fused_panel_factorize<Perturb,false><<<copies,256,0,stream>>>(values.ptr,a.nnz,a.col.ptr,a.diag.ptr,a.level_idx.ptr,
+                    a.fused_steps.ptr,unsigned(a.levels.size()-1),a.panel_groups.ptr,nullptr,a.panel_pairs.ptr,a.inline_singletons,a.threshold);
+            gpu_check(cudaGetLastError(),"factor fused matrix blocks");
+            return;
+        }
         if constexpr(Mode==UpdateMode::Mapped)if(a.panel_mode) {
             REAL* data=soa ? interleaved_values.ptr : values.ptr;
             const unsigned bits=soa ? copy_bits : 0,stride=soa ? soa_stride : 1,rows=256u>>bits;
@@ -1101,6 +1208,7 @@ bool GpuTask::normalizes_each_level() const { return impl_->matrix->panel_mode |
 
 size_t GpuTask::numeric_launches() const {
     const auto& t=*impl_;const auto& a=*t.matrix;
+    if(a.update_mode==UpdateMode::Fused)return 1;
     // Input paths prepare the execution layout; numeric work converts only output.
     size_t count=t.soa_stride ? 1 : 0;
     if(a.panel_mode) {
@@ -1222,6 +1330,129 @@ void GpuTask::check() const {
             if (!std::isfinite(values[p])) throw std::runtime_error("LU data check: NaN/Inf found");
         for (unsigned j=0; j<a.n; ++j)
             if (values[a.diagonals[j]] == REAL(0)) throw std::runtime_error("LU data check: zero diagonal");
+    }
+}
+
+struct GpuTaskSet::Impl {
+    std::vector<std::shared_ptr<const GpuMatrix::Impl>> templates;
+    std::vector<size_t> task_templates,full_offsets{0},compact_offsets{0};
+    Buffer<REAL> values,compact_values;
+    Buffer<REAL,true> output,default_input;
+    Buffer<FusedTaskDescriptor> tasks;
+    cudaStream_t stream=nullptr;
+    bool all_compact=true,perturb=false,compact_queued=false;
+    bool pending=false,ready=false,failed=false,input_queued=false;
+    double default_setup_ms=0;
+
+    Impl(const std::vector<const GpuMatrix*>& matrices,const std::vector<size_t>& indices)
+        : task_templates(indices) {
+        if(indices.empty())throw std::invalid_argument("task set must not be empty");
+        for(const auto* matrix:matrices) {
+            if(!matrix || matrix->impl_->update_mode!=UpdateMode::Fused)
+                throw std::invalid_argument("task set requires Fused templates");
+            templates.push_back(matrix->impl_);
+        }
+        std::vector<FusedTaskDescriptor> descriptors;
+        for(size_t index:indices) {
+            if(index>=templates.size())throw std::out_of_range("task template index");
+            const auto& a=*templates[index];
+            if(indices.size()>a.max_grid_x)throw std::invalid_argument("task set exceeds device grid limit");
+            descriptors.push_back({full_offsets.back(),compact_offsets.back(),a.nnz,a.compact_elements,
+                unsigned(a.levels.size()-1),a.col.ptr,a.diag.ptr,a.input_positions.ptr,a.level_idx.ptr,
+                a.fused_steps.ptr,a.panel_groups.ptr,a.panel_records.ptr,a.panel_pairs.ptr,a.inline_singletons,
+                a.perturb,a.threshold});
+            full_offsets.push_back(checked_sum(full_offsets.back(),a.nnz));
+            compact_offsets.push_back(checked_sum(compact_offsets.back(),a.compact_elements));
+            all_compact=all_compact && a.compact_elements!=0;
+            perturb=perturb || a.perturb;
+        }
+        values.allocate(full_offsets.back());output.allocate(full_offsets.back());
+        if(all_compact)compact_values.allocate(compact_offsets.back());
+        tasks.upload(descriptors);
+        gpu_check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking),"create task set stream");
+    }
+    ~Impl() {
+        if(stream) {cudaStreamSynchronize(stream);cudaStreamDestroy(stream);}
+    }
+    void require_upload() const {
+        if(failed || pending || input_queued)throw std::logic_error("cannot queue task set input in this state");
+    }
+    void upload(const REAL* input,bool compact) {
+        require_upload();ready=false;
+        try {
+            auto& destination=compact ? compact_values : values;
+            gpu_check(cudaMemcpyAsync(destination.ptr,input,destination.bytes,cudaMemcpyHostToDevice,stream),"upload task set input");
+            compact_queued=compact;input_queued=true;
+        } catch(...) {failed=true;cudaStreamSynchronize(stream);throw;}
+    }
+    void upload_default() {
+        require_upload();
+        if(!default_input.ptr) {
+            const auto start=std::chrono::steady_clock::now();
+            default_input.allocate(full_offsets.back());
+            for(size_t task=0;task<task_templates.size();++task) {
+                const auto& a=*templates[task_templates[task]];
+                std::copy(a.input.ptr,a.input.ptr+a.nnz,default_input.ptr+full_offsets[task]);
+            }
+            default_setup_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        }
+        upload(default_input.ptr,false);
+    }
+};
+
+GpuTaskSet::GpuTaskSet(const std::vector<const GpuMatrix*>& matrices,const std::vector<size_t>& indices)
+    : impl_(new Impl(matrices,indices)) {}
+GpuTaskSet::~GpuTaskSet()=default;
+size_t GpuTaskSet::task_count() const {return impl_->task_templates.size();}
+size_t GpuTaskSet::factor_offset(size_t task) const {return impl_->full_offsets.at(task);}
+size_t GpuTaskSet::compact_input_offset(size_t task) const {return impl_->compact_offsets.at(task);}
+size_t GpuTaskSet::device_bytes() const {return checked_sum(checked_sum(impl_->values.bytes,impl_->compact_values.bytes),impl_->tasks.bytes);}
+size_t GpuTaskSet::pinned_bytes() const {return checked_sum(impl_->output.bytes,impl_->default_input.bytes);}
+double GpuTaskSet::default_input_setup_ms() const {return impl_->default_setup_ms;}
+void GpuTaskSet::upload_input() {impl_->upload_default();}
+void GpuTaskSet::upload_input(const REAL* input,size_t elements) {
+    if(!input || elements!=impl_->full_offsets.back())throw std::invalid_argument("input must match task set factor slots");
+    if(impl_->perturb)throw std::invalid_argument("fresh input requires an explicit perturbation threshold policy");
+    impl_->upload(input,false);
+}
+void GpuTaskSet::upload_compact_input(const REAL* input,size_t elements) {
+    if(!impl_->all_compact || !input || elements!=impl_->compact_offsets.back())
+        throw std::invalid_argument("compact input must match all prepared task set input positions");
+    if(impl_->perturb)throw std::invalid_argument("fresh input requires an explicit perturbation threshold policy");
+    impl_->upload(input,true);
+}
+void GpuTaskSet::enqueue() {
+    auto& t=*impl_;
+    if(t.failed || t.pending)throw std::logic_error("task set is failed or pending");
+    if(!t.input_queued)t.upload_default();
+    t.ready=false;t.pending=true;t.input_queued=false;
+    try {
+        fused_task_set<<<unsigned(task_count()),256,0,t.stream>>>(t.values.ptr,t.compact_values.ptr,t.tasks.ptr,t.compact_queued);
+        gpu_check(cudaGetLastError(),"factor task set");
+        gpu_check(cudaMemcpyAsync(t.output.ptr,t.values.ptr,t.output.bytes,cudaMemcpyDeviceToHost,t.stream),"download task set factors");
+    } catch(...) {t.failed=true;cudaStreamSynchronize(t.stream);throw;}
+}
+void GpuTaskSet::wait() {
+    auto& t=*impl_;
+    if(t.input_queued)throw std::logic_error("enqueue task set numeric work before waiting");
+    if(t.pending) {
+        const auto status=cudaStreamSynchronize(t.stream);t.pending=false;
+        if(status!=cudaSuccess) {t.failed=true;gpu_check(status,"wait for task set");}
+        if(!t.failed)t.ready=true;
+    }
+    if(t.failed)throw std::runtime_error("task set submission failed; rebuild before reuse");
+}
+const REAL* GpuTaskSet::factors(size_t task) const {
+    if(task>=task_count())throw std::out_of_range("task set result index");
+    if(impl_->failed || !impl_->ready)throw std::logic_error("task set results are not ready");
+    return impl_->output.ptr+impl_->full_offsets[task];
+}
+void GpuTaskSet::check() const {
+    for(size_t task=0;task<task_count();++task) {
+        const auto& a=*impl_->templates[impl_->task_templates[task]];
+        const REAL* data=factors(task);
+        for(unsigned p=0;p<a.nnz;++p)if(!std::isfinite(data[p]))throw std::runtime_error("LU data check: NaN/Inf found");
+        for(unsigned p:a.diagonals)if(data[p]==REAL(0))throw std::runtime_error("LU data check: zero diagonal");
     }
 }
 

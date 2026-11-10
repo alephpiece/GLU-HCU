@@ -1,6 +1,6 @@
 # 性能测试
 
-`glu_bench` 测量重复数值分解，与 `lu_cmd` 共用 GPU 执行实现，支持 CUDA/HIP 和所选构建精度。它每轮恢复模板默认初值，不启用扰动。构建见[构建与验证](../BUILDING.md)，文件格式见[矩阵输入](solver.md#矩阵输入)。
+`glu_bench` 测量重复数值分解，与 `lu_cmd` 共用 GPU 执行实现，支持 CUDA/HIP 和所选构建精度。它使用 `GpuMatrix` 准备模板、`GpuTask` 执行同结构批次，每轮恢复模板默认初值，不启用扰动。构建见[构建与验证](../BUILDING.md)，文件格式见[矩阵输入](solver.md#矩阵输入)。
 
 参数概要可用 `glu_bench --help` 查看。命令示例：
 
@@ -30,7 +30,7 @@
 | `--batch-size N` | 1 | 同模板独立副本的每批上限，每批一条 stream，尾批保留实际数量 |
 | `--graph` | 关闭 | 准备阶段捕获每批数值与输出图，随后重放 |
 | `--snapshot-policy auto\|per-copy\|shared\|device` | `auto` | 自动选择初值恢复方式，或强制逐副本上传、共享上传、设备初值恢复 |
-| `--updates scan\|mapped\|panel\|tiled` | `scan` | 选择扫描、位置映射、依赖窗口目标归约或带局部密集块的归约 |
+| `--updates scan\|mapped\|panel\|tiled\|fused` | `scan` | 选择扫描、位置映射、依赖窗口目标归约、局部密集块或块内分解 |
 | `--submit-threads N` | 1 | 并行提交数值与输出的主机线程数上限，实际不超过批数。输入由主线程提前排队 |
 | `--tmp-slots N` | 32 | scan 每个副本的 scratch 槽数上限，其它策略不使用 scratch |
 | `--check full\|basic` | `full` | 完整因子残差检查，或轻量有限性检查 |
@@ -69,7 +69,9 @@ task light
 
 `--submit-threads` 大于 1 时，工作线程并行提交独立批次，只有一批时仍使用主线程。工作线程每轮创建和汇合，相关成本包含在 LOOP 中。主机线程数和逻辑 stream 数都不等于实际 GPU 并发度。
 
-`--updates` 显式选择数值更新策略。`scan` 使用独立 scratch，其余策略准备模板共享索引或计划。各策略的工作方式与准备成本见[数值更新策略](numeric-api.md#数值更新策略)。
+`--updates` 显式选择批次内的数值更新策略。`scan` 使用独立 scratch，其余策略准备模板共享索引或计划。`fused` 每矩阵使用一个线程块完成全部依赖层，使用 Panel 分组计划和 AoS 布局；它仍按同模板批次提交，`--graph` 和快照策略按批次生效。各策略的工作方式与准备成本见[数值更新策略](numeric-api.md#数值更新策略)。
+
+需要跨模板合并输入、分解与输出时，应用通过 [GpuTaskSet](numeric-api.md#异构任务集合) 显式构造集合。它与 `GpuTask` 共用模板及 Fused 块内分解函数。自定义数值生产和集合执行使用 C++ 接口编写驱动，可通过[构建文档](../BUILDING.md)的扩展入口复用后端、精度和依赖配置；本程序的任务清单与批量参数控制同结构批次。
 
 `--snapshot-policy` 选择默认初值恢复方式。默认 `auto` 对 panel 多副本使用 `shared`，其余使用 `per-copy`，尾批按实际副本数解析。`device` 需显式指定，并额外保留一份模板设备初值。完整规则见[默认初值恢复](numeric-api.md#默认初值恢复)。
 
@@ -85,7 +87,7 @@ task light
 | --- | --- |
 | `setup_ms` / `graph_setup_ms` | 准备总耗时及其中的 Graph 捕获与实例化耗时，准备时不执行分解 |
 | `update_map_setup_ms` | mapped 路径的映射及辅助元数据准备耗时，包含在 `setup_ms` 中 |
-| `update_plan_bytes` / `update_plan_setup_ms` | panel/tiled 的设备计划载荷与构造上传时间，包含在共享载荷和 `setup_ms` 中 |
+| `update_plan_bytes` / `update_plan_setup_ms` | panel/tiled/fused 的设备计划载荷与构造上传时间，包含在共享载荷和 `setup_ms` 中 |
 | `native_mmac` | 至少一个模板具有使用原生矩阵指令的密集 tile。标量回退或无 tile 时为 false |
 | `warmup_ms` | 全部预热耗时，包含可能的首次重放开销 |
 | `loop_ms` / `ms_per_loop` | 主机单调时钟测量的逐轮完整耗时及算术平均值 |
@@ -116,8 +118,8 @@ task light
 | `submit_worker_max_wall_ms` | 最慢提交工作线程的墙钟耗时。单线程时为 0 |
 | `launches_per_loop` | 每轮数值与输出布局转换 kernel 次数，Graph 重放时也统计底层 kernel，区别于主机 launch API 次数 |
 | `input_restore_launches_per_loop` | 每轮快照广播、设备恢复及输入布局转换 kernel 次数，所有输入布局准备均在数值 Graph 之外 |
-| `wide_blocks_per_loop` | scan/mapped 每轮宽层数值 kernel 的线程块总数，包含适用路径的归一化与目标更新。panel/tiled 返回 0 表示不适用 |
-| `template_work` | 每模板的层宽及 L 非空源列的结构目标数量，各批实际启动次数另计。panel/tiled 不适用的层内启动字段为 null |
+| `wide_blocks_per_loop` | scan/mapped 每轮宽层数值 kernel 的线程块总数，包含适用路径的归一化与目标更新。panel/tiled/fused 返回 0 表示不适用 |
+| `template_work` | 每模板的层宽及 L 非空源列的结构目标数量，各批实际启动次数另计。panel/tiled/fused 不适用的层内启动字段为 null |
 | `h2d_bytes_per_loop` / `d2h_bytes_per_loop` | 每轮所选快照策略的实际传输载荷，完整因子 D2H 按全部逻辑副本统计 |
 | `h2d_copy_ops_per_loop` / `d2h_copy_ops_per_loop` | 每轮安排的 H2D/D2H 操作次数 |
 

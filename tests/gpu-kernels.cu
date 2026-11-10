@@ -1044,6 +1044,64 @@ void test_panel_boundaries() {
     }
 }
 
+void test_fused_ordinary_groups() {
+    // Force the ordinary-record kernel without a huge packing-limit fixture.
+    // Known L/U generate A by dense multiplication, independently of the plan.
+    constexpr unsigned n=40,copies=3;
+    std::vector<unsigned> columns{0},rows;
+    std::vector<double> initial;
+    std::vector<REAL> input,expected;
+    for(unsigned copy=0;copy<copies;++copy) {
+        const auto l=[copy](unsigned r,unsigned c) {
+            return r==c ? 1.0 : r>c ? double((r+2*c+copy)%7+1)/128.0 : 0.0;
+        };
+        const auto u=[copy](unsigned r,unsigned c) {
+            return r==c ? 8.0+double(r%3)+double(copy)/4 :
+                   r<c ? double(int((2*r+c+copy)%5)-2)/32.0 : 0.0;
+        };
+        for(unsigned c=0;c<n;++c) {
+            for(unsigned r=0;r<n;++r) {
+                double value=0;
+                for(unsigned k=0;k<n;++k)value+=l(r,k)*u(k,c);
+                input.push_back(REAL(value));expected.push_back(REAL(r>c ? l(r,c) : u(r,c)));
+                if(copy==0) {rows.push_back(r);initial.push_back(value);}
+            }
+            if(copy==0)columns.push_back(unsigned(rows.size()));
+        }
+    }
+    std::ostringstream out,err;Symbolic_Matrix matrix(n,out,err);
+    matrix.fill_in(rows.data(),columns.data());matrix.csr();
+    matrix.predictLU(rows.data(),columns.data(),initial.data());matrix.leveling();
+    if(matrix.num_lev!=int(n) || matrix.sym_c_ptr!=columns || matrix.sym_r_idx!=rows)
+        throw std::runtime_error("ordinary Fused fixture lost its dense chain layout");
+    DeviceBuffer<unsigned> device_columns(matrix.sym_c_ptr),device_diagonals(matrix.l_col_ptr);
+    DeviceBuffer<int> device_order(matrix.level_idx);
+    Stream stream;
+    for(bool inline_singletons:{false,true}) {
+        auto plan=make_panel_update_plan(matrix,32,false,inline_singletons);
+        sort_deferred_groups_locally(plan,inline_singletons);
+        if(plan.immediate[0].end-plan.immediate[0].begin<=256 ||
+           plan.deferred[31].begin==plan.deferred[31].end)
+            throw std::runtime_error("ordinary Fused fixture lost immediate or deferred updates");
+        std::vector<FusedStep> steps;
+        for(unsigned lev=0;lev<n;++lev)
+            steps.push_back({{unsigned(matrix.level_ptr[lev]),unsigned(matrix.level_ptr[lev+1])},
+                             plan.immediate[lev],plan.deferred[lev]});
+        DeviceBuffer<FusedStep> device_steps(steps);
+        DeviceBuffer<UpdateGroup> device_groups(plan.groups);
+        DeviceBuffer<NormalizedUpdatePair> device_pairs(plan.pairs);
+        DeviceBuffer<REAL> device_values(input);
+        fused_panel_factorize<false,false><<<copies,256,0,stream.value>>>(
+            device_values.data(),matrix.nnz,device_columns.data(),device_diagonals.data(),
+            device_order.data(),device_steps.data(),n,device_groups.data(),nullptr,
+            device_pairs.data(),inline_singletons,REAL(0));
+        check_gpu(cudaGetLastError(),"launch ordinary Fused regression");
+        check_gpu(cudaStreamSynchronize(stream.value),"wait ordinary Fused regression");
+        compare(device_values.read(),expected,"ordinary Fused independent known LU");
+    }
+    std::cout<<"PASS fused/ordinary-groups-immediate-deferred-inline-and-distinct-copies\n";
+}
+
 template <typename Exception, typename Operation>
 void expect_task_rejection(Operation operation, const char* diagnostic)
 {
@@ -1105,6 +1163,65 @@ void test_submission_failure_cleanup()
             "failed task allowed result access");
     }
     std::cout<<"PASS host/submission-failure-drain-and-original-error\n";
+}
+
+void test_task_set_submission_failure_cleanup()
+{
+    unsigned columns[]{0,2,4},rows[]{0,1,0,1};
+    double values[]{4,2,1,3};
+    std::ostringstream out,err;
+    Symbolic_Matrix matrix(2,out,err);
+    matrix.fill_in(rows,columns);matrix.csr();
+    matrix.predictLU(rows,columns,values);matrix.leveling();
+    // A distinct compact order and omitted upper slot exercise both upload paths.
+    const std::vector<unsigned> positions{3,1,0};
+    GpuMatrix gpu(matrix,positions,1,false,UpdateMode::Fused);
+    Buffer<REAL,true> full,compact;
+    constexpr size_t count=2;
+    full.allocate(matrix.nnz,count);compact.allocate(positions.size(),count);
+    for(size_t task=0;task<count;++task) {
+        std::copy(matrix.val.begin(),matrix.val.end(),full.ptr+task*matrix.nnz);
+        for(size_t p=0;p<positions.size();++p)compact.ptr[task*positions.size()+p]=matrix.val[positions[p]];
+    }
+
+    for(bool use_compact:{false,true})for(bool fail_upload:{true,false})for(bool override_sync:{false,true}) {
+        GpuTaskSet tasks({&gpu},{0,0});
+        async_fault::State state{fail_upload,override_sync};
+        async_fault::Scope fault(state);
+        const auto upload=[&] {
+            if(use_compact)tasks.upload_compact_input(compact.ptr,count*positions.size());
+            else tasks.upload_input(full.ptr,count*matrix.nnz);
+        };
+        if(!fail_upload) {
+            upload();
+            if(state.sync_calls!=0)
+                throw std::runtime_error("successful task set upload unexpectedly synchronized");
+        }
+        std::string diagnostic;
+        try {
+            if(fail_upload)upload();else tasks.enqueue();
+        } catch(const std::runtime_error& error) {diagnostic=error.what();}
+        const char* operation=fail_upload ? "upload task set input" : "download task set factors";
+        const std::string expected=std::string(operation)+": "+cudaGetErrorString(async_fault::copy_error);
+        if(diagnostic!=expected)
+            throw std::runtime_error("task set submission failure lost original error: "+diagnostic);
+        // Check the drain before wait/destruction can mask a missing cleanup.
+        // Both pinned source buffers remain alive through all submitted work.
+        if(state.h2d_calls!=1 || state.h2d_submitted!=1 ||
+           state.d2h_calls!=(fail_upload ? 0u : 1u) || !state.same_stream ||
+           state.sync_calls!=1 || state.sync_successes!=1)
+            throw std::runtime_error("task set submission failure did not drain its stream");
+        expect_task_rejection<std::logic_error>([&]{tasks.enqueue();},"failed task set accepted enqueue");
+        expect_task_rejection<std::logic_error>([&]{tasks.upload_input();},"failed task set accepted default upload");
+        expect_task_rejection<std::logic_error>([&]{tasks.upload_input(full.ptr,count*matrix.nnz);},
+            "failed task set accepted full upload");
+        expect_task_rejection<std::logic_error>([&]{tasks.upload_compact_input(compact.ptr,count*positions.size());},
+            "failed task set accepted compact upload");
+        expect_task_rejection<std::logic_error>([&]{tasks.factors(0);},"failed task set allowed result access");
+        expect_task_rejection<std::logic_error>([&]{tasks.check();},"failed task set allowed factor checks");
+        expect_task_rejection<std::runtime_error>([&]{tasks.wait();},"failed task set accepted wait");
+    }
+    std::cout<<"PASS host/task-set-full-compact-failure-drain-and-original-error\n";
 }
 
 void test_fresh_inputs()
@@ -1747,6 +1864,7 @@ int main()
         test_packed_update_groups_codec();
         test_inline_update_groups();
         test_panel_boundaries();
+        test_fused_ordinary_groups();
         for(SnapshotPolicy snapshot:{SnapshotPolicy::Shared,SnapshotPolicy::Device})
             for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped})
                 for(unsigned copies:{1u,3u,33u})for(bool graph:{false,true})
@@ -1756,6 +1874,7 @@ int main()
         test_compact_tile_tails();
         test_auto_snapshot();
         test_submission_failure_cleanup();
+        test_task_set_submission_failure_cleanup();
         test_zero_update_map();
         for (bool one_column : {false,true})
             for (bool perturb : {false,true}) test_distinct_copies(one_column,perturb);

@@ -44,6 +44,16 @@ glu_configure_target(lu_cmd)
 add_executable(glu_bench src/lu_bench.cpp ${GLU_COMMON_SOURCES})
 glu_configure_target(glu_bench)
 
+set(GLU_EXTRA_BENCHMARK_SOURCE "" CACHE FILEPATH "Optional source for an additional numeric benchmark")
+if(GLU_EXTRA_BENCHMARK_SOURCE)
+    if(NOT EXISTS "${GLU_EXTRA_BENCHMARK_SOURCE}" OR IS_DIRECTORY "${GLU_EXTRA_BENCHMARK_SOURCE}")
+        message(FATAL_ERROR "GLU_EXTRA_BENCHMARK_SOURCE must name a source file: ${GLU_EXTRA_BENCHMARK_SOURCE}")
+    endif()
+    set_source_files_properties("${GLU_EXTRA_BENCHMARK_SOURCE}" PROPERTIES LANGUAGE ${GLU_BACKEND})
+    add_executable(glu_extra_bench "${GLU_EXTRA_BENCHMARK_SOURCE}" ${GLU_COMMON_SOURCES})
+    glu_configure_target(glu_extra_bench)
+endif()
+
 option(GLU_BUILD_TESTS "Build GPU numeric regression tests" OFF)
 if(GLU_BUILD_TESTS)
     enable_testing()
@@ -55,6 +65,15 @@ if(GLU_BUILD_TESTS)
     glu_configure_target(gpu-kernel-tests)
     add_test(NAME gpu-kernels COMMAND gpu-kernel-tests)
     set_tests_properties(gpu-kernels PROPERTIES TIMEOUT 120)
+    add_executable(fused-execution-tests tests/fused-execution.cpp
+        src/numeric.cu src/symbolic.cc)
+    glu_configure_target(fused-execution-tests)
+    add_test(NAME fused-execution COMMAND fused-execution-tests)
+    set_tests_properties(fused-execution PROPERTIES TIMEOUT 120)
+    add_executable(task-set-tests tests/task-set.cpp src/numeric.cu src/symbolic.cc)
+    glu_configure_target(task-set-tests)
+    add_test(NAME task-set COMMAND task-set-tests)
+    set_tests_properties(task-set PROPERTIES TIMEOUT 120)
     add_test(NAME cli-output COMMAND ${CMAKE_COMMAND}
         -DGLU_EXECUTABLE=$<TARGET_FILE:lu_cmd>
         -DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/cli-output-test

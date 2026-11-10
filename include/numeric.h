@@ -7,7 +7,10 @@
 using namespace std;
 
 // Execution strategy; its representation is shared by independent value copies.
-enum class UpdateMode { Scan, Mapped, Panel, PanelTiled };
+enum class UpdateMode {
+    Scan, Mapped, Panel, PanelTiled,
+    Fused // One matrix per block, executing the non-dense Panel stages together.
+};
 
 // A snapshot is the immutable default input, restored before each factorization.
 // Caller-provided values bypass this policy and never replace the snapshot.
@@ -56,6 +59,7 @@ private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
     friend class GpuTask;
+    friend class GpuTaskSet;
 };
 
 class GpuTask {
@@ -119,7 +123,40 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// Compatibility entry: one prepared template, one task, one execution.
+// One ordered collection of independent, possibly different Fused templates.
+// Owns one stream and contiguous AoS input/output buffers; shares template plans.
+// Calls on a set are serialized, with the same source/result lifetime and failure
+// rules as GpuTask. Template wrappers may be destroyed after construction.
+class GpuTaskSet {
+public:
+    GpuTaskSet(const std::vector<const GpuMatrix*>& templates,
+               const std::vector<size_t>& task_templates);
+    ~GpuTaskSet();
+    GpuTaskSet(const GpuTaskSet&) = delete;
+    GpuTaskSet& operator=(const GpuTaskSet&) = delete;
+    size_t task_count() const;
+    // Packed in logical task order. Offset(task_count()) is the total size.
+    size_t factor_offset(size_t task) const;
+    size_t compact_input_offset(size_t task) const;
+    size_t device_bytes() const; // Set-owned arrays; shared template plans excluded.
+    size_t pinned_bytes() const; // Output plus the default cache, once allocated.
+    double default_input_setup_ms() const;
+    // Default restoration lazily packs immutable host snapshots once per set.
+    // Explicit inputs contain exactly offset(task_count()) elements, bypass
+    // that cache and reject templates with static pivot perturbation.
+    void upload_input();
+    void upload_input(const REAL* values, size_t elements);
+    void upload_compact_input(const REAL* values, size_t elements);
+    void enqueue(); // Default input is restored when none is queued.
+    void wait(); // All factors are on the host before returning.
+    const REAL* factors(size_t task) const;
+    void check() const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Single-matrix convenience entry used by the solver CLI.
 bool LUonDevice(Symbolic_Matrix &, ostream &, ostream &, bool);
 
 #endif
