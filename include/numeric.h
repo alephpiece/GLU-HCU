@@ -49,7 +49,7 @@ public:
     size_t shared_device_bytes() const;
     size_t update_map_bytes() const;
     double update_map_setup_ms() const; // Counting, construction and upload; zero outside Mapped.
-    size_t update_plan_bytes() const; // Panel groups/pairs and optional dense indices.
+    size_t update_plan_bytes() const; // Prepared update-plan device payload, including Fused metadata.
     double update_plan_setup_ms() const;
     bool uses_native_mmac() const;
     std::string device_name() const;

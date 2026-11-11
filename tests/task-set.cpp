@@ -1,4 +1,5 @@
 #include "numeric.h"
+#include "update-plan.h"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -18,7 +19,7 @@ struct Fixture {
     std::vector<unsigned> positions,fill;
 };
 Fixture fixture(unsigned kind) {
-    const unsigned n=kind==0?40:kind==1?33:5;
+    const unsigned n=kind==0?40:kind==1?33:kind==2?5:160;
     std::vector<unsigned> columns{0},rows;
     std::vector<double> values;
     for(unsigned c=0;c<n;++c) {
@@ -39,6 +40,10 @@ Fixture fixture(unsigned kind) {
     require(kind!=0 || f.a->num_lev==40,"dense fixture lost deferred dependencies");
     require(kind!=1 || (f.fill.size()==11 && f.a->nnz==99),"sparse fixture lost fill");
     require(kind!=2 || f.a->nnz==5,"diagonal fixture changed");
+    if(kind==3) {
+        const auto plan=make_panel_update_plan(*f.a,32,false,true);
+        require(plan.groups.size()>uint64_t(f.a->num_lev)*1024,"wide fixture lost target parallelism");
+    }
     return f;
 }
 std::vector<REAL> input(const Fixture& f,unsigned round,size_t task,bool poison=false) {
@@ -88,11 +93,11 @@ void check(GpuTaskSet& set,const std::vector<Fixture>& fixtures,
         residual(*fixtures[identities[t]].a,source.data()+set.factor_offset(t),set.factors(t));
     }
 }
-void lifecycle() {
+void lifecycle(bool wide) {
     std::vector<Fixture> fixtures;
-    for(unsigned kind=0;kind<3;++kind)fixtures.push_back(fixture(kind));
+    for(unsigned kind=0;kind<3;++kind)fixtures.push_back(fixture(wide && kind==0 ? 3 : kind));
     std::vector<size_t> identities;
-    for(size_t t=0;t<33;++t)identities.push_back((t*7+t/3+2)%3);
+    for(size_t t=0;t<(wide?5:33);++t)identities.push_back((t*7+t/3+2)%3);
     std::unique_ptr<GpuTaskSet> set;
     {
         std::vector<std::unique_ptr<GpuMatrix>> matrices;
@@ -197,7 +202,7 @@ void api_boundaries() {
 
 int main() {
     try {
-        lifecycle();api_boundaries();
+        lifecycle(false);lifecycle(true);api_boundaries();
         std::cout<<"PASS heterogeneous task-set offsets, compact reset, snapshots, lifetime and API boundaries\n";
         return 0;
     } catch(const std::exception& error) {
