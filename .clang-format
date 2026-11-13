@@ -1,0 +1,22 @@
+# Reference formatter: clang-format 18.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ContinuationIndentWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -4
+BreakBeforeBraces: Allman
+PointerAlignment: Left
+AlignAfterOpenBracket: DontAlign
+
+# Expand long declarations; allow calls to pack arguments within the column limit.
+BinPackParameters: false
+BinPackArguments: true
+AllowAllParametersOfDeclarationOnNextLine: false
+AllowAllArgumentsOnNextLine: false
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+SortIncludes: Never
+ReflowComments: false
+BreakStringLiterals: false
