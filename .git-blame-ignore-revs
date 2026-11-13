@@ -1,0 +1,5 @@
+# Ignore non-functional formatting and readability changes.
+# Enable locally with: git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Apply clang-format and clarify execution invariants.
+654ff743d43744b6445225f59d7c888b21608bbb
