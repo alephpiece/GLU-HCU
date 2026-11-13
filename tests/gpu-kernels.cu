@@ -1112,6 +1112,40 @@ void test_fused_ordinary_groups() {
     std::cout<<"PASS fused/ordinary-groups-immediate-deferred-inline-and-distinct-copies\n";
 }
 
+void test_fused_strip_operands() {
+    std::vector<REAL> values(3,REAL(1234)),expected;
+    std::vector<unsigned> destinations;
+    std::vector<NormalizedUpdatePair> pairs;
+    std::vector<DeferredUpdateStrip> strips;
+    for(const auto shape:std::vector<std::pair<unsigned,unsigned>>{{1,2},{17,3},{31,4},{32,7}}) {
+        const unsigned count=shape.first,length=shape.second,first=unsigned(destinations.size()),base=unsigned(pairs.size());
+        for(unsigned lane=0;lane<count;++lane) {
+            destinations.push_back(unsigned(values.size()));values.push_back(REAL(2)+REAL(lane)/64);expected.push_back(values.back());
+        }
+        for(unsigned q=0;q<length;++q)for(unsigned lane=0;lane<count;++lane) {
+            const REAL lower=q%3==0 ? (lane%2 ? -REAL(0):REAL(0)) : REAL(1+lane%5)/64;
+            const REAL pivot=q%3==0 ? (lane%2 ? std::numeric_limits<REAL>::infinity():std::numeric_limits<REAL>::quiet_NaN()) : REAL(1+q+lane%7)/32;
+            const unsigned at=unsigned(values.size());values.push_back(lower);values.push_back(pivot);pairs.push_back({at,at+1});
+            if(lower!=REAL(0))expected[first+lane]-=lower*pivot;
+        }
+        strips.push_back({first,base,count,length});
+    }
+    const std::vector<FusedStep> steps{{{0,0},{0,0},{0,0},{0,unsigned(strips.size())},{0,0}}};
+    DeviceBuffer<FusedStep> device_steps(steps);DeviceBuffer<NormalizedUpdatePair> device_pairs(pairs);
+    DeviceBuffer<DeferredUpdateStrip> device_strips(strips);DeviceBuffer<unsigned> device_destinations(destinations);
+    Stream stream;
+    for(unsigned threads:{256u,1024u}) {
+        DeviceBuffer<REAL> data(values);
+        fused_panel_factorize<false,true><<<1,threads,0,stream.value>>>(data.data(),unsigned(values.size()),nullptr,nullptr,device_steps.data(),1,
+            nullptr,nullptr,device_pairs.data(),device_strips.data(),device_destinations.data(),nullptr,false,REAL(0));
+        check_gpu(cudaGetLastError(),"launch Fused strip operand regression");
+        check_gpu(cudaStreamSynchronize(stream.value),"wait Fused strip operand regression");
+        const auto result=data.read();std::vector<REAL> actual;for(unsigned p:destinations)actual.push_back(result[p]);
+        compare(actual,expected,"Fused strips: odd lengths, masked lanes and zero times nonfinite");
+    }
+    std::cout<<"PASS fused-strip-operands-and-zero-factor-skip\n";
+}
+
 template <typename Exception, typename Operation>
 void expect_task_rejection(Operation operation, const char* diagnostic)
 {
@@ -1875,6 +1909,7 @@ int main()
         test_inline_update_groups();
         test_panel_boundaries();
         test_fused_ordinary_groups();
+        test_fused_strip_operands();
         for(SnapshotPolicy snapshot:{SnapshotPolicy::Shared,SnapshotPolicy::Device})
             for(UpdateMode mode:{UpdateMode::Scan,UpdateMode::Mapped})
                 for(unsigned copies:{1u,3u,33u})for(bool graph:{false,true})

@@ -450,7 +450,17 @@ __device__ void fused_panel_compute(REAL* values,const unsigned* diag,
                 if(lane<strip.count) {
                     const unsigned destination=destinations[strip.destinations+lane];
                     REAL acc=values[destination];
-                    for(unsigned q=0;q<strip.length;++q) {
+                    // Expose independent operands while keeping contribution order.
+                    unsigned q=0;
+                    for(;q+1<strip.length;q+=2) {
+                        const auto first=pairs[strip.pairs+q*strip.count+lane];
+                        const auto second=pairs[strip.pairs+(q+1)*strip.count+lane];
+                        const REAL lower0=values[first.lower],lower1=values[second.lower];
+                        const REAL pivot0=values[first.pivot],pivot1=values[second.pivot];
+                        if(lower0!=REAL(0))acc-=lower0*pivot0;
+                        if(lower1!=REAL(0))acc-=lower1*pivot1;
+                    }
+                    for(;q<strip.length;++q) {
                         const auto pair=pairs[strip.pairs+q*strip.count+lane];
                         const REAL factor=values[pair.lower];
                         if(factor!=REAL(0))acc-=factor*values[pair.pivot];
