@@ -909,11 +909,15 @@ __global__ void scatter_compact_input_soa(REAL* values,
     }
 }
 
+#include "mapped-front.cuh"
+
 struct GpuMatrix::Impl
 {
+    MappedFrontPlan front_plan;
     unsigned n, nnz, slots, max_batch, max_grid_x;
     unsigned fused_block_threads = 256;
     unsigned deferred_columns_count = 0;
+    unsigned single_deferred_columns_count = 0; // Includes medium levels assigned one block per target.
     bool perturb;
     UpdateMode update_mode;
     SnapshotPolicy snapshot_policy;
@@ -948,6 +952,16 @@ struct GpuMatrix::Impl
     Buffer<REAL, true> input;
     Buffer<REAL> initial_values;
     Buffer<unsigned> input_positions;
+
+    bool medium_targets_fit(size_t lev) const
+    {
+        const unsigned width = unsigned(levels[lev + 1] - levels[lev]);
+        return width > 16 && width <= 64 && target_prefix[levels[lev + 1]] - target_prefix[levels[lev]] <= max_grid_x;
+    }
+    bool expands_medium_targets(size_t lev) const
+    {
+        return single_deferred_columns_count > deferred_columns_count && medium_targets_fit(lev);
+    }
 
     unsigned value_pitch(unsigned copies) const
     {
@@ -1134,6 +1148,21 @@ struct GpuMatrix::Impl
             if (deferred.size() > max_grid_x)
                 throw std::invalid_argument("deferred columns exceed device grid limit");
             deferred_columns_count = unsigned(deferred.size());
+            // Keep the existing small-level prefix for SoA batches, then append
+            // the extra single-copy columns normalized at the end of the graph.
+            for (size_t lev = 0; lev + 1 < levels.size(); ++lev)
+            {
+                if (!medium_targets_fit(lev))
+                    continue;
+                const unsigned width = unsigned(levels[lev + 1] - levels[lev]);
+                if (width > max_grid_x - deferred.size())
+                {
+                    deferred.resize(deferred_columns_count);
+                    break;
+                }
+                deferred.insert(deferred.end(), columns.begin() + levels[lev], columns.begin() + levels[lev + 1]);
+            }
+            single_deferred_columns_count = unsigned(deferred.size());
             level_targets.upload(target_prefix);
             deferred_columns.upload(deferred);
             map_setup_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
@@ -1226,6 +1255,7 @@ struct GpuMatrix::Impl
         bases[n] = destinations.size();
         if (destinations.size() != total)
             throw std::logic_error("update map size mismatch");
+        front_plan = make_mapped_front_plan(a, bases);
         map_bases.upload(bases);
         map_destinations.upload(destinations);
         map_pivots.upload(pivots);
@@ -1237,6 +1267,7 @@ struct GpuTask::Impl
     std::shared_ptr<const GpuMatrix::Impl> matrix;
     const SnapshotPolicy snapshot_policy;
     Buffer<REAL> values, scratch, interleaved_values, compact_values;
+    Buffer<REAL> front_values;
     Buffer<REAL, true> output;
     cudaStream_t stream = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
@@ -1258,6 +1289,8 @@ struct GpuTask::Impl
                     matrix->max_grid_x)
                     throw std::invalid_argument("mapped level targets exceed device grid limit");
         values.allocate(matrix->nnz, copies);
+        if (copies == 1 && matrix->front_plan.workspace_elements)
+            front_values.allocate(matrix->front_plan.workspace_elements);
         if (matrix->compact_elements)
             compact_values.allocate(matrix->compact_elements, copies);
         if (soa_stride)
@@ -1426,7 +1459,15 @@ struct GpuTask::Impl
             const int begin = a.levels[lev], end = a.levels[lev + 1], width = end - begin;
             if constexpr (Mode == UpdateMode::Mapped)
             {
-                if (width <= 16)
+                if (front_values.ptr && a.front_plan.starting_at[lev].steps)
+                {
+                    const auto& front = a.front_plan.starting_at[lev];
+                    enqueue_mapped_front<Perturb>(front, values.ptr, front_values.ptr, a.map_destinations.ptr,
+                        a.map_pivots.ptr, a.threshold, stream);
+                    lev += front.steps - 1;
+                    continue;
+                }
+                if (width <= 16 || (!soa && a.expands_medium_targets(lev)))
                 {
                     if (soa && normalize_soa_levels)
                     {
@@ -1533,12 +1574,13 @@ struct GpuTask::Impl
             transpose(false);
         if constexpr (Mode == UpdateMode::Mapped)
         {
-            if (a.deferred_columns_count && !(soa && normalize_soa_levels))
+            const unsigned count = soa ? a.deferred_columns_count : a.single_deferred_columns_count;
+            if (count && !(soa && normalize_soa_levels))
             {
-                // Small-level L remains raw while updates consume L/diagonal.
+                // Target-parallel updates consume the raw L entry divided by its pivot.
                 // Successors never update it. Normalize once for factor output.
                 RL_onecol_factorizeCurrentCol<Perturb, false, true>
-                    <<<dim3(a.deferred_columns_count, copies), column_threads, 0, stream>>>(a.col.ptr, a.row.ptr,
+                    <<<dim3(count, copies), column_threads, 0, stream>>>(a.col.ptr, a.row.ptr,
                         values.ptr, a.diag.ptr, 0, nullptr, 0, a.n, a.nnz, 0, a.threshold, a.deferred_columns.ptr, 0);
                 gpu_check(cudaGetLastError(), "normalize deferred lower columns");
             }
@@ -1605,6 +1647,8 @@ size_t GpuMatrix::task_device_bytes(unsigned copies) const
     size_t bytes = checked_bytes(uint64_t(impl_->nnz) * copies, sizeof(REAL));
     const size_t scratch = checked_bytes(uint64_t(impl_->n) * impl_->slots, sizeof(REAL));
     bytes = checked_sum(bytes, checked_bytes(scratch, copies));
+    if (copies == 1)
+        bytes = checked_sum(bytes, checked_bytes(impl_->front_plan.workspace_elements, sizeof(REAL)));
     if (pitch)
         bytes = checked_sum(bytes, checked_bytes(uint64_t(impl_->nnz) * pitch, sizeof(REAL)));
     bytes = checked_sum(bytes, checked_bytes(uint64_t(impl_->compact_elements) * copies, sizeof(REAL)));
@@ -1694,8 +1738,15 @@ size_t GpuTask::numeric_launches() const
         const unsigned width = unsigned(a.levels[lev + 1] - a.levels[lev]);
         if (a.update_mode == UpdateMode::Mapped)
         {
+            if (t.front_values.ptr && a.front_plan.starting_at[lev].steps)
+            {
+                const auto& front = a.front_plan.starting_at[lev];
+                count += front.numeric_launches();
+                lev += front.steps - 1;
+                continue;
+            }
             const bool targets = a.target_prefix[a.levels[lev + 1]] > a.target_prefix[a.levels[lev]];
-            if (width > 16)
+            if (width > 16 && (t.soa_stride || !a.expands_medium_targets(lev)))
                 count += t.soa_stride ? 1 + targets : 1;
             else
                 count += targets + (t.soa_stride && normalize_soa_levels);
@@ -1706,7 +1757,8 @@ size_t GpuTask::numeric_launches() const
             for (int p = a.levels[lev]; p < a.levels[lev + 1]; ++p)
                 count += 2 + (a.csr_rows[a.columns[p] + 1] > a.csr_diags[a.columns[p]] + 1);
     }
-    if (a.update_mode == UpdateMode::Mapped && a.deferred_columns_count && !(t.soa_stride && normalize_soa_levels))
+    const unsigned deferred = t.soa_stride ? a.deferred_columns_count : a.single_deferred_columns_count;
+    if (a.update_mode == UpdateMode::Mapped && deferred && !(t.soa_stride && normalize_soa_levels))
         ++count;
     return count;
 }
@@ -1720,6 +1772,11 @@ size_t GpuTask::numeric_wide_blocks() const
     for (size_t lev = 0; lev + 1 < a.levels.size(); ++lev)
         if (a.levels[lev + 1] - a.levels[lev] > 16)
         {
+            if (a.update_mode == UpdateMode::Mapped && !t.soa_stride && a.expands_medium_targets(lev))
+            {
+                columns += a.target_prefix[a.levels[lev + 1]] - a.target_prefix[a.levels[lev]];
+                continue;
+            }
             columns += a.levels[lev + 1] - a.levels[lev];
             if (t.soa_stride)
                 columns += a.target_prefix[a.levels[lev + 1]] - a.target_prefix[a.levels[lev]];

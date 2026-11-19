@@ -417,7 +417,7 @@ void verify_template_bytes(const GpuMatrix& gpu,
     {
         extra = sizeof(uint64_t) * (matrix.level_idx.size() + 1);
         for (size_t lev = 0; lev + 1 < matrix.level_ptr.size(); ++lev)
-            if (matrix.level_ptr[lev + 1] - matrix.level_ptr[lev] <= 16)
+            if (matrix.level_ptr[lev + 1] - matrix.level_ptr[lev] <= 64)
                 extra += sizeof(int) * size_t(matrix.level_ptr[lev + 1] - matrix.level_ptr[lev]);
     }
     for (unsigned copies : {1u, 2u, 3u, 31u, 32u, 33u, 42u})
@@ -2150,6 +2150,154 @@ void test_auto_snapshot()
     std::cout << "PASS host/auto-snapshot-per-task-policy-override-and-graph-stability\n";
 }
 
+void test_mapped_level_grids(unsigned width, bool targets, unsigned copies)
+{
+    const unsigned n = width + 3;
+    std::vector<unsigned> rows, columns{0};
+    std::vector<double> input;
+    for (unsigned c = 0; c < n; ++c)
+    {
+        for (unsigned r = 0; r < n; ++r)
+            if (r == c || (c < width && r >= width) || (targets && c >= width))
+            {
+                rows.push_back(r);
+                input.push_back(r == c ? 8.0 + r % 3 : double(int((r + 3 * c) % 9) - 4) / 512);
+            }
+        columns.push_back(unsigned(rows.size()));
+    }
+    std::ostringstream out, err;
+    Symbolic_Matrix matrix(n, out, err);
+    matrix.fill_in(rows.data(), columns.data());
+    matrix.csr();
+    matrix.predictLU(rows.data(), columns.data(), input.data());
+    matrix.leveling();
+    if (matrix.level_ptr[1] != int(width))
+        throw std::runtime_error("unexpected mapped grid test structure");
+    GpuMatrix gpu(matrix, 32, false, UpdateMode::Mapped);
+    GpuTask task(gpu, copies);
+    const unsigned updates = targets ? 3 * width : 0;
+    unsigned expected = 0;
+    if (width > 16)
+        expected = copies > 1 ? width + updates : width <= 64 ? updates : width;
+    if (task.numeric_wide_blocks() != expected)
+        throw std::runtime_error("incorrect mapped level grid");
+    task.prepare_graph();
+    task.enqueue();
+    task.wait();
+    task.check();
+    for (unsigned copy = 0; copy < copies; ++copy)
+        if (!(matrix.factor_residual(task.factors(copy)) <= (sizeof(REAL) == 8 ? 2.e-12 : 2.e-5)))
+            throw std::runtime_error("mapped level grid factor residual");
+}
+
+void test_mapped_front(unsigned steps, unsigned copies, bool perturb, bool graph)
+{
+    // Interleaved exterior rows and columns form a rectangular front whose
+    // entries occupy different sparse slots in each target column.
+    const unsigned n = steps + 13;
+    std::vector<unsigned> rows, columns{0};
+    std::vector<double> input;
+    for (unsigned c = 0; c < n; ++c)
+    {
+        for (unsigned r = 0; r < n; ++r)
+        {
+            const bool front_row = r < steps || (r - steps) % 2 == 0;
+            const bool front_column = c < steps || (c - steps) % 2 == 1;
+            if (r != c && !(front_row && front_column))
+                continue;
+            rows.push_back(r);
+            const double diagonal = perturb && r == 17 ? 1.e-7 : 8.0 + c % 3;
+            input.push_back(r == c ? diagonal : double(int((7 * r + 11 * c) % 17) - 8) / 4096);
+        }
+        columns.push_back(unsigned(rows.size()));
+    }
+    // U(2,6) = 1 - round((1 + eps) * (1 - eps)). A contracted
+    // multiply-add would leave eps^2. The second source has L(2,1) = 0.
+    const double eps = std::numeric_limits<REAL>::epsilon();
+    input[0] = 1;
+    input[2] = 1 + eps;
+    input[columns[1]] = input[columns[1] + 2] = 0;
+    input[columns[6]] = 1 - eps;
+    input[columns[6] + 2] = 1;
+#if defined(GLU_USE_FP32)
+    // U(1,2..5) each receives just one update with L(1,0) = 1. These
+    // distinguish flushing either sign of the sum, the initial value and the addend.
+    const double minimum = std::numeric_limits<float>::min();
+    input[1] = 1;
+    input[columns[2]] = minimum;
+    input[columns[2] + 1] = minimum + std::numeric_limits<float>::denorm_min();
+    input[columns[3]] = minimum;
+    input[columns[3] + 1] = minimum / 2;
+    input[columns[4]] = -minimum / 2;
+    input[columns[4] + 1] = minimum;
+    input[columns[5]] = minimum + std::numeric_limits<float>::denorm_min();
+    input[columns[5] + 1] = minimum;
+#endif
+    std::ostringstream out, err;
+    Symbolic_Matrix matrix(n, out, err);
+    matrix.fill_in(rows.data(), columns.data());
+    matrix.csr();
+    matrix.predictLU(rows.data(), columns.data(), input.data());
+    matrix.leveling();
+    GpuMatrix mapped(matrix, 32, perturb, UpdateMode::Mapped), scan(matrix, 32, perturb, UpdateMode::Scan);
+    GpuTask task(mapped, copies), reference(scan, copies);
+    const size_t ordinary_bytes = size_t(matrix.nnz) * (copies + task.soa_value_stride()) * sizeof(REAL);
+    const bool blocked = steps >= 32 && copies == 1;
+    if ((mapped.task_device_bytes(copies) > ordinary_bytes) != blocked || (blocked && task.numeric_launches() >= steps))
+        throw std::runtime_error("incorrect mapped front workspace or launch count");
+    if (graph)
+    {
+        task.prepare_graph();
+        reference.prepare_graph();
+    }
+    std::vector<REAL> fresh(size_t(copies) * matrix.nnz);
+    for (unsigned copy = 0; copy < copies; ++copy)
+        for (unsigned i = 0; i < matrix.nnz; ++i)
+            fresh[size_t(copy) * matrix.nnz + i] = matrix.val[i] * (REAL(1) + REAL(copy + 1) / 8 + REAL(i % 5) / 64);
+    for (bool new_values : {false, true, false})
+    {
+        if (new_values)
+        {
+            if (perturb)
+                continue;
+            task.upload_input(fresh.data(), fresh.size());
+            reference.upload_input(fresh.data(), fresh.size());
+        }
+        task.enqueue();
+        reference.enqueue();
+        task.wait();
+        reference.wait();
+        task.check();
+        reference.check();
+        for (unsigned copy = 0; copy < copies; ++copy)
+        {
+            const auto* factors = task.factors(copy);
+            const auto* other = reference.factors(copy);
+            compare({factors, factors + matrix.nnz}, {other, other + matrix.nnz}, "mapped rectangular front vs Scan");
+            const unsigned rounded = matrix.sym_c_ptr[6] + 2;
+            if (!new_values && (other[rounded] != 0 || factors[rounded] != 0))
+                throw std::runtime_error("mapped front must round the product before subtracting at U(2,6)");
+#if defined(GLU_USE_FP32)
+            for (unsigned c = 2; c <= 5; ++c)
+            {
+                const unsigned position = matrix.sym_c_ptr[c] + 1;
+                if (std::memcmp(factors + position, other + position, sizeof(REAL)) != 0)
+                    throw std::runtime_error("mapped front differs from sparse FP32 atomic add at U(1," +
+                                             std::to_string(c) + ")");
+            }
+#endif
+            if (!perturb)
+            {
+                Symbolic_Matrix oracle(matrix);
+                if (new_values)
+                    std::copy_n(fresh.data() + size_t(copy) * matrix.nnz, matrix.nnz, oracle.val.begin());
+                if (!(oracle.factor_residual(factors) <= (sizeof(REAL) == 8 ? 2.e-12 : 2.e-5)))
+                    throw std::runtime_error("mapped rectangular front factor residual");
+            }
+        }
+    }
+}
+
 void test_invalid_factor(REAL value, const char* diagnostic)
 {
     unsigned column[]{0, 1}, row[]{0};
@@ -2509,6 +2657,18 @@ int main()
         test_batched(empty_lower, 64, true, "RL_perturb/empty-lower");
         test_one_column(empty_lower, true, "one-column/empty-lower");
         test_limited_slots();
+        for (unsigned width : {16u, 17u, 64u, 65u})
+            for (bool targets : {false, true})
+                for (unsigned copies : {1u, 3u})
+                    test_mapped_level_grids(width, targets, copies);
+        for (bool graph : {false, true})
+            for (bool perturb : {false, true})
+            {
+                test_mapped_front(31, 1, perturb, graph);
+                test_mapped_front(32, 1, perturb, graph);
+                test_mapped_front(39, 1, perturb, graph);
+                test_mapped_front(39, 3, perturb, graph);
+            }
         for (UpdateMode mode : {UpdateMode::Scan, UpdateMode::Mapped})
             for (bool graph : {false, true})
                 for (unsigned copies : {1u, 2u, 3u, 16u, 33u, 42u})
