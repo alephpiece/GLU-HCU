@@ -2150,6 +2150,80 @@ void test_auto_snapshot()
     std::cout << "PASS host/auto-snapshot-per-task-policy-override-and-graph-stability\n";
 }
 
+void test_mapped_front(unsigned steps, unsigned copies, bool perturb, bool graph)
+{
+    // Interleaved exterior rows and columns form a rectangular front whose
+    // entries occupy different sparse slots in each target column.
+    const unsigned n = steps + 13;
+    std::vector<unsigned> rows, columns{0};
+    std::vector<double> input;
+    for (unsigned c = 0; c < n; ++c)
+    {
+        for (unsigned r = 0; r < n; ++r)
+        {
+            const bool front_row = r < steps || (r - steps) % 2 == 0;
+            const bool front_column = c < steps || (c - steps) % 2 == 1;
+            if (r != c && !(front_row && front_column))
+                continue;
+            rows.push_back(r);
+            const double diagonal = perturb && r == 17 ? 1.e-7 : 8.0 + c % 3;
+            input.push_back(r == c ? diagonal : double(int((7 * r + 11 * c) % 17) - 8) / 4096);
+        }
+        columns.push_back(unsigned(rows.size()));
+    }
+    std::ostringstream out, err;
+    Symbolic_Matrix matrix(n, out, err);
+    matrix.fill_in(rows.data(), columns.data());
+    matrix.csr();
+    matrix.predictLU(rows.data(), columns.data(), input.data());
+    matrix.leveling();
+    GpuMatrix mapped(matrix, 32, perturb, UpdateMode::Mapped), scan(matrix, 32, perturb, UpdateMode::Scan);
+    GpuTask task(mapped, copies), reference(scan, copies);
+    const size_t ordinary_bytes = size_t(matrix.nnz) * (copies + task.soa_value_stride()) * sizeof(REAL);
+    const bool blocked = steps >= 32 && copies == 1;
+    if ((mapped.task_device_bytes(copies) > ordinary_bytes) != blocked || (blocked && task.numeric_launches() >= steps))
+        throw std::runtime_error("incorrect mapped front workspace or launch count");
+    if (graph)
+    {
+        task.prepare_graph();
+        reference.prepare_graph();
+    }
+    std::vector<REAL> fresh(size_t(copies) * matrix.nnz);
+    for (unsigned copy = 0; copy < copies; ++copy)
+        for (unsigned i = 0; i < matrix.nnz; ++i)
+            fresh[size_t(copy) * matrix.nnz + i] = matrix.val[i] * (REAL(1) + REAL(copy + 1) / 8 + REAL(i % 5) / 64);
+    for (bool new_values : {false, true, false})
+    {
+        if (new_values)
+        {
+            if (perturb)
+                continue;
+            task.upload_input(fresh.data(), fresh.size());
+            reference.upload_input(fresh.data(), fresh.size());
+        }
+        task.enqueue();
+        reference.enqueue();
+        task.wait();
+        reference.wait();
+        task.check();
+        reference.check();
+        for (unsigned copy = 0; copy < copies; ++copy)
+        {
+            const auto* factors = task.factors(copy);
+            const auto* other = reference.factors(copy);
+            compare({factors, factors + matrix.nnz}, {other, other + matrix.nnz}, "mapped rectangular front vs Scan");
+            if (!perturb)
+            {
+                Symbolic_Matrix oracle(matrix);
+                if (new_values)
+                    std::copy_n(fresh.data() + size_t(copy) * matrix.nnz, matrix.nnz, oracle.val.begin());
+                if (!(oracle.factor_residual(factors) <= (sizeof(REAL) == 8 ? 2.e-12 : 2.e-5)))
+                    throw std::runtime_error("mapped rectangular front factor residual");
+            }
+        }
+    }
+}
+
 void test_invalid_factor(REAL value, const char* diagnostic)
 {
     unsigned column[]{0, 1}, row[]{0};
@@ -2509,6 +2583,14 @@ int main()
         test_batched(empty_lower, 64, true, "RL_perturb/empty-lower");
         test_one_column(empty_lower, true, "one-column/empty-lower");
         test_limited_slots();
+        for (bool graph : {false, true})
+            for (bool perturb : {false, true})
+            {
+                test_mapped_front(31, 1, perturb, graph);
+                test_mapped_front(32, 1, perturb, graph);
+                test_mapped_front(39, 1, perturb, graph);
+                test_mapped_front(39, 3, perturb, graph);
+            }
         for (UpdateMode mode : {UpdateMode::Scan, UpdateMode::Mapped})
             for (bool graph : {false, true})
                 for (unsigned copies : {1u, 2u, 3u, 16u, 33u, 42u})

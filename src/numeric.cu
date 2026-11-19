@@ -909,8 +909,11 @@ __global__ void scatter_compact_input_soa(REAL* values,
     }
 }
 
+#include "mapped-front.cuh"
+
 struct GpuMatrix::Impl
 {
+    MappedFrontPlan front_plan;
     unsigned n, nnz, slots, max_batch, max_grid_x;
     unsigned fused_block_threads = 256;
     unsigned deferred_columns_count = 0;
@@ -1226,6 +1229,7 @@ struct GpuMatrix::Impl
         bases[n] = destinations.size();
         if (destinations.size() != total)
             throw std::logic_error("update map size mismatch");
+        front_plan = make_mapped_front_plan(a, bases);
         map_bases.upload(bases);
         map_destinations.upload(destinations);
         map_pivots.upload(pivots);
@@ -1237,6 +1241,7 @@ struct GpuTask::Impl
     std::shared_ptr<const GpuMatrix::Impl> matrix;
     const SnapshotPolicy snapshot_policy;
     Buffer<REAL> values, scratch, interleaved_values, compact_values;
+    Buffer<REAL> front_values;
     Buffer<REAL, true> output;
     cudaStream_t stream = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
@@ -1258,6 +1263,8 @@ struct GpuTask::Impl
                     matrix->max_grid_x)
                     throw std::invalid_argument("mapped level targets exceed device grid limit");
         values.allocate(matrix->nnz, copies);
+        if (copies == 1 && matrix->front_plan.workspace_elements)
+            front_values.allocate(matrix->front_plan.workspace_elements);
         if (matrix->compact_elements)
             compact_values.allocate(matrix->compact_elements, copies);
         if (soa_stride)
@@ -1426,6 +1433,14 @@ struct GpuTask::Impl
             const int begin = a.levels[lev], end = a.levels[lev + 1], width = end - begin;
             if constexpr (Mode == UpdateMode::Mapped)
             {
+                if (front_values.ptr && a.front_plan.starting_at[lev].steps)
+                {
+                    const auto& front = a.front_plan.starting_at[lev];
+                    enqueue_mapped_front<Perturb>(front, values.ptr, front_values.ptr, a.map_destinations.ptr,
+                        a.map_pivots.ptr, a.threshold, stream);
+                    lev += front.steps - 1;
+                    continue;
+                }
                 if (width <= 16)
                 {
                     if (soa && normalize_soa_levels)
@@ -1605,6 +1620,8 @@ size_t GpuMatrix::task_device_bytes(unsigned copies) const
     size_t bytes = checked_bytes(uint64_t(impl_->nnz) * copies, sizeof(REAL));
     const size_t scratch = checked_bytes(uint64_t(impl_->n) * impl_->slots, sizeof(REAL));
     bytes = checked_sum(bytes, checked_bytes(scratch, copies));
+    if (copies == 1)
+        bytes = checked_sum(bytes, checked_bytes(impl_->front_plan.workspace_elements, sizeof(REAL)));
     if (pitch)
         bytes = checked_sum(bytes, checked_bytes(uint64_t(impl_->nnz) * pitch, sizeof(REAL)));
     bytes = checked_sum(bytes, checked_bytes(uint64_t(impl_->compact_elements) * copies, sizeof(REAL)));
@@ -1694,6 +1711,13 @@ size_t GpuTask::numeric_launches() const
         const unsigned width = unsigned(a.levels[lev + 1] - a.levels[lev]);
         if (a.update_mode == UpdateMode::Mapped)
         {
+            if (t.front_values.ptr && a.front_plan.starting_at[lev].steps)
+            {
+                const auto& front = a.front_plan.starting_at[lev];
+                count += front.numeric_launches();
+                lev += front.steps - 1;
+                continue;
+            }
             const bool targets = a.target_prefix[a.levels[lev + 1]] > a.target_prefix[a.levels[lev]];
             if (width > 16)
                 count += t.soa_stride ? 1 + targets : 1;
