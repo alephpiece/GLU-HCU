@@ -2211,6 +2211,28 @@ void test_mapped_front(unsigned steps, unsigned copies, bool perturb, bool graph
         }
         columns.push_back(unsigned(rows.size()));
     }
+    // U(2,6) = 1 - round((1 + eps) * (1 - eps)). A contracted
+    // multiply-add would leave eps^2. The second source has L(2,1) = 0.
+    const double eps = std::numeric_limits<REAL>::epsilon();
+    input[0] = 1;
+    input[2] = 1 + eps;
+    input[columns[1]] = input[columns[1] + 2] = 0;
+    input[columns[6]] = 1 - eps;
+    input[columns[6] + 2] = 1;
+#if defined(GLU_USE_FP32)
+    // U(1,2..5) each receives just one update with L(1,0) = 1. These
+    // distinguish flushing either sign of the sum, the initial value and the addend.
+    const double minimum = std::numeric_limits<float>::min();
+    input[1] = 1;
+    input[columns[2]] = minimum;
+    input[columns[2] + 1] = minimum + std::numeric_limits<float>::denorm_min();
+    input[columns[3]] = minimum;
+    input[columns[3] + 1] = minimum / 2;
+    input[columns[4]] = -minimum / 2;
+    input[columns[4] + 1] = minimum;
+    input[columns[5]] = minimum + std::numeric_limits<float>::denorm_min();
+    input[columns[5] + 1] = minimum;
+#endif
     std::ostringstream out, err;
     Symbolic_Matrix matrix(n, out, err);
     matrix.fill_in(rows.data(), columns.data());
@@ -2252,6 +2274,18 @@ void test_mapped_front(unsigned steps, unsigned copies, bool perturb, bool graph
             const auto* factors = task.factors(copy);
             const auto* other = reference.factors(copy);
             compare({factors, factors + matrix.nnz}, {other, other + matrix.nnz}, "mapped rectangular front vs Scan");
+            const unsigned rounded = matrix.sym_c_ptr[6] + 2;
+            if (!new_values && (other[rounded] != 0 || factors[rounded] != 0))
+                throw std::runtime_error("mapped front must round the product before subtracting at U(2,6)");
+#if defined(GLU_USE_FP32)
+            for (unsigned c = 2; c <= 5; ++c)
+            {
+                const unsigned position = matrix.sym_c_ptr[c] + 1;
+                if (std::memcmp(factors + position, other + position, sizeof(REAL)) != 0)
+                    throw std::runtime_error("mapped front differs from sparse FP32 atomic add at U(1," +
+                                             std::to_string(c) + ")");
+            }
+#endif
             if (!perturb)
             {
                 Symbolic_Matrix oracle(matrix);

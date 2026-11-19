@@ -37,13 +37,37 @@ template <bool Perturb> __device__ inline REAL mapped_front_divisor(REAL value, 
     return value;
 }
 
-// Match the single-source sparse update's rounded product before accumulation.
-__device__ inline REAL mapped_front_subtract(REAL value, REAL factor, REAL pivot)
+// Each destination has a unique writer throughout this kernel.
+__device__ inline REAL mapped_front_subtract(REAL value, REAL factor, REAL pivot, REAL* destination)
 {
+#if defined(GLU_USE_HIP)
+    // HIP headers may implement the rounded multiply with the ordinary operator.
+#pragma clang fp contract(off)
+#endif
     if (factor == REAL(0))
         return value;
 #if defined(GLU_USE_FP32)
-    return value + __fmul_rn(-factor, pivot);
+    const float product = __fmul_rn(-factor, pivot);
+#if defined(GLU_USE_HIP)
+    // HIP global atomicAdd can flush subnormals independently of the scalar
+    // arithmetic mode. At |x| >= 2^-101 even half the spacing below x is
+    // at least FLT_MIN. A subnormal cannot change it, and cancellation with
+    // another normal cannot produce a subnormal. Use the actual atomic for
+    // tiny operands so other HIP targets inherit their own atomic semantics.
+    const unsigned magnitude = max(__float_as_uint(value) & 0x7fffffffu, __float_as_uint(product) & 0x7fffffffu);
+    if (magnitude != 0 && magnitude < __float_as_uint(0x1p-101f))
+    {
+        *destination = value;
+        atomicAdd(destination, product);
+        return *destination;
+    }
+    return value + product;
+#else
+    // CUDA global atomicAdd flushes FP32 inputs and results to signed zero.
+    float sum;
+    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(sum) : "f"(value), "f"(product));
+    return sum;
+#endif
 #else
     return value + __dmul_rn(-factor, pivot);
 #endif
@@ -65,7 +89,7 @@ __global__ void mapped_front_diagonal(REAL* dense, unsigned ld, unsigned offset,
             normalized[r] = tile[k][r] / mapped_front_divisor<Perturb>(tile[k][k], threshold);
         __syncthreads();
         if (active && r > k && c > k)
-            tile[c][r] = mapped_front_subtract(tile[c][r], normalized[r], tile[c][k]);
+            tile[c][r] = mapped_front_subtract(tile[c][r], normalized[r], tile[c][k], dense + slot);
         __syncthreads();
     }
     if (active)
@@ -105,11 +129,11 @@ __global__ void mapped_front_edges(REAL* dense,
             const REAL factor = panel[k] / mapped_front_divisor<Perturb>(tile[k][k], threshold);
             lower[k * rows + outer] = factor;
             for (unsigned j = k + 1; j < steps; ++j)
-                panel[j] = mapped_front_subtract(panel[j], factor, tile[j][k]);
+                panel[j] = mapped_front_subtract(panel[j], factor, tile[j][k], dense + outer + (offset + j) * rows);
         }
         else
             for (unsigned i = k + 1; i < steps; ++i)
-                panel[i] = mapped_front_subtract(panel[i], tile[k][i], panel[k]);
+                panel[i] = mapped_front_subtract(panel[i], tile[k][i], panel[k], dense + offset + i + outer * rows);
     }
     for (unsigned k = 0; k < steps; ++k)
     {
@@ -134,7 +158,7 @@ mapped_front_schur(REAL* dense, const REAL* lower, unsigned rows, unsigned cols,
     {
         REAL value = dense[c * rows + r];
         for (unsigned k = 0; k < steps; ++k)
-            value = mapped_front_subtract(value, l[k][x], u[y][k]);
+            value = mapped_front_subtract(value, l[k][x], u[y][k], dense + c * rows + r);
         dense[c * rows + r] = value;
     }
 }
