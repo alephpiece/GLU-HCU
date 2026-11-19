@@ -48,25 +48,22 @@ __device__ inline REAL mapped_front_subtract(REAL value, REAL factor, REAL pivot
         return value;
 #if defined(GLU_USE_FP32)
     const float product = __fmul_rn(-factor, pivot);
-#if defined(GLU_USE_HIP)
-    // HIP global atomicAdd can flush subnormals independently of the scalar
-    // arithmetic mode. At |x| >= 2^-101 even half the spacing below x is
-    // at least FLT_MIN. A subnormal cannot change it, and cancellation with
-    // another normal cannot produce a subnormal. Use the actual atomic for
-    // tiny operands so other HIP targets inherit their own atomic semantics.
-    const unsigned magnitude = max(__float_as_uint(value) & 0x7fffffffu, __float_as_uint(product) & 0x7fffffffu);
-    if (magnitude != 0 && magnitude < __float_as_uint(0x1p-101f))
-    {
-        *destination = value;
-        atomicAdd(destination, product);
-        return *destination;
-    }
-    return value + product;
-#else
+#if !defined(GLU_USE_HIP)
     // CUDA global atomicAdd flushes FP32 inputs and results to signed zero.
     float sum;
     asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(sum) : "f"(value), "f"(product));
     return sum;
+#elif defined(__gfx936__)
+    // Multiplication by one is exact. This instruction flushes subnormals
+    // on the add, matching gfx936 global atomicAdd.
+    float sum;
+    asm("v_mad_f32 %0, 1.0, %1, %2" : "=v"(sum) : "v"(value), "v"(product));
+    return sum;
+#else
+    // Use this HIP target's actual atomic arithmetic on the private destination.
+    *destination = value;
+    atomicAdd(destination, product);
+    return *destination;
 #endif
 #else
     return value + __dmul_rn(-factor, pivot);
