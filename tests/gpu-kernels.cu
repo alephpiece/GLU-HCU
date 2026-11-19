@@ -417,7 +417,7 @@ void verify_template_bytes(const GpuMatrix& gpu,
     {
         extra = sizeof(uint64_t) * (matrix.level_idx.size() + 1);
         for (size_t lev = 0; lev + 1 < matrix.level_ptr.size(); ++lev)
-            if (matrix.level_ptr[lev + 1] - matrix.level_ptr[lev] <= 16)
+            if (matrix.level_ptr[lev + 1] - matrix.level_ptr[lev] <= 64)
                 extra += sizeof(int) * size_t(matrix.level_ptr[lev + 1] - matrix.level_ptr[lev]);
     }
     for (unsigned copies : {1u, 2u, 3u, 31u, 32u, 33u, 42u})
@@ -2150,6 +2150,46 @@ void test_auto_snapshot()
     std::cout << "PASS host/auto-snapshot-per-task-policy-override-and-graph-stability\n";
 }
 
+void test_mapped_level_grids(unsigned width, bool targets, unsigned copies)
+{
+    const unsigned n = width + 3;
+    std::vector<unsigned> rows, columns{0};
+    std::vector<double> input;
+    for (unsigned c = 0; c < n; ++c)
+    {
+        for (unsigned r = 0; r < n; ++r)
+            if (r == c || (c < width && r >= width) || (targets && c >= width))
+            {
+                rows.push_back(r);
+                input.push_back(r == c ? 8.0 + r % 3 : double(int((r + 3 * c) % 9) - 4) / 512);
+            }
+        columns.push_back(unsigned(rows.size()));
+    }
+    std::ostringstream out, err;
+    Symbolic_Matrix matrix(n, out, err);
+    matrix.fill_in(rows.data(), columns.data());
+    matrix.csr();
+    matrix.predictLU(rows.data(), columns.data(), input.data());
+    matrix.leveling();
+    if (matrix.level_ptr[1] != int(width))
+        throw std::runtime_error("unexpected mapped grid test structure");
+    GpuMatrix gpu(matrix, 32, false, UpdateMode::Mapped);
+    GpuTask task(gpu, copies);
+    const unsigned updates = targets ? 3 * width : 0;
+    unsigned expected = 0;
+    if (width > 16)
+        expected = copies > 1 ? width + updates : width <= 64 ? updates : width;
+    if (task.numeric_wide_blocks() != expected)
+        throw std::runtime_error("incorrect mapped level grid");
+    task.prepare_graph();
+    task.enqueue();
+    task.wait();
+    task.check();
+    for (unsigned copy = 0; copy < copies; ++copy)
+        if (!(matrix.factor_residual(task.factors(copy)) <= (sizeof(REAL) == 8 ? 2.e-12 : 2.e-5)))
+            throw std::runtime_error("mapped level grid factor residual");
+}
+
 void test_mapped_front(unsigned steps, unsigned copies, bool perturb, bool graph)
 {
     // Interleaved exterior rows and columns form a rectangular front whose
@@ -2583,6 +2623,10 @@ int main()
         test_batched(empty_lower, 64, true, "RL_perturb/empty-lower");
         test_one_column(empty_lower, true, "one-column/empty-lower");
         test_limited_slots();
+        for (unsigned width : {16u, 17u, 64u, 65u})
+            for (bool targets : {false, true})
+                for (unsigned copies : {1u, 3u})
+                    test_mapped_level_grids(width, targets, copies);
         for (bool graph : {false, true})
             for (bool perturb : {false, true})
             {
