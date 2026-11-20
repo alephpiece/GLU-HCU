@@ -95,6 +95,53 @@ static int ReadHeader2(FILE *f, uint__t *m, uint__t *n, uint__t *nnz)
 	return NICS_OK;
 }
 
+
+/* Accelerate ordinary decimal triples only. Preserve the original scanner for
+   nonseekable inputs, cross-line triples, long lines and other number syntax. */
+static int PlainIndex(char **cursor, uint__t n, uint__t *offset)
+{
+    char *p = *cursor, *first;
+    uint__t value = 0;
+    while (*p == ' ' || *p == '\t') ++p;
+    first = p;
+    while (*p >= '0' && *p <= '9') {
+        value = value * 10 + (uint__t)(*p - '0');
+        ++p;
+    }
+    /* A nine-digit fast path is representable for both NICSLU index widths. */
+    if (p == first || p - first > 9 || value == 0 || value > n ||
+        (*p != ' ' && *p != '\t')) return 0;
+    *offset = value - 1;
+    *cursor = p;
+    return 1;
+}
+
+static int ReadPlainColumnTriples(FILE *fp, uint__t n, uint__t nnz,
+                                  uint__t *rows, uint__t *cols, real__t *values)
+{
+    char line[256];
+    fpos_t start;
+    uint__t i;
+    if (fgetpos(fp, &start) != 0) return 0;
+    for (i = 0; i < nnz; ++i) {
+        char *p = line, *number, *end;
+        if (!fgets(line, sizeof(line), fp) || !PlainIndex(&p, n, &rows[i]) ||
+            !PlainIndex(&p, n, &cols[i])) goto fallback;
+        while (*p == ' ' || *p == '\t') ++p;
+        number = p;
+        if (*number == '-' || *number == '+') ++number;
+        if ((*number < '0' || *number > '9') && *number != '.') goto fallback;
+        if (*number == '0' && (number[1] == 'x' || number[1] == 'X')) goto fallback;
+        values[i] = strtod(p, &end);
+        if (p == end) goto fallback;
+        while (*end == ' ' || *end == '\t' || *end == '\r') ++end;
+        if (*end != '\n') goto fallback;
+    }
+    return 1;
+fallback:
+    return fsetpos(fp, &start) == 0 ? 0 : -1;
+}
+
 int NicsLU_ReadTripletColumnToSparse(char *file, uint__t *n, uint__t *nnz, \
 									 real__t **ax, uint__t **ai, uint__t **ap)
 {
@@ -102,7 +149,7 @@ int NicsLU_ReadTripletColumnToSparse(char *file, uint__t *n, uint__t *nnz, \
 	int err;
 	uint__t m, *aj, i, j;
 	uint__t pre, cur, num;
-	int cnt;
+	int cnt, plain;
 
 	if (NULL == file || NULL == n || NULL == nnz \
 		|| NULL == ax || NULL == ai || NULL == ap) return NICSLU_ARGUMENT_ERROR;
@@ -164,7 +211,13 @@ int NicsLU_ReadTripletColumnToSparse(char *file, uint__t *n, uint__t *nnz, \
 		return NICSLU_MEMORY_OVERFLOW;
 	}
 
-	for (i=0; i<*nnz; ++i)
+	plain = ReadPlainColumnTriples(fp, *n, *nnz, *ai, aj, *ax);
+	if (plain < 0) {
+		free(aj);
+		fclose(fp);
+		return NICSLU_GENERAL_FAIL;
+	}
+	for (i=0; !plain && i<*nnz; ++i)
 	{
 #ifdef INT64__
 #ifdef _WIN32
