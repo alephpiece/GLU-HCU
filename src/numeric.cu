@@ -863,6 +863,120 @@ template <class T, bool Pinned = false> struct Buffer
             gpu_check(cudaMemcpy(ptr, input.data(), bytes, cudaMemcpyHostToDevice), "upload structure");
     }
 };
+
+// CSC and CSR enumerate the same upper entries in different orders. Preserve
+// the first CSC slot when several entries have the same row.
+std::vector<unsigned> mapped_pivot_slots(const Symbolic_Matrix& a, const std::vector<uint64_t>& bases,
+    std::vector<unsigned>* host_destinations = nullptr)
+{
+    if (std::any_of(a.sym_r_idx.begin(), a.sym_r_idx.end(), [&a](unsigned row) { return row >= a.n; }))
+        throw std::invalid_argument("update map row out of range");
+    auto next = a.csr_diag_ptr;
+    for (auto& q : next)
+        ++q;
+    std::vector<unsigned> pivots(a.csr_c_idx.size());
+    std::vector<unsigned> row_slot(host_destinations ? a.n : 0, std::numeric_limits<unsigned>::max());
+    for (unsigned target = 0; target < a.n; ++target)
+    {
+        const unsigned begin = a.sym_c_ptr[target], end = a.sym_c_ptr[target + 1];
+        if (begin == a.l_col_ptr[target])
+            continue;
+        if (host_destinations)
+            for (unsigned p = end; p > begin; --p)
+                row_slot[a.sym_r_idx[p - 1]] = p - 1;
+        unsigned first = begin;
+        for (unsigned p = first; p < a.l_col_ptr[target]; ++p)
+        {
+            const unsigned source = a.sym_r_idx[p];
+            if (a.sym_r_idx[first] != source)
+                first = p;
+            const unsigned q = next[source]++;
+            if (q >= a.csr_r_ptr[source + 1] || a.csr_c_idx[q] != target)
+                throw std::runtime_error("update map missing pivot");
+            pivots[q] = first;
+            if (host_destinations)
+            {
+                const unsigned lower_begin = a.l_col_ptr[source] + 1, lower_end = a.sym_c_ptr[source + 1];
+                const unsigned ordinal = q - a.csr_diag_ptr[source] - 1;
+                uint64_t write = bases[source] + uint64_t(ordinal) * (lower_end - lower_begin);
+                for (unsigned l = lower_begin; l < lower_end; ++l)
+                {
+                    const unsigned slot = row_slot[a.sym_r_idx[l]];
+                    if (slot < begin || slot >= end)
+                        throw std::runtime_error("update map missing lower row");
+                    (*host_destinations)[write++] = slot;
+                }
+            }
+        }
+    }
+    for (unsigned source = 0; source < a.n; ++source)
+        if (next[source] != a.csr_r_ptr[source + 1])
+            throw std::runtime_error("update map missing pivot");
+    return pivots;
+}
+
+// One lane owns one output position. The prefix identifies its source, then
+// the upper CSR entry identifies the target column to search.
+__global__ void build_mapped_destinations(uint64_t total, unsigned n, const uint64_t* bases,
+    const unsigned* col, const unsigned* rows, const unsigned* diag, const unsigned* csr_diag,
+    const unsigned* targets, const unsigned* pivots, unsigned* destinations, unsigned* missing)
+{
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
+         i += uint64_t(gridDim.x) * blockDim.x)
+    {
+        unsigned lo = 0, hi = n;
+        while (hi - lo > 1)
+        {
+            const unsigned mid = lo + (hi - lo) / 2;
+            if (bases[mid] <= i)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        const unsigned source = lo;
+        const unsigned lower = col[source + 1] - diag[source] - 1;
+        const uint64_t local = i - bases[source];
+        const unsigned q = csr_diag[source] + 1 + unsigned(local / lower);
+        const unsigned row = rows[diag[source] + 1 + unsigned(local % lower)];
+        lo = pivots[q];
+        const unsigned end = col[targets[q] + 1];
+        hi = end;
+        while (lo < hi)
+        {
+            const unsigned mid = lo + (hi - lo) / 2;
+            if (rows[mid] < row)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo == end || rows[lo] != row)
+            atomicExch(missing, 1u);
+        destinations[i] = lo;
+    }
+}
+
+void create_mapped_destinations(const Symbolic_Matrix& a, uint64_t total, unsigned max_grid,
+    const uint64_t* bases, const unsigned* col, const unsigned* diag, const unsigned* csr_diag,
+    const unsigned* pivots, Buffer<unsigned>& output)
+{
+    output.allocate(size_t(total));
+    if (!total)
+        return;
+    Buffer<unsigned> rows, targets, missing;
+    rows.upload(a.sym_r_idx);
+    targets.upload(a.csr_c_idx);
+    missing.allocate(1);
+    gpu_check(cudaMemset(missing.ptr, 0, sizeof(unsigned)), "clear map status");
+    constexpr unsigned threads = 256;
+    const unsigned blocks = unsigned(std::min<uint64_t>((total - 1) / threads + 1, max_grid));
+    build_mapped_destinations<<<blocks, threads>>>(total, a.n, bases, col, rows.ptr, diag, csr_diag,
+        targets.ptr, pivots, output.ptr, missing.ptr);
+    gpu_check(cudaGetLastError(), "construct mapped destinations");
+    unsigned absent = 0;
+    gpu_check(cudaMemcpy(&absent, missing.ptr, sizeof(absent), cudaMemcpyDeviceToHost), "read map status");
+    if (absent)
+        throw std::runtime_error("update map missing lower row");
+}
 } // namespace
 
 // Separate destinations let all copies factor independently. For Shared, the
@@ -983,9 +1097,10 @@ struct GpuMatrix::Impl
         SnapshotPolicy snapshot,
         const std::vector<unsigned>& positions)
         : n(a.n), nnz(a.nnz), slots(0), perturb(use_perturb), update_mode(mode), snapshot_policy(snapshot),
-          levels(a.level_ptr), columns(a.level_idx), csr_rows(a.csr_r_ptr), csr_diags(a.csr_diag_ptr),
-          diagonals(a.l_col_ptr)
+          levels(a.level_ptr), diagonals(a.l_col_ptr)
     {
+        if (a.csr_diag_ptr.size() != n)
+            throw std::invalid_argument("expected one structural diagonal per row");
         if (!n || !nnz || !requested_slots || levels.size() < 2)
             throw std::invalid_argument("empty matrix or zero scratch slots");
         if (mode != UpdateMode::Scan && mode != UpdateMode::Mapped && mode != UpdateMode::Panel &&
@@ -1012,8 +1127,13 @@ struct GpuMatrix::Impl
         }
         panel_mode = mode == UpdateMode::Panel || mode == UpdateMode::PanelTiled || mode == UpdateMode::Fused;
         GpuMatrix::select_device();
-        cudaDeviceProp prop;
-        gpu_check(cudaGetDeviceProperties(&prop, 0), "get device properties");
+        // Every template uses logical device zero. Its capabilities are shared
+        // by all callers, while device selection above is per host thread.
+        static const cudaDeviceProp prop = [] {
+            cudaDeviceProp properties;
+            gpu_check(cudaGetDeviceProperties(&properties, 0), "get device properties");
+            return properties;
+        }();
         if ((prop.warpSize != 32 && prop.warpSize != 64) || prop.maxThreadsPerBlock < 1024)
             throw std::runtime_error("requires warp32/wave64 and 1024-thread blocks");
         device = prop.name;
@@ -1035,9 +1155,18 @@ struct GpuMatrix::Impl
         slots = mode == UpdateMode::Scan ? std::min(requested_slots, needed) : 0;
         if (mode != UpdateMode::Fused)
             col.upload(a.sym_c_ptr);
-        diag.upload(a.l_col_ptr);
+        // Fused normalization carries its diagonal offsets. Only pivot
+        // perturbation also walks the level's original columns on the device.
+        if (mode != UpdateMode::Fused || perturb)
+        {
+            diag.upload(a.l_col_ptr);
+            level_idx.upload(a.level_idx);
+        }
         if (!panel_mode)
         {
+            columns = a.level_idx;
+            csr_rows = a.csr_r_ptr;
+            csr_diags = a.csr_diag_ptr;
             csr_row.upload(a.csr_r_ptr);
             csr_diag.upload(a.csr_diag_ptr);
         }
@@ -1046,7 +1175,6 @@ struct GpuMatrix::Impl
             row.upload(a.sym_r_idx);
             csr_col.upload(a.csr_c_idx);
         }
-        level_idx.upload(a.level_idx);
         if (panel_mode)
         {
             const auto begin = std::chrono::steady_clock::now();
@@ -1107,9 +1235,12 @@ struct GpuMatrix::Impl
                 if (range.end - range.begin > max_grid_x)
                     throw std::invalid_argument("dense tile grid exceeds device limit");
 
-            panel_immediate = std::move(plan.immediate);
-            panel_deferred = std::move(plan.deferred);
-            panel_dense = std::move(plan.dense_ranges);
+            if (mode != UpdateMode::Fused)
+            {
+                panel_immediate = std::move(plan.immediate);
+                panel_deferred = std::move(plan.deferred);
+                panel_dense = std::move(plan.dense_ranges);
+            }
             if (records.empty())
                 panel_groups.upload(plan.groups);
             else
@@ -1204,7 +1335,7 @@ struct GpuMatrix::Impl
     void build_update_map(const Symbolic_Matrix& a)
     {
         // Count before allocating the potentially much larger-than-factor map.
-        uint64_t total = 0;
+        std::vector<uint64_t> bases(size_t(n) + 1);
         for (unsigned c = 0; c < n; ++c)
         {
             const uint64_t lower = a.sym_c_ptr[c + 1] - a.l_col_ptr[c] - 1;
@@ -1212,10 +1343,11 @@ struct GpuMatrix::Impl
             if (targets && lower > std::numeric_limits<uint64_t>::max() / targets)
                 throw std::overflow_error("update map size overflow");
             const uint64_t added = lower * targets;
-            if (added > std::numeric_limits<uint64_t>::max() - total)
+            if (added > std::numeric_limits<uint64_t>::max() - bases[c])
                 throw std::overflow_error("update map size overflow");
-            total += added;
+            bases[c + 1] = bases[c] + added;
         }
+        const uint64_t total = bases.back();
         map_bytes = checked_sum(checked_bytes(uint64_t(n) + 1, sizeof(uint64_t)),
             checked_sum(checked_bytes(total, sizeof(unsigned)), checked_bytes(a.csr_c_idx.size(), sizeof(unsigned))));
         const size_t available = GpuMatrix::free_device_bytes();
@@ -1223,42 +1355,20 @@ struct GpuMatrix::Impl
             throw std::runtime_error("mapped updates require " + std::to_string(map_bytes) +
                                      " additional device bytes, but only " + std::to_string(available) +
                                      " are free; use UpdateMode::Scan to avoid the map allocation");
-        std::vector<uint64_t> bases(size_t(n) + 1);
-        std::vector<unsigned> destinations;
-        destinations.reserve(size_t(total));
-        std::vector<unsigned> pivots(a.csr_c_idx.size());
-        for (unsigned c = 0; c < n; ++c)
-        {
-            bases[c] = destinations.size();
-            for (unsigned q = a.csr_diag_ptr[c] + 1; q < a.csr_r_ptr[c + 1]; ++q)
-            {
-                const unsigned target = a.csr_c_idx[q];
-                unsigned at = a.sym_c_ptr[target];
-                const unsigned end = a.sym_c_ptr[target + 1];
-                while (at < end && a.sym_r_idx[at] < c)
-                    ++at;
-                if (at == end || a.sym_r_idx[at] != c)
-                    throw std::runtime_error("update map missing pivot");
-                pivots[q] = at++;
-                for (unsigned source = a.l_col_ptr[c] + 1; source < a.sym_c_ptr[c + 1]; ++source)
-                {
-                    const unsigned row = a.sym_r_idx[source];
-                    while (at < end && a.sym_r_idx[at] < row)
-                        ++at;
-                    // Mapped mode requires a structurally closed update pattern.
-                    if (at == end || a.sym_r_idx[at] != row)
-                        throw std::runtime_error("update map missing lower row");
-                    destinations.push_back(at);
-                }
-            }
-        }
-        bases[n] = destinations.size();
-        if (destinations.size() != total)
-            throw std::logic_error("update map size mismatch");
+        const size_t device_workspace = checked_bytes(2 * uint64_t(nnz) + 1, sizeof(unsigned));
+        // Small maps avoid the extra uploads and kernel launch. The same host
+        // path can build any map that fits without temporary device storage.
+        constexpr unsigned small_map_entries = 64 * 1024;
+        const bool on_host = total <= small_map_entries || device_workspace > available - map_bytes;
+        std::vector<unsigned> destinations(on_host ? size_t(total) : 0);
+        map_pivots.upload(mapped_pivot_slots(a, bases, on_host ? &destinations : nullptr));
         front_plan = make_mapped_front_plan(a, bases);
         map_bases.upload(bases);
-        map_destinations.upload(destinations);
-        map_pivots.upload(pivots);
+        if (on_host)
+            map_destinations.upload(destinations);
+        else
+            create_mapped_destinations(a, total, max_grid_x, map_bases.ptr, col.ptr, diag.ptr, csr_diag.ptr,
+                map_pivots.ptr, map_destinations);
     }
 };
 

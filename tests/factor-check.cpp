@@ -7,8 +7,60 @@ void expect(double actual, double expected) {
     if (!std::isfinite(actual) || std::abs(actual-expected)>1e-12)
         throw std::runtime_error("incorrect full factor residual");
 }
+// Unsorted and repeated rows exercise both structural union and the mapping
+// from the original entries to the filled columns, including signed zero.
+void check_symbolic_preparation() {
+    std::ostringstream out, err;
+    Symbolic_Matrix a(5, out, err);
+    unsigned rows[]{2,1,0,2, 3,1, 0, 4,3};
+    unsigned columns[]{0,4,6,7,9,9};
+    double values[]{-0.0,2,3,8, 4,5, 6, 7,9};
+    a.fill_in(rows, columns);
+    a.csr();
+    a.predictLU(rows, columns, values);
+    if (a.sym_c_ptr != std::vector<unsigned>{0,4,6,11,13,14} ||
+        a.sym_r_idx != std::vector<unsigned>{0,1,2,2, 1,3, 0,1,2,2,3, 3,4, 4} ||
+        a.l_col_ptr != std::vector<unsigned>{0,4,8,11,13} ||
+        a.csr_r_ptr != std::vector<unsigned>{0,2,5,9,12,14} ||
+        a.csr_c_idx != std::vector<unsigned>{0,2, 0,1,2, 0,0,2,2, 1,2,3, 3,4} ||
+        a.csr_diag_ptr != std::vector<unsigned>{0,3,7,8,11,13})
+        throw std::runtime_error("symbolic preparation changed the filled pattern");
+    if (a.val != std::vector<REAL>{3,2,0,0, 5,4, 6,0,0,0,0, 9,7, 0} ||
+        !std::signbit(a.val[2]) || !std::signbit(a.val[3]) || std::signbit(a.val[8]))
+        throw std::runtime_error("symbolic preparation changed an input or fill value");
+
+    unsigned bad_row[]{1}, valid_row[]{0}, single_column[]{0,1};
+    double value[]{1};
+    bool rejected = false;
+    Symbolic_Matrix bad(1, out, err);
+    try { bad.fill_in(bad_row, single_column); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) throw std::runtime_error("fill accepted an invalid input row");
+
+    Symbolic_Matrix valid(1, out, err);
+    valid.fill_in(valid_row, single_column);
+    try { valid.predictLU(bad_row, single_column, value); }
+    catch (const std::invalid_argument&) { return; }
+    throw std::runtime_error("value initialization accepted an invalid input row");
+}
+
+// Column 4 reaches row 5 through three successively pruned columns.
+void check_transitive_fill() {
+    std::ostringstream out, err;
+    Symbolic_Matrix a(7, out, err);
+    unsigned rows[]{5,1,6,5,1,5, 2,0, 3,1, 4,2, 0};
+    unsigned columns[]{0,6,8,10,12,13,13,13};
+    a.fill_in(rows, columns);
+    const auto begin = a.sym_r_idx.begin();
+    const std::vector<unsigned> reached(begin + a.sym_c_ptr[4], begin + a.sym_c_ptr[5]);
+    if (reached != std::vector<unsigned>{0,1,1,2,3,4,5,5,5,6})
+        throw std::runtime_error("transitive fill lost a row or its multiplicity");
+}
+
 int main() {
     try {
+        check_symbolic_preparation();
+        check_transitive_fill();
         std::ostringstream out, err;
         Symbolic_Matrix a(2,out,err);
         a.nnz=4;

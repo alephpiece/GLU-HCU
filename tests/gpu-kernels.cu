@@ -584,6 +584,57 @@ void test_repeated_tasks(bool graph = false,
               << (mode == UpdateMode::Scan ? "scan" : "mapped") << '\n';
 }
 
+void test_repeated_mapped_indices()
+{
+    // Repeated off-diagonal entries still refer to the first matching slot in
+    // the target column, both when reading a pivot and when writing an update.
+    for (bool repeated_pivot : {false, true})
+    {
+        std::vector<unsigned> rows = repeated_pivot ? std::vector<unsigned>{0, 2, 0, 0, 1, 2, 2}
+                                                    : std::vector<unsigned>{0, 2, 2, 0, 1, 2, 2, 2};
+        std::vector<unsigned> columns = repeated_pivot ? std::vector<unsigned>{0, 2, 6, 7}
+                                                       : std::vector<unsigned>{0, 3, 7, 8};
+        std::ostringstream out, err;
+        Symbolic_Matrix a(3, out, err);
+        a.fill_in(rows.data(), columns.data());
+        a.csr();
+        const std::vector<uint64_t> offsets{0, 2, 2, 2};
+        std::vector<unsigned> host_destinations(2);
+        const auto pivots = mapped_pivot_slots(a, offsets, &host_destinations);
+        Buffer<uint64_t> bases;
+        Buffer<unsigned> col, diag, csr_diag, pivot_slots, output;
+        bases.upload(offsets);
+        col.upload(a.sym_c_ptr);
+        diag.upload(a.l_col_ptr);
+        csr_diag.upload(a.csr_diag_ptr);
+        pivot_slots.upload(pivots);
+        create_mapped_destinations(a, 2, 1, bases.ptr, col.ptr, diag.ptr, csr_diag.ptr, pivot_slots.ptr, output);
+        std::vector<unsigned> destinations(2);
+        gpu_check(cudaMemcpy(destinations.data(), output.ptr, output.bytes, cudaMemcpyDeviceToHost), "read map");
+        const unsigned first = a.sym_c_ptr[1];
+        if (destinations != host_destinations || destinations != std::vector<unsigned>{5, 5} || pivots[1] != first ||
+            (repeated_pivot && pivots[2] != first))
+            throw std::runtime_error("mapped lookup changed a repeated factor slot");
+
+        // Remove the required lower row from the target after constructing
+        // its pivots. The device constructor must report the missing entry.
+        std::fill(a.sym_r_idx.begin() + a.l_col_ptr[1] + 1, a.sym_r_idx.begin() + a.sym_c_ptr[2], 1u);
+        Buffer<unsigned> invalid_output;
+        try
+        {
+            create_mapped_destinations(a, 2, 1, bases.ptr, col.ptr, diag.ptr, csr_diag.ptr, pivot_slots.ptr,
+                invalid_output);
+        }
+        catch (const std::runtime_error& error)
+        {
+            if (std::string(error.what()) != "update map missing lower row")
+                throw;
+            continue;
+        }
+        throw std::runtime_error("device map accepted a missing destination");
+    }
+}
+
 void test_zero_update_map()
 {
     unsigned column[]{0, 1, 2}, row[]{0, 1};
@@ -2701,6 +2752,7 @@ int main()
         test_submission_failure_cleanup();
         test_task_set_submission_failure_cleanup();
         test_zero_update_map();
+        test_repeated_mapped_indices();
         for (bool one_column : {false, true})
             for (bool perturb : {false, true})
                 test_distinct_copies(one_column, perturb);
