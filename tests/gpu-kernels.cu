@@ -598,10 +598,12 @@ void test_repeated_mapped_indices()
         Symbolic_Matrix a(3, out, err);
         a.fill_in(rows.data(), columns.data());
         a.csr();
-        const auto pivots = mapped_pivot_slots(a);
+        const std::vector<uint64_t> offsets{0, 2, 2, 2};
+        std::vector<unsigned> host_destinations(2);
+        const auto pivots = mapped_pivot_slots(a, offsets, &host_destinations);
         Buffer<uint64_t> bases;
         Buffer<unsigned> col, diag, csr_diag, pivot_slots, output;
-        bases.upload({0, 2, 2, 2});
+        bases.upload(offsets);
         col.upload(a.sym_c_ptr);
         diag.upload(a.l_col_ptr);
         csr_diag.upload(a.csr_diag_ptr);
@@ -610,7 +612,7 @@ void test_repeated_mapped_indices()
         std::vector<unsigned> destinations(2);
         gpu_check(cudaMemcpy(destinations.data(), output.ptr, output.bytes, cudaMemcpyDeviceToHost), "read map");
         const unsigned first = a.sym_c_ptr[1];
-        if (destinations != std::vector<unsigned>{5, 5} || pivots[1] != first ||
+        if (destinations != host_destinations || destinations != std::vector<unsigned>{5, 5} || pivots[1] != first ||
             (repeated_pivot && pivots[2] != first))
             throw std::runtime_error("mapped lookup changed a repeated factor slot");
     }
