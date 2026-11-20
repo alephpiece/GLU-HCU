@@ -29,15 +29,19 @@ void check_symbolic_preparation() {
         !std::signbit(a.val[2]) || !std::signbit(a.val[3]) || std::signbit(a.val[8]))
         throw std::runtime_error("symbolic preparation changed an input or fill value");
 
-    unsigned bad_row[]{1}, single_column[]{0,1};
+    unsigned bad_row[]{1}, valid_row[]{0}, single_column[]{0,1};
     double value[]{1};
+    bool rejected = false;
     Symbolic_Matrix bad(1, out, err);
     try { bad.fill_in(bad_row, single_column); }
-    catch (const std::invalid_argument&) {
-        try { bad.predictLU(bad_row, single_column, value); }
-        catch (const std::invalid_argument&) { return; }
-    }
-    throw std::runtime_error("invalid input row accepted");
+    catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) throw std::runtime_error("fill accepted an invalid input row");
+
+    Symbolic_Matrix valid(1, out, err);
+    valid.fill_in(valid_row, single_column);
+    try { valid.predictLU(bad_row, single_column, value); }
+    catch (const std::invalid_argument&) { return; }
+    throw std::runtime_error("value initialization accepted an invalid input row");
 }
 
 int main() {
