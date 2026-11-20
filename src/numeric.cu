@@ -1064,8 +1064,13 @@ struct GpuMatrix::Impl
         }
         panel_mode = mode == UpdateMode::Panel || mode == UpdateMode::PanelTiled || mode == UpdateMode::Fused;
         GpuMatrix::select_device();
-        cudaDeviceProp prop;
-        gpu_check(cudaGetDeviceProperties(&prop, 0), "get device properties");
+        // Every template uses logical device zero. Its capabilities are shared
+        // by all callers, while device selection above is per host thread.
+        static const cudaDeviceProp prop = [] {
+            cudaDeviceProp properties;
+            gpu_check(cudaGetDeviceProperties(&properties, 0), "get device properties");
+            return properties;
+        }();
         if ((prop.warpSize != 32 && prop.warpSize != 64) || prop.maxThreadsPerBlock < 1024)
             throw std::runtime_error("requires warp32/wave64 and 1024-thread blocks");
         device = prop.name;
