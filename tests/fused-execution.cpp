@@ -394,6 +394,9 @@ void perturbation()
     std::vector<unsigned> positions(a->nnz);
     std::iota(positions.begin(), positions.end(), 0);
     GpuMatrix gpu(*a, positions, 1, true, UpdateMode::Fused);
+    GpuMatrix plain(*a, positions, 1, false, UpdateMode::Fused);
+    if (gpu.shared_device_bytes() != plain.shared_device_bytes() + a->n * (sizeof(unsigned) + sizeof(int)))
+        throw std::runtime_error("unexpected Fused perturbation index storage");
     GpuTask task(gpu, 3);
     task.prepare_graph();
     const auto input = repeated(a->val, 3);

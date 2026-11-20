@@ -1034,8 +1034,7 @@ struct GpuMatrix::Impl
         SnapshotPolicy snapshot,
         const std::vector<unsigned>& positions)
         : n(a.n), nnz(a.nnz), slots(0), perturb(use_perturb), update_mode(mode), snapshot_policy(snapshot),
-          levels(a.level_ptr), columns(a.level_idx), csr_rows(a.csr_r_ptr), csr_diags(a.csr_diag_ptr),
-          diagonals(a.l_col_ptr)
+          levels(a.level_ptr), diagonals(a.l_col_ptr)
     {
         if (a.csr_diag_ptr.size() != n)
             throw std::invalid_argument("expected one structural diagonal per row");
@@ -1088,9 +1087,18 @@ struct GpuMatrix::Impl
         slots = mode == UpdateMode::Scan ? std::min(requested_slots, needed) : 0;
         if (mode != UpdateMode::Fused)
             col.upload(a.sym_c_ptr);
-        diag.upload(a.l_col_ptr);
+        // Fused normalization carries its diagonal offsets. Only pivot
+        // perturbation also walks the level's original columns on the device.
+        if (mode != UpdateMode::Fused || perturb)
+        {
+            diag.upload(a.l_col_ptr);
+            level_idx.upload(a.level_idx);
+        }
         if (!panel_mode)
         {
+            columns = a.level_idx;
+            csr_rows = a.csr_r_ptr;
+            csr_diags = a.csr_diag_ptr;
             csr_row.upload(a.csr_r_ptr);
             csr_diag.upload(a.csr_diag_ptr);
         }
@@ -1099,7 +1107,6 @@ struct GpuMatrix::Impl
             row.upload(a.sym_r_idx);
             csr_col.upload(a.csr_c_idx);
         }
-        level_idx.upload(a.level_idx);
         if (panel_mode)
         {
             const auto begin = std::chrono::steady_clock::now();
@@ -1160,9 +1167,12 @@ struct GpuMatrix::Impl
                 if (range.end - range.begin > max_grid_x)
                     throw std::invalid_argument("dense tile grid exceeds device limit");
 
-            panel_immediate = std::move(plan.immediate);
-            panel_deferred = std::move(plan.deferred);
-            panel_dense = std::move(plan.dense_ranges);
+            if (mode != UpdateMode::Fused)
+            {
+                panel_immediate = std::move(plan.immediate);
+                panel_deferred = std::move(plan.deferred);
+                panel_dense = std::move(plan.dense_ranges);
+            }
             if (records.empty())
                 panel_groups.upload(plan.groups);
             else
