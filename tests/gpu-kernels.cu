@@ -598,8 +598,17 @@ void test_repeated_mapped_indices()
         Symbolic_Matrix a(3, out, err);
         a.fill_in(rows.data(), columns.data());
         a.csr();
-        std::vector<unsigned> destinations(2), pivots(a.csr_c_idx.size());
-        fill_mapped_indices(a, {0, 2, 2, 2}, destinations, pivots);
+        const auto pivots = mapped_pivot_slots(a);
+        Buffer<uint64_t> bases;
+        Buffer<unsigned> col, diag, csr_diag, pivot_slots, output;
+        bases.upload({0, 2, 2, 2});
+        col.upload(a.sym_c_ptr);
+        diag.upload(a.l_col_ptr);
+        csr_diag.upload(a.csr_diag_ptr);
+        pivot_slots.upload(pivots);
+        create_mapped_destinations(a, 2, 1, bases.ptr, col.ptr, diag.ptr, csr_diag.ptr, pivot_slots.ptr, output);
+        std::vector<unsigned> destinations(2);
+        gpu_check(cudaMemcpy(destinations.data(), output.ptr, output.bytes, cudaMemcpyDeviceToHost), "read map");
         const unsigned first = a.sym_c_ptr[1];
         if (destinations != std::vector<unsigned>{5, 5} || pivots[1] != first ||
             (repeated_pivot && pivots[2] != first))

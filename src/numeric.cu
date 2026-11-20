@@ -864,55 +864,97 @@ template <class T, bool Pinned = false> struct Buffer
     }
 };
 
-void fill_mapped_indices(const Symbolic_Matrix& a,
-    const std::vector<uint64_t>& bases,
-    std::vector<unsigned>& destinations,
-    std::vector<unsigned>& pivots)
+// CSC and CSR enumerate the same upper entries in different orders. Preserve
+// the first CSC slot when several entries have the same row.
+std::vector<unsigned> mapped_pivot_slots(const Symbolic_Matrix& a)
 {
-    std::vector<unsigned> next_pivot = a.csr_diag_ptr;
-    for (auto& q : next_pivot)
-        ++q;
     if (std::any_of(a.sym_r_idx.begin(), a.sym_r_idx.end(), [&a](unsigned row) { return row >= a.n; }))
         throw std::invalid_argument("update map row out of range");
-    std::vector<unsigned> row_slot(a.n, std::numeric_limits<unsigned>::max());
-
-    // Index a target column once for all sources that update it. Its
-    // sources are the upper entries of the column, in CSC order.
+    auto next = a.csr_diag_ptr;
+    for (auto& q : next)
+        ++q;
+    std::vector<unsigned> pivots(a.csr_c_idx.size());
     for (unsigned target = 0; target < a.n; ++target)
     {
-        const unsigned begin = a.sym_c_ptr[target], end = a.sym_c_ptr[target + 1];
-        if (begin == a.l_col_ptr[target])
-            continue;
-        // A repeated off-diagonal row uses its first factor slot, as in
-        // the ordered lookup used by the numeric update.
-        for (unsigned p = end; p > begin; --p)
-            row_slot[a.sym_r_idx[p - 1]] = p - 1;
-        for (unsigned p = begin; p < a.l_col_ptr[target]; ++p)
+        unsigned first = a.sym_c_ptr[target];
+        for (unsigned p = first; p < a.l_col_ptr[target]; ++p)
         {
             const unsigned source = a.sym_r_idx[p];
-            const unsigned q = next_pivot[source]++;
+            if (a.sym_r_idx[first] != source)
+                first = p;
+            const unsigned q = next[source]++;
             if (q >= a.csr_r_ptr[source + 1] || a.csr_c_idx[q] != target)
                 throw std::runtime_error("update map missing pivot");
-            pivots[q] = row_slot[source];
-
-            // Targets arrive in CSR order for this source. Keep the
-            // existing source-major layout consumed by all Mapped kernels.
-            const unsigned first = a.l_col_ptr[source] + 1;
-            const unsigned lower = a.sym_c_ptr[source + 1] - first;
-            const unsigned ordinal = q - a.csr_diag_ptr[source] - 1;
-            uint64_t write = bases[source] + uint64_t(ordinal) * lower;
-            for (unsigned l = first; l < a.sym_c_ptr[source + 1]; ++l)
-            {
-                const unsigned slot = row_slot[a.sym_r_idx[l]];
-                if (slot < begin || slot >= end)
-                    throw std::runtime_error("update map missing lower row");
-                destinations[write++] = slot;
-            }
+            pivots[q] = first;
         }
     }
     for (unsigned source = 0; source < a.n; ++source)
-        if (next_pivot[source] != a.csr_r_ptr[source + 1])
+        if (next[source] != a.csr_r_ptr[source + 1])
             throw std::runtime_error("update map missing pivot");
+    return pivots;
+}
+
+// One lane owns one output position. The prefix identifies its source, then
+// the upper CSR entry identifies the target column to search.
+__global__ void build_mapped_destinations(uint64_t total, unsigned n, const uint64_t* bases,
+    const unsigned* col, const unsigned* rows, const unsigned* diag, const unsigned* csr_diag,
+    const unsigned* targets, const unsigned* pivots, unsigned* destinations, unsigned* missing)
+{
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
+         i += uint64_t(gridDim.x) * blockDim.x)
+    {
+        unsigned lo = 0, hi = n;
+        while (hi - lo > 1)
+        {
+            const unsigned mid = lo + (hi - lo) / 2;
+            if (bases[mid] <= i)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        const unsigned source = lo;
+        const unsigned lower = col[source + 1] - diag[source] - 1;
+        const uint64_t local = i - bases[source];
+        const unsigned q = csr_diag[source] + 1 + unsigned(local / lower);
+        const unsigned row = rows[diag[source] + 1 + unsigned(local % lower)];
+        lo = pivots[q];
+        const unsigned end = col[targets[q] + 1];
+        hi = end;
+        while (lo < hi)
+        {
+            const unsigned mid = lo + (hi - lo) / 2;
+            if (rows[mid] < row)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo == end || rows[lo] != row)
+            atomicExch(missing, 1u);
+        destinations[i] = lo;
+    }
+}
+
+void create_mapped_destinations(const Symbolic_Matrix& a, uint64_t total, unsigned max_grid,
+    const uint64_t* bases, const unsigned* col, const unsigned* diag, const unsigned* csr_diag,
+    const unsigned* pivots, Buffer<unsigned>& output)
+{
+    output.allocate(size_t(total));
+    if (!total)
+        return;
+    Buffer<unsigned> rows, targets, missing;
+    rows.upload(a.sym_r_idx);
+    targets.upload(a.csr_c_idx);
+    missing.allocate(1);
+    gpu_check(cudaMemset(missing.ptr, 0, sizeof(unsigned)), "clear map status");
+    constexpr unsigned threads = 256;
+    const unsigned blocks = unsigned(std::min<uint64_t>((total - 1) / threads + 1, max_grid));
+    build_mapped_destinations<<<blocks, threads>>>(total, a.n, bases, col, rows.ptr, diag, csr_diag,
+        targets.ptr, pivots, output.ptr, missing.ptr);
+    gpu_check(cudaGetLastError(), "construct mapped destinations");
+    unsigned absent = 0;
+    gpu_check(cudaMemcpy(&absent, missing.ptr, sizeof(absent), cudaMemcpyDeviceToHost), "read map status");
+    if (absent)
+        throw std::runtime_error("update map missing lower row");
 }
 } // namespace
 
@@ -1292,13 +1334,11 @@ struct GpuMatrix::Impl
             throw std::runtime_error("mapped updates require " + std::to_string(map_bytes) +
                                      " additional device bytes, but only " + std::to_string(available) +
                                      " are free; use UpdateMode::Scan to avoid the map allocation");
-        std::vector<unsigned> destinations(size_t(total), 0);
-        std::vector<unsigned> pivots(a.csr_c_idx.size());
-        fill_mapped_indices(a, bases, destinations, pivots);
+        map_pivots.upload(mapped_pivot_slots(a));
         front_plan = make_mapped_front_plan(a, bases);
         map_bases.upload(bases);
-        map_destinations.upload(destinations);
-        map_pivots.upload(pivots);
+        create_mapped_destinations(a, total, max_grid_x, map_bases.ptr, col.ptr, diag.ptr, csr_diag.ptr,
+            map_pivots.ptr, map_destinations);
     }
 };
 
