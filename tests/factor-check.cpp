@@ -7,8 +7,32 @@ void expect(double actual, double expected) {
     if (!std::isfinite(actual) || std::abs(actual-expected)>1e-12)
         throw std::runtime_error("incorrect full factor residual");
 }
+// Unsorted and repeated rows exercise both structural union and the mapping
+// from the original entries to the filled columns, including signed zero.
+void check_symbolic_preparation() {
+    std::ostringstream out, err;
+    Symbolic_Matrix a(5, out, err);
+    unsigned rows[]{2,1,0,2, 3,1, 0, 4,3};
+    unsigned columns[]{0,4,6,7,9,9};
+    double values[]{-0.0,2,3,8, 4,5, 6, 7,9};
+    a.fill_in(rows, columns);
+    a.csr();
+    a.predictLU(rows, columns, values);
+    if (a.sym_c_ptr != std::vector<unsigned>{0,4,6,11,13,14} ||
+        a.sym_r_idx != std::vector<unsigned>{0,1,2,2, 1,3, 0,1,2,2,3, 3,4, 4} ||
+        a.l_col_ptr != std::vector<unsigned>{0,4,8,11,13} ||
+        a.csr_r_ptr != std::vector<unsigned>{0,2,5,9,12,14} ||
+        a.csr_c_idx != std::vector<unsigned>{0,2, 0,1,2, 0,0,2,2, 1,2,3, 3,4} ||
+        a.csr_diag_ptr != std::vector<unsigned>{0,3,7,8,11,13})
+        throw std::runtime_error("symbolic preparation changed the filled pattern");
+    if (a.val != std::vector<REAL>{3,2,0,0, 5,4, 6,0,0,0,0, 9,7, 0} ||
+        !std::signbit(a.val[2]) || !std::signbit(a.val[3]) || std::signbit(a.val[8]))
+        throw std::runtime_error("symbolic preparation changed an input or fill value");
+}
+
 int main() {
     try {
+        check_symbolic_preparation();
         std::ostringstream out, err;
         Symbolic_Matrix a(2,out,err);
         a.nnz=4;

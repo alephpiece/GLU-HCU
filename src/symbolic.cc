@@ -3,106 +3,100 @@
 #include <vector>
 #include <algorithm>
 #include <iterator>
+#include <numeric>
 #include "Timer.h"
 #include "symbolic.h"
 #include <cmath>
 
 using namespace std;
 
-void Symbolic_Matrix :: fill_in(unsigned *ai, unsigned *ap)
+void Symbolic_Matrix::fill_in(unsigned *ai, unsigned *ap)
 {
+    // A reachable row above the diagonal contributes its already computed L
+    // column. Visit each such column once, then sort the resulting row indices.
+    vector<unsigned> multiplicity(n, 0);
+    vector<unsigned> reached;
     sym_c_ptr.push_back(0);
-    vector<unsigned> :: iterator it;
-
-    for (unsigned i = 0; i < n; ++i)
+    for (unsigned col = 0; col < n; ++col)
     {
-        vector<unsigned> tmpcol1;
-        vector<unsigned> tmpcol2(ai + ap[i], ai + ap[i+1]);
-        sort(tmpcol2.begin(), tmpcol2.end());
-
-        for (unsigned j = 0; j < tmpcol2.size(); ++j)
+        reached.clear();
+        for (unsigned p = ap[col]; p < ap[col + 1]; ++p)
+            if (multiplicity[ai[p]]++ == 0)
+                reached.push_back(ai[p]);
+        if (multiplicity[col] == 0)
         {
-            unsigned nz_idx = tmpcol2[j];
-            if (nz_idx < i)
-            {
-                auto colhead = sym_r_idx.begin() + l_col_ptr[nz_idx];
-                auto colend = sym_r_idx.begin() + sym_c_ptr[nz_idx+1];
-                tmpcol1.resize(distance(colhead, colend) + tmpcol2.size());
-                it = set_union(colhead, colend, tmpcol2.begin(), tmpcol2.end(), tmpcol1.begin());
-                tmpcol1.resize(it - tmpcol1.begin());
-                tmpcol2.clear();
-                swap(tmpcol1, tmpcol2);
-            }
-            else
-                break;
+            multiplicity[col] = 1;
+            reached.push_back(col);
         }
 
-        // Ensure a structural diagonal exists for each column.
-        // Later stages index l_col_ptr/csr_diag_ptr by column/row directly.
-        auto diag_it = lower_bound(tmpcol2.begin(), tmpcol2.end(), i);
-        if (diag_it == tmpcol2.end() || *diag_it != i)
-            diag_it = tmpcol2.insert(diag_it, i);
+        for (size_t i = 0; i < reached.size(); ++i)
+        {
+            const unsigned source = reached[i];
+            if (source >= col)
+                continue;
+            unsigned p = l_col_ptr[source];
+            const unsigned end = sym_c_ptr[source + 1];
+            while (p < end)
+            {
+                const unsigned first = p, row = sym_r_idx[p++];
+                // Set union retains the larger multiplicity of a repeated row.
+                while (p < end && sym_r_idx[p] == row)
+                    ++p;
+                if (multiplicity[row] == 0)
+                    reached.push_back(row);
+                multiplicity[row] = max(multiplicity[row], p - first);
+            }
+        }
 
-        l_col_ptr.push_back(sym_c_ptr.back() + distance(tmpcol2.begin(), diag_it));
-        sym_c_ptr.push_back(tmpcol2.size() + sym_c_ptr.back());
-        sym_r_idx.insert(sym_r_idx.end(), tmpcol2.begin(), tmpcol2.end());
+        sort(reached.begin(), reached.end());
+        for (const unsigned row : reached)
+        {
+            if (row == col)
+                l_col_ptr.push_back(sym_r_idx.size());
+            sym_r_idx.insert(sym_r_idx.end(), multiplicity[row], row);
+            multiplicity[row] = 0;
+        }
+        sym_c_ptr.push_back(sym_r_idx.size());
     }
 
     nnz = sym_c_ptr.back();
-
     m_out << "Symbolic nonzero: " << nnz << endl;
 }
 
-void Symbolic_Matrix :: csr()
+void Symbolic_Matrix::csr()
 {
-    csr_r_ptr.push_back(0);
-    vector<vector<unsigned> > buffer(n, vector<unsigned>());
-
-    for (unsigned i = 0; i < n; ++i)
-    {
-        for (unsigned j = sym_c_ptr[i]; j < sym_c_ptr[i+1]; ++j)
+    csr_r_ptr.assign(size_t(n) + 1, 0);
+    for (const unsigned row : sym_r_idx)
+        ++csr_r_ptr[row + 1];
+    partial_sum(csr_r_ptr.begin(), csr_r_ptr.end(), csr_r_ptr.begin());
+    vector<unsigned> next(csr_r_ptr.begin(), csr_r_ptr.end() - 1);
+    csr_c_idx.resize(csr_r_ptr.back());
+    for (unsigned col = 0; col < n; ++col)
+        for (unsigned p = sym_c_ptr[col]; p < sym_c_ptr[col + 1]; ++p)
         {
-            unsigned row_idx = sym_r_idx[j];
-            buffer[row_idx].push_back(i);
+            const unsigned row = sym_r_idx[p], slot = next[row]++;
+            csr_c_idx[slot] = col;
+            if (row == col)
+                csr_diag_ptr.push_back(slot);
         }
-    }
-
-    for (unsigned i = 0; i < n; ++i)
-    {
-        for (unsigned j = 0; j < buffer[i].size(); ++j)
-        {
-            csr_c_idx.push_back(buffer[i][j]);
-            if(buffer[i][j] == i)
-                csr_diag_ptr.push_back(csr_c_idx.size()-1);
-        }
-        csr_r_ptr.push_back(csr_r_ptr.back() + buffer[i].size());
-    }
 }
 
-//Construct val vector (including filled in zeros) of symbolic_matrix
-void Symbolic_Matrix :: predictLU (unsigned *ai, unsigned *ap, double *ax)
+// Scatter one input column into a row-indexed buffer, then gather its filled
+// column. In reverse order the first supplied value wins for duplicate rows.
+void Symbolic_Matrix::predictLU(unsigned *ai, unsigned *ap, double *ax)
 {
+    vector<REAL> values(n, REAL(0));
     val.reserve(nnz);
-    for (unsigned i = 0; i < n; ++i)
+    for (unsigned col = 0; col < n; ++col)
     {
-        unsigned *start = ai + ap[i];
-        unsigned *end = ai + ap[i+1];
-        for (unsigned j = sym_c_ptr[i]; j < sym_c_ptr[i+1]; ++j)
-        {
-            unsigned *idx = find(start, end, sym_r_idx[j]);
-            if (idx != end)
-            {
-                double* x_idx = ax + distance(ai, idx);
-                val.push_back((REAL)*x_idx);
-            }
-            else
-            {
-                val.push_back(0);
-            }
-        }
+        for (unsigned p = ap[col + 1]; p > ap[col]; --p)
+            values[ai[p - 1]] = static_cast<REAL>(ax[p - 1]);
+        for (unsigned p = sym_c_ptr[col]; p < sym_c_ptr[col + 1]; ++p)
+            val.push_back(values[sym_r_idx[p]]);
+        for (unsigned p = ap[col]; p < ap[col + 1]; ++p)
+            values[ai[p]] = REAL(0);
     }
 }
-
 
 void Symbolic_Matrix :: leveling()
 {
