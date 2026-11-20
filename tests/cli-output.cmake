@@ -3,7 +3,11 @@ file(MAKE_DIRECTORY "${TEST_DIRECTORY}")
 file(WRITE "${TEST_DIRECTORY}/identity.mtx" "2 2 2\n1 1 1\n2 2 1\n")
 
 function(run_cli name expected_status expected_diagnostic)
-    execute_process(COMMAND "${GLU_EXECUTABLE}" -i "${TEST_DIRECTORY}/identity.mtx"
+    set(input identity.mtx)
+    if(ARGC GREATER 3)
+        set(input "${ARGV3}")
+    endif()
+    execute_process(COMMAND "${GLU_EXECUTABLE}" -i "${TEST_DIRECTORY}/${input}"
         WORKING_DIRECTORY "${TEST_DIRECTORY}/${name}"
         RESULT_VARIABLE status OUTPUT_VARIABLE output ERROR_VARIABLE error
         TIMEOUT 30)
@@ -22,6 +26,17 @@ run_cli(success 0 "")
 file(READ "${TEST_DIRECTORY}/success/x.dat" solution)
 if(NOT solution STREQUAL "1\n1\n")
     message(FATAL_ERROR "Unexpected identity solution: ${solution}")
+endif()
+
+# The first record is ordinary. The second crosses lines and exercises the
+# formatted reader after a partial fast read of the same file.
+file(WRITE "${TEST_DIRECTORY}/split-record.mtx" "2 2 2\n1 1 1\n2\n2 0x1p0")
+file(MAKE_DIRECTORY "${TEST_DIRECTORY}/split-record")
+file(REMOVE "${TEST_DIRECTORY}/split-record/x.dat")
+run_cli(split-record 0 "" split-record.mtx)
+file(READ "${TEST_DIRECTORY}/split-record/x.dat" solution)
+if(NOT solution STREQUAL "1\n1\n")
+    message(FATAL_ERROR "Unexpected solution for split coordinate records: ${solution}")
 endif()
 
 # A directory named x.dat reliably rejects opening, even when running as root.

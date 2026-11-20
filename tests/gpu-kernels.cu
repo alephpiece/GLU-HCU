@@ -615,6 +615,23 @@ void test_repeated_mapped_indices()
         if (destinations != host_destinations || destinations != std::vector<unsigned>{5, 5} || pivots[1] != first ||
             (repeated_pivot && pivots[2] != first))
             throw std::runtime_error("mapped lookup changed a repeated factor slot");
+
+        // Remove the required lower row from the target after constructing
+        // its pivots. The device constructor must report the missing entry.
+        std::fill(a.sym_r_idx.begin() + a.l_col_ptr[1] + 1, a.sym_r_idx.begin() + a.sym_c_ptr[2], 1u);
+        Buffer<unsigned> invalid_output;
+        try
+        {
+            create_mapped_destinations(a, 2, 1, bases.ptr, col.ptr, diag.ptr, csr_diag.ptr, pivot_slots.ptr,
+                invalid_output);
+        }
+        catch (const std::runtime_error& error)
+        {
+            if (std::string(error.what()) != "update map missing lower row")
+                throw;
+            continue;
+        }
+        throw std::runtime_error("device map accepted a missing destination");
     }
 }
 

@@ -44,9 +44,23 @@ void check_symbolic_preparation() {
     throw std::runtime_error("value initialization accepted an invalid input row");
 }
 
+// Column 4 reaches row 5 through three successively pruned columns.
+void check_transitive_fill() {
+    std::ostringstream out, err;
+    Symbolic_Matrix a(7, out, err);
+    unsigned rows[]{5,1,6,5,1,5, 2,0, 3,1, 4,2, 0};
+    unsigned columns[]{0,6,8,10,12,13,13,13};
+    a.fill_in(rows, columns);
+    const auto begin = a.sym_r_idx.begin();
+    const std::vector<unsigned> reached(begin + a.sym_c_ptr[4], begin + a.sym_c_ptr[5]);
+    if (reached != std::vector<unsigned>{0,1,1,2,3,4,5,5,5,6})
+        throw std::runtime_error("transitive fill lost a row or its multiplicity");
+}
+
 int main() {
     try {
         check_symbolic_preparation();
+        check_transitive_fill();
         std::ostringstream out, err;
         Symbolic_Matrix a(2,out,err);
         a.nnz=4;
