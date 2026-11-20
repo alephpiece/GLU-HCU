@@ -16,6 +16,7 @@ void Symbolic_Matrix::fill_in(unsigned *ai, unsigned *ap)
     // column. Visit each such column once, then sort the resulting row indices.
     vector<unsigned> multiplicity(n, 0);
     vector<unsigned> reached;
+    vector<unsigned> reach_end(n);
     sym_c_ptr.push_back(0);
     for (unsigned col = 0; col < n; ++col)
     {
@@ -40,13 +41,17 @@ void Symbolic_Matrix::fill_in(unsigned *ai, unsigned *ap)
             if (source >= col)
                 continue;
             unsigned p = l_col_ptr[source];
-            const unsigned end = sym_c_ptr[source + 1];
+            const unsigned end = reach_end[source];
             while (p < end)
             {
                 const unsigned first = p, row = sym_r_idx[p++];
                 // Set union retains the larger multiplicity of a repeated row.
                 while (p < end && sym_r_idx[p] == row)
                     ++p;
+                // Column col now receives this source's entire remaining tail. In
+                // later columns the edge source -> col reaches that tail through col.
+                if (row == col)
+                    reach_end[source] = p;
                 if (multiplicity[row] == 0)
                     reached.push_back(row);
                 multiplicity[row] = max(multiplicity[row], p - first);
@@ -64,6 +69,7 @@ void Symbolic_Matrix::fill_in(unsigned *ai, unsigned *ap)
             multiplicity[row] = 0;
         }
         sym_c_ptr.push_back(sym_r_idx.size());
+        reach_end[col] = sym_c_ptr.back();
     }
 
     nnz = sym_c_ptr.back();
