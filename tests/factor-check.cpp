@@ -28,6 +28,16 @@ void check_symbolic_preparation() {
     if (a.val != std::vector<REAL>{3,2,0,0, 5,4, 6,0,0,0,0, 9,7, 0} ||
         !std::signbit(a.val[2]) || !std::signbit(a.val[3]) || std::signbit(a.val[8]))
         throw std::runtime_error("symbolic preparation changed an input or fill value");
+
+    unsigned bad_row[]{1}, single_column[]{0,1};
+    double value[]{1};
+    Symbolic_Matrix bad(1, out, err);
+    try { bad.fill_in(bad_row, single_column); }
+    catch (const std::invalid_argument&) {
+        try { bad.predictLU(bad_row, single_column, value); }
+        catch (const std::invalid_argument&) { return; }
+    }
+    throw std::runtime_error("invalid input row accepted");
 }
 
 int main() {

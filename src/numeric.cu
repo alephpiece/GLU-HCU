@@ -863,6 +863,57 @@ template <class T, bool Pinned = false> struct Buffer
             gpu_check(cudaMemcpy(ptr, input.data(), bytes, cudaMemcpyHostToDevice), "upload structure");
     }
 };
+
+void fill_mapped_indices(const Symbolic_Matrix& a,
+    const std::vector<uint64_t>& bases,
+    std::vector<unsigned>& destinations,
+    std::vector<unsigned>& pivots)
+{
+    std::vector<unsigned> next_pivot = a.csr_diag_ptr;
+    for (auto& q : next_pivot)
+        ++q;
+    if (std::any_of(a.sym_r_idx.begin(), a.sym_r_idx.end(), [&a](unsigned row) { return row >= a.n; }))
+        throw std::invalid_argument("update map row out of range");
+    std::vector<unsigned> row_slot(a.n, std::numeric_limits<unsigned>::max());
+
+    // Index a target column once for all sources that update it. Its
+    // sources are the upper entries of the column, in CSC order.
+    for (unsigned target = 0; target < a.n; ++target)
+    {
+        const unsigned begin = a.sym_c_ptr[target], end = a.sym_c_ptr[target + 1];
+        if (begin == a.l_col_ptr[target])
+            continue;
+        // A repeated off-diagonal row uses its first factor slot, as in
+        // the ordered lookup used by the numeric update.
+        for (unsigned p = end; p > begin; --p)
+            row_slot[a.sym_r_idx[p - 1]] = p - 1;
+        for (unsigned p = begin; p < a.l_col_ptr[target]; ++p)
+        {
+            const unsigned source = a.sym_r_idx[p];
+            const unsigned q = next_pivot[source]++;
+            if (q >= a.csr_r_ptr[source + 1] || a.csr_c_idx[q] != target)
+                throw std::runtime_error("update map missing pivot");
+            pivots[q] = row_slot[source];
+
+            // Targets arrive in CSR order for this source. Keep the
+            // existing source-major layout consumed by all Mapped kernels.
+            const unsigned first = a.l_col_ptr[source] + 1;
+            const unsigned lower = a.sym_c_ptr[source + 1] - first;
+            const unsigned ordinal = q - a.csr_diag_ptr[source] - 1;
+            uint64_t write = bases[source] + uint64_t(ordinal) * lower;
+            for (unsigned l = first; l < a.sym_c_ptr[source + 1]; ++l)
+            {
+                const unsigned slot = row_slot[a.sym_r_idx[l]];
+                if (slot < begin || slot >= end)
+                    throw std::runtime_error("update map missing lower row");
+                destinations[write++] = slot;
+            }
+        }
+    }
+    for (unsigned source = 0; source < a.n; ++source)
+        if (next_pivot[source] != a.csr_r_ptr[source + 1])
+            throw std::runtime_error("update map missing pivot");
+}
 } // namespace
 
 // Separate destinations let all copies factor independently. For Shared, the
@@ -986,6 +1037,8 @@ struct GpuMatrix::Impl
           levels(a.level_ptr), columns(a.level_idx), csr_rows(a.csr_r_ptr), csr_diags(a.csr_diag_ptr),
           diagonals(a.l_col_ptr)
     {
+        if (a.csr_diag_ptr.size() != n)
+            throw std::invalid_argument("expected one structural diagonal per row");
         if (!n || !nnz || !requested_slots || levels.size() < 2)
             throw std::invalid_argument("empty matrix or zero scratch slots");
         if (mode != UpdateMode::Scan && mode != UpdateMode::Mapped && mode != UpdateMode::Panel &&
@@ -1226,48 +1279,7 @@ struct GpuMatrix::Impl
                                      " are free; use UpdateMode::Scan to avoid the map allocation");
         std::vector<unsigned> destinations(size_t(total), 0);
         std::vector<unsigned> pivots(a.csr_c_idx.size());
-        std::vector<unsigned> next_pivot = a.csr_diag_ptr;
-        for (auto& q : next_pivot)
-            ++q;
-        if (std::any_of(a.sym_r_idx.begin(), a.sym_r_idx.end(), [this](unsigned row) { return row >= n; }))
-            throw std::invalid_argument("update map row out of range");
-        std::vector<unsigned> row_slot(n, std::numeric_limits<unsigned>::max());
-
-        // Index a target column once for all sources that update it. Its
-        // sources are the upper entries of the column, in CSC order.
-        for (unsigned target = 0; target < n; ++target)
-        {
-            const unsigned begin = a.sym_c_ptr[target], end = a.sym_c_ptr[target + 1];
-            if (begin == a.l_col_ptr[target])
-                continue;
-            for (unsigned p = begin; p < end; ++p)
-                row_slot[a.sym_r_idx[p]] = p;
-            for (unsigned p = begin; p < a.l_col_ptr[target]; ++p)
-            {
-                const unsigned source = a.sym_r_idx[p];
-                const unsigned q = next_pivot[source]++;
-                if (q >= a.csr_r_ptr[source + 1] || a.csr_c_idx[q] != target)
-                    throw std::runtime_error("update map missing pivot");
-                pivots[q] = p;
-
-                // Targets arrive in CSR order for this source. Keep the
-                // existing source-major layout consumed by all Mapped kernels.
-                const unsigned first = a.l_col_ptr[source] + 1;
-                const unsigned lower = a.sym_c_ptr[source + 1] - first;
-                const unsigned ordinal = q - a.csr_diag_ptr[source] - 1;
-                uint64_t write = bases[source] + uint64_t(ordinal) * lower;
-                for (unsigned l = first; l < a.sym_c_ptr[source + 1]; ++l)
-                {
-                    const unsigned slot = row_slot[a.sym_r_idx[l]];
-                    if (slot < begin || slot >= end)
-                        throw std::runtime_error("update map missing lower row");
-                    destinations[write++] = slot;
-                }
-            }
-        }
-        for (unsigned source = 0; source < n; ++source)
-            if (next_pivot[source] != a.csr_r_ptr[source + 1])
-                throw std::runtime_error("update map missing pivot");
+        fill_mapped_indices(a, bases, destinations, pivots);
         front_plan = make_mapped_front_plan(a, bases);
         map_bases.upload(bases);
         map_destinations.upload(destinations);

@@ -2,7 +2,7 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
-#include <iterator>
+#include <limits>
 #include <numeric>
 #include "Timer.h"
 #include "symbolic.h"
@@ -21,8 +21,13 @@ void Symbolic_Matrix::fill_in(unsigned *ai, unsigned *ap)
     {
         reached.clear();
         for (unsigned p = ap[col]; p < ap[col + 1]; ++p)
-            if (multiplicity[ai[p]]++ == 0)
-                reached.push_back(ai[p]);
+        {
+            const unsigned row = ai[p];
+            if (row >= n)
+                throw invalid_argument("input row out of range");
+            if (multiplicity[row]++ == 0)
+                reached.push_back(row);
+        }
         if (multiplicity[col] == 0)
         {
             multiplicity[col] = 1;
@@ -51,6 +56,8 @@ void Symbolic_Matrix::fill_in(unsigned *ai, unsigned *ap)
         sort(reached.begin(), reached.end());
         for (const unsigned row : reached)
         {
+            if (multiplicity[row] > numeric_limits<unsigned>::max() - sym_r_idx.size())
+                throw overflow_error("symbolic pattern exceeds index range");
             if (row == col)
                 l_col_ptr.push_back(sym_r_idx.size());
             sym_r_idx.insert(sym_r_idx.end(), multiplicity[row], row);
@@ -90,7 +97,12 @@ void Symbolic_Matrix::predictLU(unsigned *ai, unsigned *ap, double *ax)
     for (unsigned col = 0; col < n; ++col)
     {
         for (unsigned p = ap[col + 1]; p > ap[col]; --p)
-            values[ai[p - 1]] = static_cast<REAL>(ax[p - 1]);
+        {
+            const unsigned row = ai[p - 1];
+            if (row >= n)
+                throw invalid_argument("input row out of range");
+            values[row] = static_cast<REAL>(ax[p - 1]);
+        }
         for (unsigned p = sym_c_ptr[col]; p < sym_c_ptr[col + 1]; ++p)
             val.push_back(values[sym_r_idx[p]]);
         for (unsigned p = ap[col]; p < ap[col + 1]; ++p)

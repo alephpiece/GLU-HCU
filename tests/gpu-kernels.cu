@@ -584,6 +584,29 @@ void test_repeated_tasks(bool graph = false,
               << (mode == UpdateMode::Scan ? "scan" : "mapped") << '\n';
 }
 
+void test_repeated_mapped_indices()
+{
+    // Repeated off-diagonal entries still refer to the first matching slot in
+    // the target column, both when reading a pivot and when writing an update.
+    for (bool repeated_pivot : {false, true})
+    {
+        std::vector<unsigned> rows = repeated_pivot ? std::vector<unsigned>{0, 2, 0, 0, 1, 2, 2}
+                                                    : std::vector<unsigned>{0, 2, 2, 0, 1, 2, 2, 2};
+        std::vector<unsigned> columns = repeated_pivot ? std::vector<unsigned>{0, 2, 6, 7}
+                                                       : std::vector<unsigned>{0, 3, 7, 8};
+        std::ostringstream out, err;
+        Symbolic_Matrix a(3, out, err);
+        a.fill_in(rows.data(), columns.data());
+        a.csr();
+        std::vector<unsigned> destinations(2), pivots(a.csr_c_idx.size());
+        fill_mapped_indices(a, {0, 2, 2, 2}, destinations, pivots);
+        const unsigned first = a.sym_c_ptr[1];
+        if (destinations != std::vector<unsigned>{5, 5} || pivots[1] != first ||
+            (repeated_pivot && pivots[2] != first))
+            throw std::runtime_error("mapped lookup changed a repeated factor slot");
+    }
+}
+
 void test_zero_update_map()
 {
     unsigned column[]{0, 1, 2}, row[]{0, 1};
@@ -2701,6 +2724,7 @@ int main()
         test_submission_failure_cleanup();
         test_task_set_submission_failure_cleanup();
         test_zero_update_map();
+        test_repeated_mapped_indices();
         for (bool one_column : {false, true})
             for (bool perturb : {false, true})
                 test_distinct_copies(one_column, perturb);
