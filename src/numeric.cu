@@ -1204,7 +1204,7 @@ struct GpuMatrix::Impl
     void build_update_map(const Symbolic_Matrix& a)
     {
         // Count before allocating the potentially much larger-than-factor map.
-        uint64_t total = 0;
+        std::vector<uint64_t> bases(size_t(n) + 1);
         for (unsigned c = 0; c < n; ++c)
         {
             const uint64_t lower = a.sym_c_ptr[c + 1] - a.l_col_ptr[c] - 1;
@@ -1212,10 +1212,11 @@ struct GpuMatrix::Impl
             if (targets && lower > std::numeric_limits<uint64_t>::max() / targets)
                 throw std::overflow_error("update map size overflow");
             const uint64_t added = lower * targets;
-            if (added > std::numeric_limits<uint64_t>::max() - total)
+            if (added > std::numeric_limits<uint64_t>::max() - bases[c])
                 throw std::overflow_error("update map size overflow");
-            total += added;
+            bases[c + 1] = bases[c] + added;
         }
+        const uint64_t total = bases.back();
         map_bytes = checked_sum(checked_bytes(uint64_t(n) + 1, sizeof(uint64_t)),
             checked_sum(checked_bytes(total, sizeof(unsigned)), checked_bytes(a.csr_c_idx.size(), sizeof(unsigned))));
         const size_t available = GpuMatrix::free_device_bytes();
@@ -1223,38 +1224,50 @@ struct GpuMatrix::Impl
             throw std::runtime_error("mapped updates require " + std::to_string(map_bytes) +
                                      " additional device bytes, but only " + std::to_string(available) +
                                      " are free; use UpdateMode::Scan to avoid the map allocation");
-        std::vector<uint64_t> bases(size_t(n) + 1);
-        std::vector<unsigned> destinations;
-        destinations.reserve(size_t(total));
+        std::vector<unsigned> destinations(size_t(total), 0);
         std::vector<unsigned> pivots(a.csr_c_idx.size());
-        for (unsigned c = 0; c < n; ++c)
+        std::vector<unsigned> next_pivot = a.csr_diag_ptr;
+        for (auto& q : next_pivot)
+            ++q;
+        if (std::any_of(a.sym_r_idx.begin(), a.sym_r_idx.end(), [this](unsigned row) { return row >= n; }))
+            throw std::invalid_argument("update map row out of range");
+        std::vector<unsigned> row_slot(n, std::numeric_limits<unsigned>::max());
+
+        // Index a target column once for all sources that update it. Its
+        // sources are the upper entries of the column, in CSC order.
+        for (unsigned target = 0; target < n; ++target)
         {
-            bases[c] = destinations.size();
-            for (unsigned q = a.csr_diag_ptr[c] + 1; q < a.csr_r_ptr[c + 1]; ++q)
+            const unsigned begin = a.sym_c_ptr[target], end = a.sym_c_ptr[target + 1];
+            if (begin == a.l_col_ptr[target])
+                continue;
+            for (unsigned p = begin; p < end; ++p)
+                row_slot[a.sym_r_idx[p]] = p;
+            for (unsigned p = begin; p < a.l_col_ptr[target]; ++p)
             {
-                const unsigned target = a.csr_c_idx[q];
-                unsigned at = a.sym_c_ptr[target];
-                const unsigned end = a.sym_c_ptr[target + 1];
-                while (at < end && a.sym_r_idx[at] < c)
-                    ++at;
-                if (at == end || a.sym_r_idx[at] != c)
+                const unsigned source = a.sym_r_idx[p];
+                const unsigned q = next_pivot[source]++;
+                if (q >= a.csr_r_ptr[source + 1] || a.csr_c_idx[q] != target)
                     throw std::runtime_error("update map missing pivot");
-                pivots[q] = at++;
-                for (unsigned source = a.l_col_ptr[c] + 1; source < a.sym_c_ptr[c + 1]; ++source)
+                pivots[q] = p;
+
+                // Targets arrive in CSR order for this source. Keep the
+                // existing source-major layout consumed by all Mapped kernels.
+                const unsigned first = a.l_col_ptr[source] + 1;
+                const unsigned lower = a.sym_c_ptr[source + 1] - first;
+                const unsigned ordinal = q - a.csr_diag_ptr[source] - 1;
+                uint64_t write = bases[source] + uint64_t(ordinal) * lower;
+                for (unsigned l = first; l < a.sym_c_ptr[source + 1]; ++l)
                 {
-                    const unsigned row = a.sym_r_idx[source];
-                    while (at < end && a.sym_r_idx[at] < row)
-                        ++at;
-                    // Mapped mode requires a structurally closed update pattern.
-                    if (at == end || a.sym_r_idx[at] != row)
+                    const unsigned slot = row_slot[a.sym_r_idx[l]];
+                    if (slot < begin || slot >= end)
                         throw std::runtime_error("update map missing lower row");
-                    destinations.push_back(at);
+                    destinations[write++] = slot;
                 }
             }
         }
-        bases[n] = destinations.size();
-        if (destinations.size() != total)
-            throw std::logic_error("update map size mismatch");
+        for (unsigned source = 0; source < n; ++source)
+            if (next_pivot[source] != a.csr_r_ptr[source + 1])
+                throw std::runtime_error("update map missing pivot");
         front_plan = make_mapped_front_plan(a, bases);
         map_bases.upload(bases);
         map_destinations.upload(destinations);
