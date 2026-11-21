@@ -11,7 +11,7 @@
 | 执行单位 | 任务组成 | 提交与资源 |
 | --- | --- | --- |
 | `GpuTask` | 同一模板的一批独立数值副本，支持所有更新策略 | 每批一个 stream、独立数值与输出缓冲，可准备 Graph |
-| `GpuTaskSet` | 有序的独立任务集合，每项引用一个 `Fused` 模板，可包含不同或重复模板 | 整个集合一个 stream、连续数值与输出缓冲，一次 grid 执行全部任务，直接提交 |
+| `GpuTaskSet` | 有序的独立任务集合，模板使用相同的 `Fused` 或 `Mapped` 模式，可包含不同或重复模板 | 整个集合一个 stream 和连续数值与输出缓冲。Fused 每任务一块；Mapped 按依赖层合并，可复用 Graph |
 
 调用者显式选择执行单位和数值策略。同结构合批可利用副本间的 SoA 布局与并行；异构集合通过不同矩阵提供块间并行，减少逐任务提交。两者使用相同的模板接口、数值类型和输入契约。
 
@@ -76,7 +76,7 @@ Device 适用于跨轮初值不变的场景，需比较每轮耗时与额外容�
 
 ## 数值输入
 
-两种执行单位均提供以下三种输入调用。`GpuTask` 的各输入路径可复用已准备的 Graph，`GpuTaskSet` 直接提交。上传新值保留模板默认初值。
+两种执行单位均提供以下三种输入调用。`GpuTask` 的各输入路径可复用已准备的 Graph，`Mapped` 集合也可复用 Graph。上传新值保留模板默认初值。
 
 | 调用 | 输入与元素数 |
 | --- | --- |
@@ -116,7 +116,9 @@ const REAL* factors = task.factors(0);
 
 ## 异构任务集合
 
-创建 `GpuTaskSet` 时，调用者给出 `Fused` 模板列表和逻辑任务的模板下标。每个任务有独立数值，重复下标共享同一个不可变计划。
+创建 `GpuTaskSet` 时，调用者给出同为 `Fused` 或同为 `Mapped` 的模板列表和逻辑任务的模板下标。每个任务有独立数值，重复下标共享同一个不可变计划。
+
+`Mapped` 集合把各任务同一依赖层的列归一化后，并行更新该层所有源列的目标。多源对同一因子的贡献使用原子加。在空闲的集合上调用 `prepare_graph()` 可捕获数值阶段和输出复制。输入恢复保持在 Graph 之前，因此同一个 Graph 可交替接收默认值、全量新值或紧凑新值。
 
 ```cpp
 GpuMatrix a(symbolic_a, positions_a, 32, false, UpdateMode::Fused);
@@ -132,7 +134,7 @@ const REAL* first = tasks.factors(0); // A factorization of template b.
 
 集合分别按完整因子数和紧凑位置数计算前缀偏移，`factor_offset(t)` 与 `compact_input_offset(t)` 给出第 `t` 个任务的起点，终点下标 `task_count()` 返回总元素数。完整输入按 `[task][factor slot]` 拼接，紧凑输入按 `[task][input position]` 拼接。紧凑上传要求全部任务的模板都已准备位置表，完整输入和默认恢复不要求位置表。
 
-每轮一次 H2D 上传、一次 grid 启动与一次 D2H 输出。紧凑输入在各任务的线程块内完成清零与 scatter，再开始分解。集合使用一个 stream，直接提交，不支持 Graph。完整因子缓冲保持普通 AoS 布局。
+两种集合每轮各做一次连续 H2D 上传和 D2H 输出，完整因子使用普通 AoS 布局。Fused 把清零、紧凑输入 scatter 和分解合入一次 grid 启动。Mapped 先清零并按固定位置 scatter 紧凑输入，再提交分层数值工作。
 
 `upload_input()` 或没有显式输入的 `enqueue()` 恢复各模板的默认初值。新值上传不分配或修改默认缓存，含静态主元扰动的集合只接受默认初值。
 

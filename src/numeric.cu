@@ -2062,6 +2062,8 @@ void GpuTask::check() const
     }
 }
 
+#include "mapped-set.cuh"
+
 struct GpuTaskSet::Impl
 {
     std::vector<std::shared_ptr<const GpuMatrix::Impl>> templates;
@@ -2069,22 +2071,29 @@ struct GpuTaskSet::Impl
     Buffer<REAL> values, compact_values;
     Buffer<REAL, true> output, default_input;
     Buffer<FusedTaskDescriptor> tasks;
+    std::unique_ptr<MappedSetPlan> mapped;
     unsigned block_threads = 256;
     cudaStream_t stream = nullptr;
     bool all_compact = true, perturb = false, compact_queued = false;
     bool pending = false, ready = false, failed = false, input_queued = false;
     double default_setup_ms = 0;
 
-    Impl(const std::vector<const GpuMatrix*>& matrices, const std::vector<size_t>& indices) : task_templates(indices)
+    Impl(const std::vector<const GpuMatrix*>& matrices, const std::vector<size_t>& indices)
+        : task_templates(indices)
     {
         if (indices.empty())
             throw std::invalid_argument("task set must not be empty");
         for (const auto* matrix : matrices)
         {
-            if (!matrix || matrix->impl_->update_mode != UpdateMode::Fused)
-                throw std::invalid_argument("task set requires Fused templates");
+            if (!matrix || (matrix->impl_->update_mode != UpdateMode::Fused &&
+                               matrix->impl_->update_mode != UpdateMode::Mapped))
+                throw std::invalid_argument("task set requires Fused or Mapped templates");
+            if (!templates.empty() && matrix->impl_->update_mode != templates.front()->update_mode)
+                throw std::invalid_argument("task set templates must use the same update mode");
             templates.push_back(matrix->impl_);
         }
+        if (!templates.empty() && templates.front()->update_mode == UpdateMode::Mapped)
+            mapped = std::make_unique<MappedSetPlan>();
         std::vector<FusedTaskDescriptor> descriptors;
         for (size_t index : indices)
         {
@@ -2094,10 +2103,11 @@ struct GpuTaskSet::Impl
             block_threads = std::max(block_threads, a.fused_block_threads);
             if (indices.size() > a.max_grid_x)
                 throw std::invalid_argument("task set exceeds device grid limit");
-            descriptors.push_back({full_offsets.back(), compact_offsets.back(), a.nnz, a.compact_elements,
-                unsigned(a.levels.size() - 1), a.diag.ptr, a.input_positions.ptr, a.level_idx.ptr, a.fused_steps.ptr,
-                a.panel_groups.ptr, a.panel_records.ptr, a.panel_pairs.ptr, a.fused_strips.ptr,
-                a.fused_destinations.ptr, a.fused_normalizations.ptr, a.inline_singletons, a.perturb, a.threshold});
+            if (!mapped)
+                descriptors.push_back({full_offsets.back(), compact_offsets.back(), a.nnz, a.compact_elements,
+                    unsigned(a.levels.size() - 1), a.diag.ptr, a.input_positions.ptr, a.level_idx.ptr,
+                    a.fused_steps.ptr, a.panel_groups.ptr, a.panel_records.ptr, a.panel_pairs.ptr, a.fused_strips.ptr,
+                    a.fused_destinations.ptr, a.fused_normalizations.ptr, a.inline_singletons, a.perturb, a.threshold});
             full_offsets.push_back(checked_sum(full_offsets.back(), a.nnz));
             compact_offsets.push_back(checked_sum(compact_offsets.back(), a.compact_elements));
             all_compact = all_compact && a.compact_elements != 0;
@@ -2111,7 +2121,10 @@ struct GpuTaskSet::Impl
         // input/output offsets, so buffers and results stay in logical task order.
         std::stable_sort(descriptors.begin(), descriptors.end(),
             [](const auto& x, const auto& y) { return x.nnz > y.nnz; });
-        tasks.upload(descriptors);
+        if (mapped)
+            mapped->build(templates, indices, full_offsets, compact_offsets);
+        else
+            tasks.upload(descriptors);
         gpu_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create task set stream");
     }
     ~Impl()
@@ -2121,6 +2134,19 @@ struct GpuTaskSet::Impl
             cudaStreamSynchronize(stream);
             cudaStreamDestroy(stream);
         }
+    }
+    void download() const
+    {
+        gpu_check(cudaMemcpyAsync(output.ptr, values.ptr, output.bytes, cudaMemcpyDeviceToHost, stream),
+            "download task set factors");
+    }
+    void enqueue_mapped() const
+    {
+        if (perturb)
+            mapped->enqueue<true>(values.ptr, stream);
+        else
+            mapped->enqueue<false>(values.ptr, stream);
+        download();
     }
     void require_upload() const
     {
@@ -2175,10 +2201,43 @@ size_t GpuTaskSet::factor_offset(size_t task) const { return impl_->full_offsets
 size_t GpuTaskSet::compact_input_offset(size_t task) const { return impl_->compact_offsets.at(task); }
 size_t GpuTaskSet::device_bytes() const
 {
-    return checked_sum(checked_sum(impl_->values.bytes, impl_->compact_values.bytes), impl_->tasks.bytes);
+    size_t bytes = checked_sum(checked_sum(impl_->values.bytes, impl_->compact_values.bytes), impl_->tasks.bytes);
+    if (const auto* m = impl_->mapped.get())
+        for (auto size : {m->tasks.bytes, m->columns.bytes, m->updates.bytes})
+            bytes = checked_sum(bytes, size);
+    return bytes;
 }
 size_t GpuTaskSet::pinned_bytes() const { return checked_sum(impl_->output.bytes, impl_->default_input.bytes); }
 double GpuTaskSet::default_input_setup_ms() const { return impl_->default_setup_ms; }
+void GpuTaskSet::prepare_graph()
+{
+    auto& t = *impl_;
+    if (!t.mapped || t.failed || t.pending || t.input_queued)
+        throw std::logic_error("cannot capture mapped task set");
+    if (t.mapped->graph)
+        return;
+    gpu_check(cudaStreamBeginCapture(t.stream, cudaStreamCaptureModeThreadLocal), "begin mapped set capture");
+    cudaGraph_t graph = nullptr;
+    bool capturing = true;
+    try
+    {
+        t.enqueue_mapped();
+        const auto status = cudaStreamEndCapture(t.stream, &graph);
+        capturing = false;
+        gpu_check(status, "end mapped set capture");
+        gpu_check(cudaGraphInstantiate(&t.mapped->graph, graph, nullptr, nullptr, 0), "instantiate mapped set graph");
+        cudaGraphDestroy(graph);
+    }
+    catch (...)
+    {
+        if (capturing)
+            cudaStreamEndCapture(t.stream, &graph);
+        if (graph)
+            cudaGraphDestroy(graph);
+        t.failed = true;
+        throw;
+    }
+}
 void GpuTaskSet::upload_input() { impl_->upload_default(); }
 void GpuTaskSet::upload_input(const REAL* input, size_t elements)
 {
@@ -2208,11 +2267,27 @@ void GpuTaskSet::enqueue()
     t.input_queued = false;
     try
     {
-        fused_task_set<<<unsigned(task_count()), t.block_threads, 0, t.stream>>>(t.values.ptr, t.compact_values.ptr,
-            t.tasks.ptr, t.compact_queued);
-        gpu_check(cudaGetLastError(), "factor task set");
-        gpu_check(cudaMemcpyAsync(t.output.ptr, t.values.ptr, t.output.bytes, cudaMemcpyDeviceToHost, t.stream),
-            "download task set factors");
+        if (t.mapped)
+        {
+            if (t.compact_queued)
+            {
+                gpu_check(cudaMemsetAsync(t.values.ptr, 0, t.values.bytes, t.stream), "clear mapped task set");
+                scatter_mapped_set<<<t.mapped->scatter_grid, 256, 0, t.stream>>>(
+                    t.values.ptr, t.compact_values.ptr, t.mapped->tasks.ptr, task_count());
+                gpu_check(cudaGetLastError(), "scatter mapped task set");
+            }
+            if (t.mapped->graph)
+                gpu_check(cudaGraphLaunch(t.mapped->graph, t.stream), "launch mapped set graph");
+            else
+                t.enqueue_mapped();
+        }
+        else
+        {
+            fused_task_set<<<unsigned(task_count()), t.block_threads, 0, t.stream>>>(t.values.ptr, t.compact_values.ptr,
+                t.tasks.ptr, t.compact_queued);
+            gpu_check(cudaGetLastError(), "factor task set");
+            t.download();
+        }
     }
     catch (...)
     {

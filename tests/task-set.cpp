@@ -132,7 +132,7 @@ void check(GpuTaskSet& set,
         residual(*fixtures[identities[t]].a, source.data() + set.factor_offset(t), set.factors(t));
     }
 }
-void lifecycle(bool wide)
+void lifecycle(bool wide, UpdateMode mode, bool graph = false)
 {
     std::vector<Fixture> fixtures;
     for (unsigned kind = 0; kind < 3; ++kind)
@@ -146,13 +146,18 @@ void lifecycle(bool wide)
         std::vector<const GpuMatrix*> templates;
         for (const auto& f : fixtures)
         {
-            matrices.push_back(std::make_unique<GpuMatrix>(*f.a, f.positions, 1, false, UpdateMode::Fused));
+            matrices.push_back(std::make_unique<GpuMatrix>(*f.a, f.positions, 1, false, mode));
             templates.push_back(matrices.back().get());
         }
         rejects<std::invalid_argument>([&] { GpuTaskSet invalid(templates, {}); }, "empty set accepted");
         rejects<std::out_of_range>([&] { GpuTaskSet invalid(templates, {3}); }, "invalid template index accepted");
         rejects<std::invalid_argument>([&] { GpuTaskSet invalid({nullptr}, {0}); }, "null template accepted");
         set = std::make_unique<GpuTaskSet>(templates, identities);
+        if (graph)
+        {
+            set->prepare_graph();
+            set->prepare_graph();
+        }
         // Upload-only destruction must drain while its source is still alive.
         const auto source = input(fixtures[0], 1, 0);
         {
@@ -204,7 +209,11 @@ void lifecycle(bool wide)
         rejects<std::logic_error>([&] { set->factors(0); }, "upload did not invalidate result");
         rejects<std::logic_error>([&] { set->wait(); }, "upload-only wait accepted");
         rejects<std::logic_error>([&] { set->upload_input(); }, "second queued input accepted");
+        if (graph)
+            rejects<std::logic_error>([&] { set->prepare_graph(); }, "captured with queued input");
         set->enqueue();
+        if (graph)
+            rejects<std::logic_error>([&] { set->prepare_graph(); }, "captured with pending output");
         rejects<std::logic_error>([&] { set->enqueue(); }, "second pending execution accepted");
         rejects<std::logic_error>([&] { set->check(); }, "pending result accepted");
         set->wait();
@@ -223,14 +232,117 @@ void lifecycle(bool wide)
     check(*set, fixtures, identities, defaults);
     require(set->default_input_setup_ms() == setup_ms, "default cache rebuilt");
 }
+Fixture build_fixture(unsigned n, std::vector<unsigned> rows, std::vector<unsigned> columns, std::vector<double> values)
+{
+    Fixture f;
+    f.a = std::make_unique<Symbolic_Matrix>(n, std::cout, std::cerr);
+    f.a->fill_in(rows.data(), columns.data());
+    f.a->csr();
+    f.a->predictLU(rows.data(), columns.data(), values.data());
+    f.a->leveling();
+    for (unsigned p = f.a->nnz; p > 0; --p)
+        f.positions.push_back(p - 1);
+    return f;
+}
+Fixture collision()
+{
+    constexpr unsigned n = 35;
+    std::vector<unsigned> rows, columns{0};
+    std::vector<double> values;
+    for (unsigned c = 0; c < n; ++c)
+    {
+        for (unsigned r = 0; r < n; ++r)
+        {
+            if (c < 2 && r < 2 && r != c)
+                continue;
+            rows.push_back(r);
+            values.push_back(r == c ? 8 : .125);
+        }
+        columns.push_back(unsigned(rows.size()));
+    }
+    auto f = build_fixture(n, rows, std::move(columns), std::move(values));
+    require(f.a->level_ptr[1] == 2 && f.a->level_idx[0] == 0 && f.a->level_idx[1] == 1,
+        "expected two colliding sources");
+    return f;
+}
+void mapped_collision(bool graph)
+{
+    auto a = collision();
+    auto b = build_fixture(2, {0, 1, 1}, {0, 2, 3}, {2, 4, 8});
+    GpuMatrix first(*a.a, a.positions, 1, false, UpdateMode::Mapped);
+    GpuMatrix second(*b.a, b.positions, 1, false, UpdateMode::Mapped);
+    GpuTaskSet set({&first, &second}, {1, 0, 0});
+    if (graph)
+        set.prepare_graph();
+    set.enqueue();
+    set.wait();
+    require(set.factors(0)[1] == REAL(2), "lower-only source did not normalize");
+    const auto p = a.a->l_col_ptr[2];
+    const REAL pivot = REAL(8) - REAL(2) * REAL(.125) * REAL(.125) / REAL(8);
+    for (unsigned job : {1u, 2u})
+    {
+        require(set.factors(job)[p] == pivot, "concurrent source update was lost");
+        residual(*a.a, a.a->val.data(), set.factors(job));
+    }
+}
+void static_perturbation(bool graph)
+{
+    auto a = build_fixture(3, {0, 1, 0, 1, 2}, {0, 2, 4, 5}, {-1e-6, 1e-4, .03125, 2, 0});
+    auto b = build_fixture(3, {0, 1, 0, 1, 2}, {0, 2, 4, 5}, {-2e-6, 2e-4, .0625, 4, 0});
+    auto plain = build_fixture(2, {0, 1}, {0, 1, 2}, {1e-6, 2});
+    GpuMatrix ga(*a.a, a.positions, 1, true, UpdateMode::Mapped);
+    GpuMatrix gb(*b.a, b.positions, 1, true, UpdateMode::Mapped);
+    GpuMatrix gp(*plain.a, plain.positions, 1, false, UpdateMode::Mapped);
+    GpuTaskSet set({&ga, &gb, &gp}, {1, 2, 0, 1});
+    if (graph)
+        set.prepare_graph();
+    std::vector<REAL> rejected(set.factor_offset(4), REAL(1));
+    rejects<std::invalid_argument>([&] { set.upload_input(rejected.data(), rejected.size()); },
+        "perturbed fresh full input accepted");
+    rejects<std::invalid_argument>([&] { set.upload_compact_input(rejected.data(), set.compact_input_offset(4)); },
+        "perturbed fresh compact input accepted");
+    for (int repeat = 0; repeat < 2; ++repeat)
+    {
+        if (repeat)
+            set.upload_input();
+        set.enqueue();
+        set.wait();
+        set.check();
+        for (size_t i = 0; i < 4; ++i)
+        {
+            if (i == 1)
+            {
+                require(set.factors(i)[0] == plain.a->val[0], "plain template was perturbed");
+                residual(*plain.a, plain.a->val.data(), set.factors(i));
+                continue;
+            }
+            const bool small = i == 2;
+            const auto& f = small ? a : b;
+            auto expected = f.a->val;
+            const REAL threshold = (small ? REAL(2.03125) : REAL(4.0625)) * REAL(3.45e-4f);
+            expected[0] = threshold;
+            expected.back() = threshold;
+            require(set.factors(i)[0] == threshold && set.factors(i)[expected.size() - 1] == threshold,
+                "incorrect signed or empty-column perturbation");
+            residual(*f.a, expected.data(), set.factors(i));
+        }
+    }
+}
 void api_boundaries()
 {
     auto sparse = fixture(1), diagonal = fixture(2);
     {
         GpuMatrix panel(*diagonal.a, 1, false, UpdateMode::Panel);
-        rejects<std::invalid_argument>([&] { GpuTaskSet invalid({&panel}, {0}); }, "non-Fused template accepted");
+        rejects<std::invalid_argument>([&] { GpuTaskSet invalid({&panel}, {0}); }, "Panel template accepted");
     }
     GpuMatrix compact_template(*sparse.a, sparse.positions, 1, false, UpdateMode::Fused);
+    {
+        GpuMatrix mapped(*diagonal.a, 1, false, UpdateMode::Mapped);
+        rejects<std::invalid_argument>([&] { GpuTaskSet invalid({&mapped, &compact_template}, {0, 1}); },
+            "mixed update modes accepted");
+        GpuTaskSet fused({&compact_template}, {0});
+        rejects<std::logic_error>([&] { fused.prepare_graph(); }, "captured Fused task set");
+    }
     {
         GpuMatrix full_only_template(*diagonal.a, 1, false, UpdateMode::Fused);
         GpuTaskSet set({&full_only_template, &compact_template}, {1, 0});
@@ -284,8 +396,14 @@ int main()
 {
     try
     {
-        lifecycle(false);
-        lifecycle(true);
+        lifecycle(false, UpdateMode::Fused);
+        lifecycle(true, UpdateMode::Fused);
+        for (bool graph : {false, true})
+        {
+            lifecycle(false, UpdateMode::Mapped, graph);
+            mapped_collision(graph);
+            static_perturbation(graph);
+        }
         api_boundaries();
         std::cout << "PASS heterogeneous task-set offsets, compact reset, snapshots, lifetime and API boundaries\n";
         return 0;
