@@ -3,13 +3,13 @@
 // Diagonals and raw L stay in the usual factor representation for final normalization.
 constexpr unsigned front_tile = 16;
 
-template <bool Pack>
+template <bool Pack, class Slot = unsigned>
 __global__ void mapped_front_copy(REAL* sparse,
     REAL* dense,
     unsigned rows,
     unsigned cols,
     unsigned diagonal,
-    const unsigned* destinations,
+    const Slot* destinations,
     const unsigned* pivots)
 {
     const unsigned position = blockIdx.x * blockDim.x + threadIdx.x;
@@ -22,7 +22,7 @@ __global__ void mapped_front_copy(REAL* sparse,
     else if (r == 0)
         slot = pivots[c - 1];
     else
-        slot = destinations[(c - 1) * (rows - 1) + r - 1];
+        slot = mapped_position(destinations, (c - 1) * (rows - 1) + r - 1, pivots[c - 1]);
     if constexpr (Pack)
         dense[position] = sparse[slot];
     else
@@ -243,11 +243,11 @@ MappedFrontPlan make_mapped_front_plan(const Symbolic_Matrix& a, const std::vect
     return plan;
 }
 
-template <bool Perturb>
+template <bool Perturb, class Slot = unsigned>
 void enqueue_mapped_front(const MappedFront& front,
     REAL* sparse,
     REAL* dense,
-    const unsigned* destination_map,
+    const Slot* destination_map,
     const unsigned* pivot_map,
     REAL threshold,
     cudaStream_t stream)

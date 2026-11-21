@@ -405,9 +405,10 @@ void verify_template_bytes(const GpuMatrix& gpu,
     for (unsigned c = 0; c < matrix.n; ++c)
         updates += uint64_t(matrix.sym_c_ptr[c + 1] - matrix.l_col_ptr[c] - 1) *
                    (matrix.csr_r_ptr[c + 1] - matrix.csr_diag_ptr[c] - 1);
-    const size_t map = mode == UpdateMode::Mapped ? sizeof(uint64_t) * (size_t(matrix.n) + 1) +
-                                                        sizeof(unsigned) * (size_t(updates) + matrix.csr_c_idx.size())
-                                                  : 0;
+    const size_t map = mode == UpdateMode::Mapped
+                           ? sizeof(uint64_t) * (size_t(matrix.n) + 1) + sizeof(unsigned) * matrix.csr_c_idx.size() +
+                                 size_t(updates) * sizeof(uint16_t)
+                           : 0;
     const size_t task =
         sizeof(REAL) * (matrix.val.size() + (mode == UpdateMode::Scan ? size_t(matrix.n) * gpu.tmp_slots() : 0));
     if (gpu.task_device_bytes() != task)
@@ -616,6 +617,16 @@ void test_repeated_mapped_indices()
             (repeated_pivot && pivots[2] != first))
             throw std::runtime_error("mapped lookup changed a repeated factor slot");
 
+        std::vector<uint16_t> host_delta(2);
+        if (mapped_pivot_slots(a, offsets, &host_delta) != pivots)
+            throw std::runtime_error("relative map changed pivot slots");
+        Buffer<uint16_t> relative;
+        create_mapped_destinations(a, 2, 1, bases.ptr, col.ptr, diag.ptr, csr_diag.ptr, pivot_slots.ptr, relative);
+        std::vector<uint16_t> delta(2);
+        gpu_check(cudaMemcpy(delta.data(), relative.ptr, relative.bytes, cudaMemcpyDeviceToHost),
+            "read relative duplicate map");
+        if (delta != host_delta || pivots[1] + delta[0] != 5 || pivots[repeated_pivot ? 2 : 1] + delta[1] != 5)
+            throw std::runtime_error("relative slots changed first-occurrence lookup");
         // Remove the required lower row from the target after constructing
         // its pivots. The device constructor must report the missing entry.
         std::fill(a.sym_r_idx.begin() + a.l_col_ptr[1] + 1, a.sym_r_idx.begin() + a.sym_c_ptr[2], 1u);

@@ -7,6 +7,7 @@ struct MappedSetTask
     unsigned compact_count;
     const unsigned *positions, *col, *diag, *csr_diag, *destinations, *pivots;
     const uint64_t* bases;
+    const uint16_t* deltas;
     REAL threshold;
 };
 
@@ -66,6 +67,23 @@ __global__ void normalize_mapped_set(REAL* factors,
         values[i] /= divisor;
 }
 
+template <class Slot>
+__device__ inline void update_mapped_target(REAL* values,
+    const Slot* destinations,
+    uint64_t base,
+    unsigned lower,
+    unsigned count,
+    unsigned pivot_position)
+{
+    const REAL pivot = values[pivot_position];
+    for (size_t i = threadIdx.x % 32; i < count; i += 32)
+    {
+        const REAL factor = values[lower + i];
+        if (factor != REAL(0))
+            atomicAdd(values + mapped_position(destinations, base + i, pivot_position), -factor * pivot);
+    }
+}
+
 __global__ void
 update_mapped_set(REAL* factors, const MappedSetTask* tasks, const MappedSetUpdate* updates, unsigned begin)
 {
@@ -79,13 +97,11 @@ update_mapped_set(REAL* factors, const MappedSetTask* tasks, const MappedSetUpda
     const unsigned diagonal = task.diag[entry.source], lower = diagonal + 1;
     const unsigned count = task.col[entry.source + 1] - lower;
     const uint64_t base = task.bases[entry.source] + uint64_t(target) * count;
-    const REAL pivot = values[task.pivots[task.csr_diag[entry.source] + 1 + target]];
-    for (size_t i = threadIdx.x % 32; i < count; i += 32)
-    {
-        const REAL factor = values[lower + i];
-        if (factor != REAL(0))
-            atomicAdd(values + task.destinations[base + i], -factor * pivot);
-    }
+    const unsigned pivot = task.pivots[task.csr_diag[entry.source] + 1 + target];
+    if (task.deltas)
+        update_mapped_target(values, task.deltas, base, lower, count, pivot);
+    else
+        update_mapped_target(values, task.destinations, base, lower, count, pivot);
 }
 
 struct MappedSetPlan
@@ -122,7 +138,8 @@ struct MappedSetPlan
         {
             const auto& a = *templates[indices[job]];
             task_specs.push_back({factors[job], compact[job], a.compact_elements, a.input_positions.ptr, a.col.ptr,
-                a.diag.ptr, a.csr_diag.ptr, a.map_destinations.ptr, a.map_pivots.ptr, a.map_bases.ptr, a.threshold});
+                a.diag.ptr, a.csr_diag.ptr, a.map_destinations.ptr, a.map_pivots.ptr, a.map_bases.ptr, a.map_deltas.ptr,
+                a.threshold});
             depth = std::max(depth, a.levels.size() - 1);
             scatter_blocks =
                 std::max(scatter_blocks, (a.compact_elements / 256) + unsigned(a.compact_elements % 256 != 0));

@@ -10,10 +10,20 @@
 #include <stdexcept>
 #include <utility>
 #include <cstdint>
+#include <type_traits>
 
 using namespace std;
 
-template <UpdateMode Mode, bool Perturb = false>
+// The U pivot already supplies a stable base in the sorted target column.
+template <class Slot>
+__device__ inline unsigned mapped_position(const Slot* positions, uint64_t ordinal, unsigned pivot)
+{
+    if constexpr (std::is_same_v<Slot, uint16_t>)
+        return pivot + unsigned(positions[ordinal]);
+    return positions[ordinal];
+}
+
+template <UpdateMode Mode, bool Perturb = false, class Slot = unsigned>
 __global__ void RL(const unsigned* __restrict__ sym_c_ptr_dev,
     const unsigned* __restrict__ sym_r_idx_dev,
     REAL* __restrict__ val_dev,
@@ -30,7 +40,7 @@ __global__ void RL(const unsigned* __restrict__ sym_c_ptr_dev,
     const size_t scratch_stride = 0,
     const REAL pert = 0,
     const uint64_t* __restrict__ map_bases = nullptr,
-    const unsigned* __restrict__ map_destinations = nullptr,
+    const Slot* __restrict__ map_destinations = nullptr,
     const unsigned* __restrict__ map_pivots = nullptr)
 {
     val_dev += size_t(blockIdx.y) * value_stride;
@@ -80,14 +90,15 @@ __global__ void RL(const unsigned* __restrict__ sym_c_ptr_dev,
         const unsigned first_target = csr_diag_ptr_dev[currentCol] + 1;
         for (unsigned q = first_target + wid; q < csr_r_ptr_dev[currentCol + 1]; q += blockDim.x / GLU_GROUP_SIZE)
         {
-            const REAL pivot = val_dev[map_pivots[q]];
+            const unsigned pivot_position = map_pivots[q];
+            const REAL pivot = val_dev[pivot_position];
             const uint64_t base = map_bases[currentCol] + uint64_t(q - first_target) * currentLColSize;
             for (unsigned i = tid % GLU_GROUP_SIZE; i < currentLColSize; i += GLU_GROUP_SIZE)
             {
                 const unsigned source = l_col_ptr_dev[currentCol] + 1 + i;
                 const REAL factor = val_dev[source];
                 if (factor != REAL(0))
-                    atomicAdd(&val_dev[map_destinations[base + i]], -factor * pivot);
+                    atomicAdd(&val_dev[mapped_position(map_destinations, base + i, pivot_position)], -factor * pivot);
             }
         }
     }
@@ -200,7 +211,7 @@ __global__ void RL_onecol_factorizeCurrentCol(const unsigned* __restrict__ sym_c
     }
 }
 
-template <UpdateMode Mode>
+template <UpdateMode Mode, class Slot = unsigned>
 __global__ void RL_onecol_updateSubmat(const unsigned* __restrict__ sym_c_ptr_dev,
     const unsigned* __restrict__ sym_r_idx_dev,
     REAL* __restrict__ val_dev,
@@ -214,7 +225,7 @@ __global__ void RL_onecol_updateSubmat(const unsigned* __restrict__ sym_c_ptr_de
     const size_t scratch_stride = 0,
     const unsigned* __restrict__ l_col_ptr_dev = nullptr,
     const uint64_t* __restrict__ map_bases = nullptr,
-    const unsigned* __restrict__ map_destinations = nullptr,
+    const Slot* __restrict__ map_destinations = nullptr,
     const unsigned* __restrict__ map_pivots = nullptr)
 {
     val_dev += size_t(blockIdx.y) * value_stride;
@@ -232,14 +243,15 @@ __global__ void RL_onecol_updateSubmat(const unsigned* __restrict__ sym_c_ptr_de
             return;
         const unsigned q = csr_diag_ptr_dev[currentCol] + 1 + bid;
         const uint64_t base = map_bases[currentCol] + uint64_t(bid) * count;
+        const unsigned pivot_position = map_pivots[q];
         if (tid == 0)
-            s = val_dev[map_pivots[q]];
+            s = val_dev[pivot_position];
         __syncthreads();
         for (unsigned i = tid; i < count; i += blockDim.x)
         {
             const REAL factor = val_dev[lower + i];
             if (factor != REAL(0))
-                atomicAdd(&val_dev[map_destinations[base + i]], -factor * s);
+                atomicAdd(&val_dev[mapped_position(map_destinations, base + i, pivot_position)], -factor * s);
         }
     }
     else
@@ -284,7 +296,7 @@ __global__ void RL_onecol_updateSubmat(const unsigned* __restrict__ sym_c_ptr_de
 }
 
 // Deferred small levels expose source-target parallelism without a separate factor launch.
-template <bool Perturb = false>
+template <bool Perturb = false, class Slot = unsigned>
 __global__ void mapped_level_update(REAL* __restrict__ values,
     size_t stride,
     const unsigned* __restrict__ col,
@@ -295,12 +307,12 @@ __global__ void mapped_level_update(REAL* __restrict__ values,
     int begin,
     int end,
     const uint64_t* __restrict__ bases,
-    const unsigned* __restrict__ destinations,
+    const Slot* __restrict__ destinations,
     const unsigned* __restrict__ pivots,
     REAL threshold = 0)
 {
     values += size_t(blockIdx.y) * stride;
-    __shared__ unsigned lower, count;
+    __shared__ unsigned lower, count, pivot_position;
     __shared__ uint64_t base;
     __shared__ REAL pivot;
     __shared__ REAL divisor;
@@ -322,7 +334,8 @@ __global__ void mapped_level_update(REAL* __restrict__ values,
         lower = diag[source] + 1;
         count = col[source + 1] - lower;
         base = bases[source] + target * count;
-        pivot = values[pivots[csr_diag[source] + 1 + target]];
+        pivot_position = pivots[csr_diag[source] + 1 + target];
+        pivot = values[pivot_position];
         divisor = values[diag[source]];
         if constexpr (Perturb)
             if (fabs(divisor) < threshold)
@@ -334,12 +347,12 @@ __global__ void mapped_level_update(REAL* __restrict__ values,
         REAL factor = values[lower + i];
         factor /= divisor;
         if (factor != REAL(0))
-            atomicAdd(&values[destinations[base + i]], -factor * pivot);
+            atomicAdd(&values[mapped_position(destinations, base + i, pivot_position)], -factor * pivot);
     }
 }
 
 // Adjacent lanes access one symbolic position across independent value copies.
-template <bool Perturb = false, bool Normalized = false>
+template <bool Perturb = false, bool Normalized = false, class Slot = unsigned>
 __global__ void mapped_level_update_soa(REAL* values,
     unsigned copies,
     const unsigned* col,
@@ -350,7 +363,7 @@ __global__ void mapped_level_update_soa(REAL* values,
     int begin,
     int end,
     const uint64_t* bases,
-    const unsigned* destinations,
+    const Slot* destinations,
     const unsigned* pivots,
     REAL threshold,
     unsigned value_stride,
@@ -403,7 +416,7 @@ __global__ void mapped_level_update_soa(REAL* values,
             factor /= divisor;
         if (factor != REAL(0))
         {
-            REAL* target = &values[size_t(destinations[base + i]) * step + copy_base];
+            REAL* target = &values[size_t(mapped_position(destinations, base + i, pivot_position)) * step + copy_base];
             atomicAdd(target, -factor * pivot);
         }
     }
@@ -864,10 +877,19 @@ template <class T, bool Pinned = false> struct Buffer
     }
 };
 
+template <class Slot> __host__ __device__ Slot encode_mapped_position(unsigned destination, unsigned pivot)
+{
+    if constexpr (std::is_same_v<Slot, uint16_t>)
+        return uint16_t(destination - pivot);
+    return destination;
+}
+
 // CSC and CSR enumerate the same upper entries in different orders. Preserve
 // the first CSC slot when several entries have the same row.
-std::vector<unsigned> mapped_pivot_slots(const Symbolic_Matrix& a, const std::vector<uint64_t>& bases,
-    std::vector<unsigned>* host_destinations = nullptr)
+template <class Slot = unsigned>
+std::vector<unsigned> mapped_pivot_slots(const Symbolic_Matrix& a,
+    const std::vector<uint64_t>& bases,
+    std::vector<Slot>* host_destinations = nullptr)
 {
     if (std::any_of(a.sym_r_idx.begin(), a.sym_r_idx.end(), [&a](unsigned row) { return row >= a.n; }))
         throw std::invalid_argument("update map row out of range");
@@ -902,9 +924,9 @@ std::vector<unsigned> mapped_pivot_slots(const Symbolic_Matrix& a, const std::ve
                 for (unsigned l = lower_begin; l < lower_end; ++l)
                 {
                     const unsigned slot = row_slot[a.sym_r_idx[l]];
-                    if (slot < begin || slot >= end)
+                    if (slot < first || slot >= end)
                         throw std::runtime_error("update map missing lower row");
-                    (*host_destinations)[write++] = slot;
+                    (*host_destinations)[write++] = encode_mapped_position<Slot>(slot, first);
                 }
             }
         }
@@ -917,9 +939,18 @@ std::vector<unsigned> mapped_pivot_slots(const Symbolic_Matrix& a, const std::ve
 
 // One lane owns one output position. The prefix identifies its source, then
 // the upper CSR entry identifies the target column to search.
-__global__ void build_mapped_destinations(uint64_t total, unsigned n, const uint64_t* bases,
-    const unsigned* col, const unsigned* rows, const unsigned* diag, const unsigned* csr_diag,
-    const unsigned* targets, const unsigned* pivots, unsigned* destinations, unsigned* missing)
+template <class Slot>
+__global__ void build_mapped_destinations(uint64_t total,
+    unsigned n,
+    const uint64_t* bases,
+    const unsigned* col,
+    const unsigned* rows,
+    const unsigned* diag,
+    const unsigned* csr_diag,
+    const unsigned* targets,
+    const unsigned* pivots,
+    Slot* destinations,
+    unsigned* missing)
 {
     for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
          i += uint64_t(gridDim.x) * blockDim.x)
@@ -951,13 +982,20 @@ __global__ void build_mapped_destinations(uint64_t total, unsigned n, const uint
         }
         if (lo == end || rows[lo] != row)
             atomicExch(missing, 1u);
-        destinations[i] = lo;
+        destinations[i] = encode_mapped_position<Slot>(lo, pivots[q]);
     }
 }
 
-void create_mapped_destinations(const Symbolic_Matrix& a, uint64_t total, unsigned max_grid,
-    const uint64_t* bases, const unsigned* col, const unsigned* diag, const unsigned* csr_diag,
-    const unsigned* pivots, Buffer<unsigned>& output)
+template <class Slot>
+void create_mapped_destinations(const Symbolic_Matrix& a,
+    uint64_t total,
+    unsigned max_grid,
+    const uint64_t* bases,
+    const unsigned* col,
+    const unsigned* diag,
+    const unsigned* csr_diag,
+    const unsigned* pivots,
+    Buffer<Slot>& output)
 {
     output.allocate(size_t(total));
     if (!total)
@@ -1052,6 +1090,7 @@ struct GpuMatrix::Impl
     std::vector<uint64_t> target_prefix;
     Buffer<uint64_t> map_bases;
     Buffer<unsigned> map_destinations, map_pivots;
+    Buffer<uint16_t> map_deltas;
     std::vector<UpdateRange> panel_immediate, panel_deferred, panel_dense;
     bool inline_singletons = false;
     Buffer<UpdateGroup> panel_groups;
@@ -1336,8 +1375,10 @@ struct GpuMatrix::Impl
     {
         // Count before allocating the potentially much larger-than-factor map.
         std::vector<uint64_t> bases(size_t(n) + 1);
+        unsigned longest_column = 0;
         for (unsigned c = 0; c < n; ++c)
         {
+            longest_column = std::max(longest_column, a.sym_c_ptr[c + 1] - a.sym_c_ptr[c]);
             const uint64_t lower = a.sym_c_ptr[c + 1] - a.l_col_ptr[c] - 1;
             const uint64_t targets = a.csr_r_ptr[c + 1] - a.csr_diag_ptr[c] - 1;
             if (targets && lower > std::numeric_limits<uint64_t>::max() / targets)
@@ -1348,8 +1389,11 @@ struct GpuMatrix::Impl
             bases[c + 1] = bases[c] + added;
         }
         const uint64_t total = bases.back();
+        // The pivot is at or before every destination in its sorted target column.
+        const bool narrow = longest_column <= uint64_t(std::numeric_limits<uint16_t>::max()) + 1;
         map_bytes = checked_sum(checked_bytes(uint64_t(n) + 1, sizeof(uint64_t)),
-            checked_sum(checked_bytes(total, sizeof(unsigned)), checked_bytes(a.csr_c_idx.size(), sizeof(unsigned))));
+            checked_sum(checked_bytes(total, narrow ? sizeof(uint16_t) : sizeof(unsigned)),
+                checked_bytes(a.csr_c_idx.size(), sizeof(unsigned))));
         const size_t available = GpuMatrix::free_device_bytes();
         if (map_bytes > available)
             throw std::runtime_error("mapped updates require " + std::to_string(map_bytes) +
@@ -1360,15 +1404,24 @@ struct GpuMatrix::Impl
         // path can build any map that fits without temporary device storage.
         constexpr unsigned small_map_entries = 64 * 1024;
         const bool on_host = total <= small_map_entries || device_workspace > available - map_bytes;
-        std::vector<unsigned> destinations(on_host ? size_t(total) : 0);
-        map_pivots.upload(mapped_pivot_slots(a, bases, on_host ? &destinations : nullptr));
         front_plan = make_mapped_front_plan(a, bases);
         map_bases.upload(bases);
-        if (on_host)
-            map_destinations.upload(destinations);
+        if (narrow)
+            upload_map(a, bases, on_host, map_deltas);
         else
-            create_mapped_destinations(a, total, max_grid_x, map_bases.ptr, col.ptr, diag.ptr, csr_diag.ptr,
-                map_pivots.ptr, map_destinations);
+            upload_map(a, bases, on_host, map_destinations);
+    }
+
+    template <class Slot>
+    void upload_map(const Symbolic_Matrix& a, const std::vector<uint64_t>& bases, bool on_host, Buffer<Slot>& output)
+    {
+        std::vector<Slot> destinations(on_host ? size_t(bases.back()) : 0);
+        map_pivots.upload(mapped_pivot_slots(a, bases, on_host ? &destinations : nullptr));
+        if (on_host)
+            output.upload(destinations);
+        else
+            create_mapped_destinations(a, bases.back(), max_grid_x, map_bases.ptr, col.ptr, diag.ptr, csr_diag.ptr,
+                map_pivots.ptr, output);
     }
 };
 
@@ -1502,7 +1555,8 @@ struct GpuTask::Impl
             to_interleaved ? matrix->nnz : soa_stride, to_interleaved ? soa_stride : matrix->nnz);
         gpu_check(cudaGetLastError(), "transpose task values");
     }
-    template <UpdateMode Mode, bool Perturb> void enqueue_numeric()
+    template <UpdateMode Mode, bool Perturb, class Slot = unsigned>
+    void enqueue_numeric(const Slot* mapped_positions = nullptr)
     {
         auto& t = *this;
         const auto& a = *matrix;
@@ -1572,7 +1626,7 @@ struct GpuTask::Impl
                 if (front_values.ptr && a.front_plan.starting_at[lev].steps)
                 {
                     const auto& front = a.front_plan.starting_at[lev];
-                    enqueue_mapped_front<Perturb>(front, values.ptr, front_values.ptr, a.map_destinations.ptr,
+                    enqueue_mapped_front<Perturb>(front, values.ptr, front_values.ptr, mapped_positions,
                         a.map_pivots.ptr, a.threshold, stream);
                     lev += front.steps - 1;
                     continue;
@@ -1593,13 +1647,13 @@ struct GpuTask::Impl
                             mapped_level_update_soa<Perturb, normalize_soa_levels>
                                 <<<dim3(unsigned(targets), copy_tiles(copy_bits)), 256, 0, stream>>>(
                                     interleaved_values.ptr, copies, a.col.ptr, a.diag.ptr, a.csr_diag.ptr,
-                                    a.level_idx.ptr, a.level_targets.ptr, begin, end, a.map_bases.ptr,
-                                    a.map_destinations.ptr, a.map_pivots.ptr, a.threshold, soa_stride, copy_bits);
+                                    a.level_idx.ptr, a.level_targets.ptr, begin, end, a.map_bases.ptr, mapped_positions,
+                                    a.map_pivots.ptr, a.threshold, soa_stride, copy_bits);
                         else
                             mapped_level_update<Perturb>
                                 <<<dim3(unsigned(targets), copies), 256, 0, stream>>>(values.ptr, a.nnz, a.col.ptr,
                                     a.diag.ptr, a.csr_diag.ptr, a.level_idx.ptr, a.level_targets.ptr, begin, end,
-                                    a.map_bases.ptr, a.map_destinations.ptr, a.map_pivots.ptr, a.threshold);
+                                    a.map_bases.ptr, mapped_positions, a.map_pivots.ptr, a.threshold);
                         gpu_check(cudaGetLastError(), "update mapped level");
                     }
                     continue;
@@ -1617,7 +1671,7 @@ struct GpuTask::Impl
                         mapped_level_update_soa<Perturb, true>
                             <<<dim3(unsigned(targets), copy_tiles(copy_bits)), 256, 0, stream>>>(interleaved_values.ptr,
                                 copies, a.col.ptr, a.diag.ptr, a.csr_diag.ptr, a.level_idx.ptr, a.level_targets.ptr,
-                                begin, end, a.map_bases.ptr, a.map_destinations.ptr, a.map_pivots.ptr, a.threshold,
+                                begin, end, a.map_bases.ptr, mapped_positions, a.map_pivots.ptr, a.threshold,
                                 soa_stride, copy_bits);
                     gpu_check(cudaGetLastError(), "update wide mapped targets");
                     continue;
@@ -1638,12 +1692,12 @@ struct GpuTask::Impl
                         RL<Mode><<<dim3(blocks, t.copies), threads, 0, t.stream>>>(a.col.ptr, a.row.ptr, t.values.ptr,
                             a.diag.ptr, a.csr_row.ptr, a.csr_col.ptr, a.csr_diag.ptr, a.level_idx.ptr, t.scratch.ptr,
                             a.n, a.levels[lev], offset, a.nnz, size_t(a.n) * a.slots, 0, a.map_bases.ptr,
-                            a.map_destinations.ptr, a.map_pivots.ptr);
+                            mapped_positions, a.map_pivots.ptr);
                     else
                         RL<Mode, true><<<dim3(blocks, t.copies), threads, 0, t.stream>>>(a.col.ptr, a.row.ptr,
                             t.values.ptr, a.diag.ptr, a.csr_row.ptr, a.csr_col.ptr, a.csr_diag.ptr, a.level_idx.ptr,
                             t.scratch.ptr, a.n, a.levels[lev], offset, a.nnz, size_t(a.n) * a.slots, a.threshold,
-                            a.map_bases.ptr, a.map_destinations.ptr, a.map_pivots.ptr);
+                            a.map_bases.ptr, mapped_positions, a.map_pivots.ptr);
                     gpu_check(cudaGetLastError(), "launch batched level");
                     offset += int(blocks);
                 }
@@ -1665,10 +1719,10 @@ struct GpuTask::Impl
                     gpu_check(cudaGetLastError(), "launch column factorization");
                     if (targets)
                     {
-                        RL_onecol_updateSubmat<Mode><<<dim3(targets, t.copies), column_threads, 0, t.stream>>>(
-                            a.col.ptr, a.row.ptr, t.values.ptr, a.csr_col.ptr, a.csr_diag.ptr, column, t.scratch.ptr, 0,
-                            a.n, a.nnz, size_t(a.n) * a.slots, a.diag.ptr, a.map_bases.ptr, a.map_destinations.ptr,
-                            a.map_pivots.ptr);
+                        RL_onecol_updateSubmat<Mode>
+                            <<<dim3(targets, t.copies), column_threads, 0, t.stream>>>(a.col.ptr, a.row.ptr,
+                                t.values.ptr, a.csr_col.ptr, a.csr_diag.ptr, column, t.scratch.ptr, 0, a.n, a.nnz,
+                                size_t(a.n) * a.slots, a.diag.ptr, a.map_bases.ptr, mapped_positions, a.map_pivots.ptr);
                         gpu_check(cudaGetLastError(), "launch column update");
                     }
                     if constexpr (Mode == UpdateMode::Scan)
@@ -1696,15 +1750,22 @@ struct GpuTask::Impl
             }
         }
     }
+    template <bool Perturb> void enqueue_mapped_family()
+    {
+        if (matrix->map_deltas.ptr)
+            enqueue_numeric<UpdateMode::Mapped, Perturb>(matrix->map_deltas.ptr);
+        else
+            enqueue_numeric<UpdateMode::Mapped, Perturb>(matrix->map_destinations.ptr);
+    }
     void enqueue_work(bool graph_output)
     {
         // Prepared Panel/Tiled/Fused plans use the Mapped dispatch family.
         if (matrix->update_mode != UpdateMode::Scan)
         {
             if (matrix->perturb)
-                enqueue_numeric<UpdateMode::Mapped, true>();
+                enqueue_mapped_family<true>();
             else
-                enqueue_numeric<UpdateMode::Mapped, false>();
+                enqueue_mapped_family<false>();
         }
         else
         {

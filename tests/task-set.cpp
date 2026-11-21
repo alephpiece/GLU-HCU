@@ -328,6 +328,87 @@ void static_perturbation(bool graph)
         }
     }
 }
+struct BoundaryFixture
+{
+    std::unique_ptr<Symbolic_Matrix> matrix;
+    std::vector<REAL> factors;
+};
+BoundaryFixture boundary(unsigned n)
+{
+    // The only active source is 0. Its single update reaches the last slot
+    // of the last column. All previously stored upper zeros retain their slots.
+    std::vector<unsigned> rows, columns{0};
+    std::vector<double> values;
+    for (unsigned c = 0; c < n; ++c)
+    {
+        if (c + 1 == n)
+        {
+            for (unsigned r = 0; r < n; ++r)
+            {
+                rows.push_back(r);
+                values.push_back(r == c ? 2 : r == 0 ? .25 : 0);
+            }
+        }
+        else
+        {
+            rows.push_back(c);
+            values.push_back(2);
+            if (c == 0)
+            {
+                rows.push_back(n - 1);
+                values.push_back(.5);
+            }
+        }
+        columns.push_back(unsigned(rows.size()));
+    }
+    auto a = std::make_unique<Symbolic_Matrix>(n, std::cout, std::cerr);
+    a->fill_in(rows.data(), columns.data());
+    a->csr();
+    a->predictLU(rows.data(), columns.data(), values.data());
+    a->leveling();
+    require(a->sym_c_ptr[n] - a->sym_c_ptr[n - 1] == n && a->l_col_ptr[n - 1] - a->sym_c_ptr[n - 1] == n - 1,
+        "test needs exact maximum relative displacement");
+    auto expected = a->val;
+    expected[a->l_col_ptr[0] + 1] = REAL(.25);
+    expected[a->l_col_ptr[n - 1]] = REAL(1.9375);
+    return {std::move(a), std::move(expected)};
+}
+void mapped_position_widths()
+{
+    auto narrow = boundary(65536), wide = boundary(65537);
+    GpuMatrix a(*narrow.matrix, 1, false, UpdateMode::Mapped, SnapshotPolicy::Auto);
+    GpuMatrix b(*wide.matrix, 1, false, UpdateMode::Mapped, SnapshotPolicy::Auto);
+    require(a.update_map_bytes() == (size_t(narrow.matrix->n) + 1) * sizeof(uint64_t) +
+                                        narrow.matrix->nnz * sizeof(unsigned) + sizeof(uint16_t),
+        "65535 displacement was not packed");
+    require(b.update_map_bytes() == (size_t(wide.matrix->n) + 1) * sizeof(uint64_t) +
+                                        wide.matrix->nnz * sizeof(unsigned) + sizeof(unsigned),
+        "65536 displacement did not fall back");
+    GpuTask standalone(a, 2), one(b);
+    standalone.prepare_graph();
+    one.prepare_graph();
+    standalone.enqueue();
+    one.enqueue();
+    standalone.wait();
+    one.wait();
+    standalone.check();
+    one.check();
+    for (unsigned i = 0; i < 2; ++i)
+        require(std::equal(narrow.factors.begin(), narrow.factors.end(), standalone.factors(i)),
+            "SoA absolute/relative result");
+    require(std::equal(wide.factors.begin(), wide.factors.end(), one.factors()), "wide AoS fallback result");
+    GpuTaskSet set({&a, &b}, {1, 0, 1});
+    set.prepare_graph();
+    set.enqueue();
+    set.wait();
+    set.check();
+    for (unsigned job = 0; job < 3; ++job)
+    {
+        const auto& expected = (job == 1 ? narrow : wide).factors;
+        require(std::equal(expected.begin(), expected.end(), set.factors(job)), "mixed-width full factors differ");
+    }
+}
+
 void api_boundaries()
 {
     auto sparse = fixture(1), diagonal = fixture(2);
@@ -404,6 +485,7 @@ int main()
             mapped_collision(graph);
             static_perturbation(graph);
         }
+        mapped_position_widths();
         api_boundaries();
         std::cout << "PASS heterogeneous task-set offsets, compact reset, snapshots, lifetime and API boundaries\n";
         return 0;
