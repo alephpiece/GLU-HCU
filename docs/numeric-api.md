@@ -120,7 +120,7 @@ const REAL* factors = task.factors(0);
 
 创建 `GpuTaskSet` 时，调用者给出同为 `Fused` 或同为 `Mapped` 的模板列表和逻辑任务的模板下标。每个任务有独立数值，重复下标共享同一个不可变计划。
 
-`Mapped` 集合把各任务同一依赖层的列归一化后，并行更新该层所有源列的目标。多源对同一因子的贡献使用原子加。在空闲的集合上调用 `prepare_graph()` 可捕获数值阶段和输出复制。输入恢复保持在 Graph 之前，因此同一个 Graph 可交替接收默认值、全量新值或紧凑新值。
+`Mapped` 集合并行更新各任务同一依赖层的所有源列目标，每组 32 线程处理一个目标。CUDA FP64 逐层写回归一化的 L；HIP 和 CUDA FP32 在更新时按主元求商，将 L 的写回合并到最后一次启动。多源对同一因子的贡献使用原子加。在空闲的集合上调用 `prepare_graph()` 可捕获数值阶段和输出复制。输入恢复保持在 Graph 之前，因此同一个 Graph 可交替接收默认值、全量新值或紧凑新值。
 
 ```cpp
 GpuMatrix a(symbolic_a, positions_a, 32, false, UpdateMode::Fused);

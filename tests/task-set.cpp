@@ -290,16 +290,21 @@ void static_perturbation(bool graph)
     auto a = build_fixture(3, {0, 1, 0, 1, 2}, {0, 2, 4, 5}, {-1e-6, 1e-4, .03125, 2, 0});
     auto b = build_fixture(3, {0, 1, 0, 1, 2}, {0, 2, 4, 5}, {-2e-6, 2e-4, .0625, 4, 0});
     auto plain = build_fixture(2, {0, 1}, {0, 1, 2}, {1e-6, 2});
+    // The first Schur update cancels the middle diagonal exactly. Its clamped
+    // value must be used to factor the next column, even with deferred writeback.
+    auto cancelled = build_fixture(3, {0, 1, 0, 1, 2, 1, 2}, {0, 2, 5, 7}, {4, 2, 2, 1, .125, .5, 2});
+    GpuMatrix gc(*cancelled.a, cancelled.positions, 1, true, UpdateMode::Mapped);
     GpuMatrix ga(*a.a, a.positions, 1, true, UpdateMode::Mapped);
     GpuMatrix gb(*b.a, b.positions, 1, true, UpdateMode::Mapped);
     GpuMatrix gp(*plain.a, plain.positions, 1, false, UpdateMode::Mapped);
-    GpuTaskSet set({&ga, &gb, &gp}, {1, 2, 0, 1});
+    GpuTaskSet set({&ga, &gb, &gp, &gc}, {1, 2, 0, 1, 3});
     if (graph)
         set.prepare_graph();
-    std::vector<REAL> rejected(set.factor_offset(4), REAL(1));
+    std::vector<REAL> rejected(set.factor_offset(set.task_count()), REAL(1));
     rejects<std::invalid_argument>([&] { set.upload_input(rejected.data(), rejected.size()); },
         "perturbed fresh full input accepted");
-    rejects<std::invalid_argument>([&] { set.upload_compact_input(rejected.data(), set.compact_input_offset(4)); },
+    rejects<std::invalid_argument>([&]
+        { set.upload_compact_input(rejected.data(), set.compact_input_offset(set.task_count())); },
         "perturbed fresh compact input accepted");
     for (int repeat = 0; repeat < 2; ++repeat)
     {
@@ -308,6 +313,12 @@ void static_perturbation(bool graph)
         set.enqueue();
         set.wait();
         set.check();
+        auto corrected = cancelled.a->val;
+        const unsigned middle = cancelled.a->l_col_ptr[1];
+        const REAL threshold = REAL(6) * REAL(3.45e-4f);
+        corrected[middle] += threshold;
+        require(set.factors(4)[middle] == threshold, "updated pivot did not use its snapshot threshold");
+        residual(*cancelled.a, corrected.data(), set.factors(4));
         for (size_t i = 0; i < 4; ++i)
         {
             if (i == 1)

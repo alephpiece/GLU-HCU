@@ -1,4 +1,12 @@
-// Tasks share a normalization and an update launch at each dependency level.
+// All tasks share one update launch at each active dependency level.
+// Write L once per level when reusing it across targets offsets the extra launches.
+// With deferred writeback, updates divide their source values on demand.
+#if defined(GLU_USE_HIP) || defined(GLU_USE_FP32)
+constexpr bool defer_set_normalization = true;
+#else
+constexpr bool defer_set_normalization = false;
+#endif
+
 // Each source-target update owns its L-column lanes. Independent sources may update
 // the same factor slot, as on the single-copy right-looking Mapped path.
 struct MappedSetTask
@@ -73,17 +81,21 @@ __device__ inline void update_mapped_target(REAL* values,
     uint64_t base,
     unsigned lower,
     unsigned count,
-    unsigned pivot_position)
+    unsigned pivot_position,
+    REAL divisor)
 {
     const REAL pivot = values[pivot_position];
     for (size_t i = threadIdx.x % 32; i < count; i += 32)
     {
-        const REAL factor = values[lower + i];
+        REAL factor = values[lower + i];
+        if constexpr (defer_set_normalization)
+            factor /= divisor;
         if (factor != REAL(0))
             atomicAdd(values + mapped_position(destinations, base + i, pivot_position), -factor * pivot);
     }
 }
 
+template <bool Perturb>
 __global__ void
 update_mapped_set(REAL* factors, const MappedSetTask* tasks, const MappedSetUpdate* updates, unsigned begin)
 {
@@ -98,10 +110,19 @@ update_mapped_set(REAL* factors, const MappedSetTask* tasks, const MappedSetUpda
     const unsigned count = task.col[entry.source + 1] - lower;
     const uint64_t base = task.bases[entry.source] + uint64_t(target) * count;
     const unsigned pivot = task.pivots[task.csr_diag[entry.source] + 1 + target];
+    REAL divisor = REAL(1);
+    if constexpr (defer_set_normalization)
+    {
+        // Updates may share the source pivot. Only normalization writes it.
+        divisor = values[diagonal];
+        if constexpr (Perturb)
+            if (fabs(divisor) < task.threshold)
+                divisor = task.threshold;
+    }
     if (task.deltas)
-        update_mapped_target(values, task.deltas, base, lower, count, pivot);
+        update_mapped_target(values, task.deltas, base, lower, count, pivot, divisor);
     else
-        update_mapped_target(values, task.destinations, base, lower, count, pivot);
+        update_mapped_target(values, task.destinations, base, lower, count, pivot, divisor);
 }
 
 struct MappedSetPlan
@@ -169,7 +190,8 @@ struct MappedSetPlan
                 }
             }
             const unsigned ce = offset(column_specs.size()), ue = offset(update_specs.size());
-            if (ue - ub > limit || (uint64_t(ce - cb) + 7) / 8 > limit)
+            const uint64_t normalized_columns = defer_set_normalization ? ce : ce - cb;
+            if (ue - ub > limit || (normalized_columns + 7) / 8 > limit)
                 throw std::invalid_argument("mapped set level exceeds device grid limit");
             stages.push_back({{cb, ce}, {ub, ue}});
         }
@@ -178,24 +200,32 @@ struct MappedSetPlan
         updates.upload(update_specs);
     }
 
+    template <bool Perturb> void normalize(REAL* values, cudaStream_t stream, UpdateRange range) const
+    {
+        const unsigned blocks = unsigned((uint64_t(range.end - range.begin) + 7) / 8);
+        if (blocks)
+        {
+            normalize_mapped_set<Perturb>
+                <<<blocks, 256, 0, stream>>>(values, tasks.ptr, columns.ptr, range.begin, range.end);
+            gpu_check(cudaGetLastError(), "normalize mapped task set");
+        }
+    }
+
     template <bool Perturb> void enqueue(REAL* values, cudaStream_t stream) const
     {
         for (const auto& stage : stages)
         {
-            const auto c = stage.columns;
-            const unsigned column_blocks = unsigned((uint64_t(c.end - c.begin) + 7) / 8);
-            if (column_blocks)
-            {
-                normalize_mapped_set<Perturb>
-                    <<<column_blocks, 256, 0, stream>>>(values, tasks.ptr, columns.ptr, c.begin, c.end);
-                gpu_check(cudaGetLastError(), "normalize mapped task set");
-            }
+            if constexpr (!defer_set_normalization)
+                normalize<Perturb>(values, stream, stage.columns);
             const unsigned blocks = stage.updates.end - stage.updates.begin;
             if (blocks)
             {
-                update_mapped_set<<<blocks, 256, 0, stream>>>(values, tasks.ptr, updates.ptr, stage.updates.begin);
+                update_mapped_set<Perturb>
+                    <<<blocks, 256, 0, stream>>>(values, tasks.ptr, updates.ptr, stage.updates.begin);
                 gpu_check(cudaGetLastError(), "update mapped task set");
             }
         }
+        if constexpr (defer_set_normalization)
+            normalize<Perturb>(values, stream, {0, stages.back().columns.end});
     }
 };
