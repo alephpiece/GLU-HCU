@@ -2460,10 +2460,15 @@ enum class SplitFixture
     pending_parent
 };
 
+constexpr unsigned split_first_row = 66, split_exterior_size = 192;
+constexpr unsigned split_first_target = split_first_row + split_exterior_size;
+constexpr unsigned split_order = split_first_target + split_exterior_size;
+
 void make_split_fixture(Symbolic_Matrix& a, SplitFixture fixture)
 {
-    // Pivot chains [0,4..34] and [2,35..65] share only their exterior row 66
-    // and target column 67. The sparse roots 1 and 3 also update (66,67).
+    // Pivot chains [0,4..34] and [2,35..65] share a large exterior rectangle,
+    // with all but its first row and column structurally present but zero.
+    // The sparse roots 1 and 3 also update the first exterior entry.
     // Original level zero is [0,1,2,3], so two selected fronts leave disjoint
     // remainder intervals [1,2) and [3,4).
     const auto left = [](unsigned k) { return k == 0 || (k >= 4 && k <= 34); };
@@ -2471,27 +2476,29 @@ void make_split_fixture(Symbolic_Matrix& a, SplitFixture fixture)
     const bool blocker = fixture == SplitFixture::pending_parent;
     std::vector<unsigned> rows, columns{0};
     std::vector<double> input;
-    for (unsigned c = 0; c < 68; ++c)
+    for (unsigned c = 0; c < a.n; ++c)
     {
-        for (unsigned r = 0; r < 68; ++r)
+        for (unsigned r = 0; r < a.n; ++r)
         {
-            if (r != c && !(left(c) && left(r)) && !(right(c) && right(r)) && !(r == 66 && c < 66) &&
-                !(c == 67 && r <= 66) && !(blocker && ((r == 4 && c == 1) || (r == 1 && c == 4))))
+            const bool exterior_row = r >= split_first_row && r < split_first_target;
+            if (r != c && !(left(c) && left(r)) && !(right(c) && right(r)) &&
+                !(exterior_row && c < split_first_row) && !(c >= split_first_target && r < split_first_target) &&
+                !(blocker && ((r == 4 && c == 1) || (r == 1 && c == 4))))
                 continue;
             // The two dense roots have different non-unit divisors. Both raw
             // lower entries must be normalized exactly once at factor output.
             const double pivot = c == 0 ? 2.0 : (c == 2 || (blocker && c == 4)) ? 4.0 : 1.0;
             double v = r == c ? pivot : 0.0;
-            if (r == 66 && c < 4)
+            if (r == split_first_row && c < 4)
                 v = pivot;
-            if (c == 67 && r < 4)
+            if (c == split_first_target && r < 4)
                 v = 1.0;
-            if (r == 66 && c == 67)
+            if (r == split_first_row && c == split_first_target)
                 v = 8.0;
             if (blocker && ((r == 4 && c == 1) || (r == 1 && c == 4)))
                 v = 1.0;
-            const bool duplicate = (fixture == SplitFixture::duplicate_lower && r == 66 && left(c)) ||
-                                   (fixture == SplitFixture::duplicate_upper && c == 67 && left(r));
+            const bool duplicate = (fixture == SplitFixture::duplicate_lower && r == split_first_row && left(c)) ||
+                                   (fixture == SplitFixture::duplicate_upper && c == split_first_target && left(r));
             rows.push_back(r);
             input.push_back(v);
             if (duplicate)
@@ -2510,7 +2517,7 @@ void make_split_fixture(Symbolic_Matrix& a, SplitFixture fixture)
 
 void test_split_fixture_plan(const Symbolic_Matrix& a, SplitFixture fixture)
 {
-    if (a.n != 68 || a.csr_diag_ptr.size() != 68 || a.level_ptr[1] != 4 ||
+    if (a.csr_diag_ptr.size() != a.n || a.level_ptr[1] != 4 ||
         !std::equal(a.level_idx.begin(), a.level_idx.begin() + 4, std::vector<int>{0, 1, 2, 3}.begin()))
         throw std::runtime_error("split fixture initial level or diagonal count");
     std::vector<uint64_t> bases{0};
@@ -2528,7 +2535,8 @@ void test_split_fixture_plan(const Symbolic_Matrix& a, SplitFixture fixture)
     {
         const auto& f = first.fronts[i];
         const unsigned root = both && i == 0 ? 0 : 2;
-        if (f.steps != 32 || f.rows != 33 || f.cols != 33 || f.diagonal != a.l_col_ptr[root] ||
+        if (f.steps != 32 || f.rows != 32 + split_exterior_size || f.cols != 32 + split_exterior_size ||
+            f.diagonal != a.l_col_ptr[root] ||
             f.first_target != a.csr_diag_ptr[root] + 1 || f.map_begin != bases[root])
             throw std::runtime_error("split fixture selected incorrect branch");
     }
@@ -2547,7 +2555,7 @@ void test_split_fixture_plan(const Symbolic_Matrix& a, SplitFixture fixture)
 void test_mapped_split_front(SplitFixture fixture, bool graph)
 {
     std::ostringstream out, err;
-    Symbolic_Matrix matrix(68, out, err);
+    Symbolic_Matrix matrix(split_order, out, err);
     make_split_fixture(matrix, fixture);
     test_split_fixture_plan(matrix, fixture);
     GpuMatrix storage(matrix, 32, false, UpdateMode::Mapped);
@@ -2569,8 +2577,9 @@ void test_mapped_split_front(SplitFixture fixture, bool graph)
     };
     const bool blocked = fixture == SplitFixture::pending_parent;
     const REAL expected = fixture == SplitFixture::independent ? REAL(4) : blocked ? REAL(11) / 3 : REAL(3);
-    if (std::abs(value(66, 67) - expected) > 4 * std::numeric_limits<REAL>::epsilon() ||
-        (blocked && value(4, 4) != REAL(3)) || value(66, 0) != REAL(1) || value(66, 2) != REAL(1))
+    if (std::abs(value(split_first_row, split_first_target) - expected) > 4 * std::numeric_limits<REAL>::epsilon() ||
+        (blocked && value(4, 4) != REAL(3)) || value(split_first_row, 0) != REAL(1) ||
+        value(split_first_row, 2) != REAL(1))
         throw std::runtime_error("split mapped front numeric result");
     if ((fixture == SplitFixture::independent || blocked) &&
         !(matrix.factor_residual(values) <= (sizeof(REAL) == 8 ? 2.e-12 : 2.e-5)))

@@ -235,6 +235,9 @@ unsigned nested_front_successor(const Symbolic_Matrix& a, unsigned current)
 void add_split_mapped_levels(MappedFrontPlan& plan, const Symbolic_Matrix& a, const std::vector<uint64_t>& bases,
     std::vector<int>& mapped_order)
 {
+    // A separate front entails packing and several launches. Small fronts
+    // can leave almost all of the original sparse launches in place.
+    constexpr uint64_t minimum_products = 1000000;
     // At most n columns can be appended, and update bounds use signed indices.
     if (uint64_t(a.n) * 2 > uint64_t(std::numeric_limits<int>::max()))
         return;
@@ -264,6 +267,7 @@ void add_split_mapped_levels(MappedFrontPlan& plan, const Symbolic_Matrix& a, co
                 continue;
             chain.assign(1, root);
             member[root] = root;
+            uint64_t products = bases[root + 1] - bases[root];
             for (unsigned current = root;;)
             {
                 const unsigned next = nested_front_successor(a, current);
@@ -282,9 +286,10 @@ void add_split_mapped_levels(MappedFrontPlan& plan, const Symbolic_Matrix& a, co
                     break;
                 member[next] = root;
                 chain.push_back(next);
+                products += bases[next + 1] - bases[next];
                 current = next;
             }
-            if (chain.size() < front_minimum_steps)
+            if (chain.size() < front_minimum_steps || products < minimum_products)
                 continue;
             if (plan.split_levels.empty())
                 plan.split_levels.resize(levels.size() - 1);
