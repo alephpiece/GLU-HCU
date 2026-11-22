@@ -2212,9 +2212,9 @@ void test_auto_snapshot()
     std::cout << "PASS host/auto-snapshot-per-task-policy-override-and-graph-stability\n";
 }
 
-void test_mapped_level_grids(unsigned width, bool targets, unsigned copies)
+void test_mapped_level_grids(unsigned width, bool targets, unsigned copies, unsigned tail = 3)
 {
-    const unsigned n = width + 3;
+    const unsigned n = width + tail;
     std::vector<unsigned> rows, columns{0};
     std::vector<double> input;
     for (unsigned c = 0; c < n; ++c)
@@ -2237,10 +2237,14 @@ void test_mapped_level_grids(unsigned width, bool targets, unsigned copies)
         throw std::runtime_error("unexpected mapped grid test structure");
     GpuMatrix gpu(matrix, 32, false, UpdateMode::Mapped);
     GpuTask task(gpu, copies);
-    const unsigned updates = targets ? 3 * width : 0;
+    const unsigned updates = targets ? tail * width : 0;
     unsigned expected = 0;
     if (width > 16)
         expected = copies > 1 ? width + updates : width <= 64 ? updates : width;
+#if !defined(GLU_USE_HIP) && !defined(GLU_USE_FP32)
+    if (copies == 1 && width > 16 && width <= 64 && updates * tail >= 100000)
+        expected += width;
+#endif
     if (task.numeric_wide_blocks() != expected)
         throw std::runtime_error("incorrect mapped level grid");
     task.prepare_graph();
@@ -2949,6 +2953,8 @@ int main()
             for (bool targets : {false, true})
                 for (unsigned copies : {1u, 3u})
                     test_mapped_level_grids(width, targets, copies);
+        test_mapped_level_grids(40, true, 1, 49); // 96,040 products
+        test_mapped_level_grids(40, true, 1, 50); // 100,000 products
         for (bool perturb : {false, true})
         {
             test_mapped_single_normalization(271, 369, true, perturb); // 99,999 products

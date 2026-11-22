@@ -2035,6 +2035,8 @@ size_t GpuTask::numeric_wide_blocks() const
             if (a.update_mode == UpdateMode::Mapped && !t.soa_stride && a.expands_medium_targets(lev))
             {
                 columns += a.target_prefix[a.levels[lev + 1]] - a.target_prefix[a.levels[lev]];
+                if (a.normalizes_single_level(lev))
+                    columns += a.levels[lev + 1] - a.levels[lev];
                 continue;
             }
             columns += a.levels[lev + 1] - a.levels[lev];
