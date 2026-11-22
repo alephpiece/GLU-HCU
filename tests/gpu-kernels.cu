@@ -2464,7 +2464,7 @@ enum class SplitFixture
     pending_parent
 };
 
-constexpr unsigned split_first_row = 66, split_exterior_size = 192;
+constexpr unsigned split_first_row = 66, split_exterior_size = 384;
 constexpr unsigned split_first_target = split_first_row + split_exterior_size;
 constexpr unsigned split_order = split_first_target + split_exterior_size;
 

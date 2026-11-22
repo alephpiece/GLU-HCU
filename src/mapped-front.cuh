@@ -237,7 +237,11 @@ void add_split_mapped_levels(MappedFrontPlan& plan, const Symbolic_Matrix& a, co
 {
     // A separate front entails packing and several launches. Small fronts
     // can leave almost all of the original sparse launches in place.
+#if defined(GLU_USE_HIP)
+    constexpr uint64_t minimum_products = 5000000;
+#else
     constexpr uint64_t minimum_products = 1000000;
+#endif
     // At most n columns can be appended, and update bounds use signed indices.
     if (uint64_t(a.n) * 2 > uint64_t(std::numeric_limits<int>::max()))
         return;
