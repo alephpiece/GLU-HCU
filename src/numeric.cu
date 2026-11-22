@@ -1200,7 +1200,8 @@ struct GpuMatrix::Impl
         if (mode != UpdateMode::Fused || perturb)
         {
             diag.upload(a.l_col_ptr);
-            level_idx.upload(a.level_idx);
+            if (mode != UpdateMode::Mapped)
+                level_idx.upload(a.level_idx);
         }
         if (!panel_mode)
         {
@@ -1297,9 +1298,11 @@ struct GpuMatrix::Impl
         if (mode == UpdateMode::Mapped)
         {
             const auto begin = std::chrono::steady_clock::now();
-            build_update_map(a);
+            std::vector<int> mapped_order = columns;
+            build_update_map(a, mapped_order);
+            level_idx.upload(mapped_order);
             target_prefix.push_back(0);
-            for (int column : columns)
+            for (int column : mapped_order)
             {
                 const uint64_t targets = a.sym_c_ptr[column + 1] > a.l_col_ptr[column] + 1
                                              ? uint64_t(csr_rows[column + 1] - csr_diags[column] - 1)
@@ -1372,7 +1375,7 @@ struct GpuMatrix::Impl
         }
     }
 
-    void build_update_map(const Symbolic_Matrix& a)
+    void build_update_map(const Symbolic_Matrix& a, std::vector<int>& mapped_order)
     {
         // Count before allocating the potentially much larger-than-factor map.
         std::vector<uint64_t> bases(size_t(n) + 1);
@@ -1405,7 +1408,7 @@ struct GpuMatrix::Impl
         // path can build any map that fits without temporary device storage.
         constexpr unsigned small_map_entries = 64 * 1024;
         const bool on_host = total <= small_map_entries || device_workspace > available - map_bytes;
-        front_plan = make_mapped_front_plan(a, bases);
+        front_plan = make_mapped_front_plan(a, bases, mapped_order);
         map_bases.upload(bases);
         if (narrow)
             upload_map(a, bases, on_host, map_deltas);
@@ -1619,12 +1622,30 @@ struct GpuTask::Impl
                     transpose(false);
                 return;
             }
+        auto enqueue_aos_targets = [&](unsigned begin, unsigned end) {
+            const uint64_t targets = a.target_prefix[end] - a.target_prefix[begin];
+            if (!targets)
+                return;
+            mapped_level_update<Perturb><<<dim3(unsigned(targets), copies), 256, 0, stream>>>(values.ptr, a.nnz,
+                a.col.ptr, a.diag.ptr, a.csr_diag.ptr, a.level_idx.ptr, a.level_targets.ptr, begin, end,
+                a.map_bases.ptr, mapped_positions, a.map_pivots.ptr, a.threshold);
+            gpu_check(cudaGetLastError(), "update mapped level");
+        };
         for (size_t lev = 0; lev + 1 < a.levels.size(); ++lev)
         {
             const int begin = a.levels[lev], end = a.levels[lev + 1], width = end - begin;
             if constexpr (Mode == UpdateMode::Mapped)
             {
-                if (front_values.ptr && a.front_plan.starting_at[lev].steps)
+                if (front_values.ptr && !a.front_plan.split_levels.empty() && a.front_plan.split_levels[lev].split)
+                {
+                    const auto& split = a.front_plan.split_levels[lev];
+                    for (const auto& front : split.fronts)
+                        enqueue_mapped_front<Perturb>(front, values.ptr, front_values.ptr, mapped_positions,
+                            a.map_pivots.ptr, a.threshold, stream);
+                    enqueue_aos_targets(split.sparse.begin, split.sparse.end);
+                    continue;
+                }
+                if (front_values.ptr && !a.front_plan.starting_at.empty() && a.front_plan.starting_at[lev].steps)
                 {
                     const auto& front = a.front_plan.starting_at[lev];
                     enqueue_mapped_front<Perturb>(front, values.ptr, front_values.ptr, mapped_positions,
@@ -1645,17 +1666,16 @@ struct GpuTask::Impl
                     if (targets)
                     {
                         if (soa)
+                        {
                             mapped_level_update_soa<Perturb, normalize_soa_levels>
                                 <<<dim3(unsigned(targets), copy_tiles(copy_bits)), 256, 0, stream>>>(
                                     interleaved_values.ptr, copies, a.col.ptr, a.diag.ptr, a.csr_diag.ptr,
                                     a.level_idx.ptr, a.level_targets.ptr, begin, end, a.map_bases.ptr, mapped_positions,
                                     a.map_pivots.ptr, a.threshold, soa_stride, copy_bits);
+                            gpu_check(cudaGetLastError(), "update mapped level");
+                        }
                         else
-                            mapped_level_update<Perturb>
-                                <<<dim3(unsigned(targets), copies), 256, 0, stream>>>(values.ptr, a.nnz, a.col.ptr,
-                                    a.diag.ptr, a.csr_diag.ptr, a.level_idx.ptr, a.level_targets.ptr, begin, end,
-                                    a.map_bases.ptr, mapped_positions, a.map_pivots.ptr, a.threshold);
-                        gpu_check(cudaGetLastError(), "update mapped level");
+                            enqueue_aos_targets(begin, end);
                     }
                     continue;
                 }
@@ -1910,7 +1930,15 @@ size_t GpuTask::numeric_launches() const
         const unsigned width = unsigned(a.levels[lev + 1] - a.levels[lev]);
         if (a.update_mode == UpdateMode::Mapped)
         {
-            if (t.front_values.ptr && a.front_plan.starting_at[lev].steps)
+            if (t.front_values.ptr && !a.front_plan.split_levels.empty() && a.front_plan.split_levels[lev].split)
+            {
+                const auto& split = a.front_plan.split_levels[lev];
+                for (const auto& front : split.fronts)
+                    count += front.numeric_launches();
+                count += a.target_prefix[split.sparse.end] > a.target_prefix[split.sparse.begin];
+                continue;
+            }
+            if (t.front_values.ptr && !a.front_plan.starting_at.empty() && a.front_plan.starting_at[lev].steps)
             {
                 const auto& front = a.front_plan.starting_at[lev];
                 count += front.numeric_launches();

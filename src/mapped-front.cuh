@@ -1,4 +1,4 @@
-// Single-copy right-looking LU on a nested sequence of sparse elimination fronts.
+// Single-copy right-looking LU on nested sparse elimination fronts.
 // The first pivot's Mapped indices locate every sparse entry of the rectangle.
 // Diagonals and raw L stay in the usual factor representation for final normalization.
 constexpr unsigned front_tile = 16;
@@ -186,16 +186,151 @@ struct MappedFrontPlan
     // Indexed by the first dependency level; empty for matrices without a front.
     std::vector<MappedFront> starting_at;
     size_t workspace_elements = 0;
+    struct SplitLevel
+    {
+        bool split = false;
+        std::vector<MappedFront> fronts;
+        UpdateRange sparse{};
+    };
+    std::vector<SplitLevel> split_levels;
 };
 
-MappedFrontPlan make_mapped_front_plan(const Symbolic_Matrix& a, const std::vector<uint64_t>& bases)
+constexpr unsigned front_minimum_steps = 32;
+constexpr uint64_t front_maximum_elements = 1024 * 1024;
+
+bool mapped_front_shape(const Symbolic_Matrix& a, unsigned root, unsigned rows, unsigned cols)
+{
+    if (rows < front_minimum_steps || cols < front_minimum_steps ||
+        uint64_t(rows) * cols > front_maximum_elements)
+        return false;
+    const auto lower = a.sym_r_idx.begin() + a.l_col_ptr[root];
+    const auto upper = a.csr_c_idx.begin() + a.csr_diag_ptr[root];
+    const auto nonincreasing = [](unsigned first, unsigned second) { return first >= second; };
+    // Packing and scattering require distinct rows and columns.
+    return std::adjacent_find(lower, lower + rows, nonincreasing) == lower + rows &&
+           std::adjacent_find(upper, upper + cols, nonincreasing) == upper + cols;
+}
+
+// Each pivot is the next row and column of the previous front. Equality of
+// both tails keeps the remaining work inside the first pivot's rectangle.
+unsigned nested_front_successor(const Symbolic_Matrix& a, unsigned current)
+{
+    const auto lo = a.sym_r_idx.begin() + a.l_col_ptr[current] + 1;
+    const auto lo_end = a.sym_r_idx.begin() + a.sym_c_ptr[current + 1];
+    const auto up = a.csr_c_idx.begin() + a.csr_diag_ptr[current] + 1;
+    const auto up_end = a.csr_c_idx.begin() + a.csr_r_ptr[current + 1];
+    if (lo == lo_end || up == up_end || *lo != *up)
+        return a.n;
+    const unsigned next = *lo;
+    if (next >= a.n)
+        return a.n;
+    if (std::equal(lo + 1, lo_end, a.sym_r_idx.begin() + a.l_col_ptr[next] + 1,
+            a.sym_r_idx.begin() + a.sym_c_ptr[next + 1]) &&
+        std::equal(up + 1, up_end, a.csr_c_idx.begin() + a.csr_diag_ptr[next] + 1,
+            a.csr_c_idx.begin() + a.csr_r_ptr[next + 1]))
+        return next;
+    return a.n;
+}
+
+void add_split_mapped_levels(MappedFrontPlan& plan, const Symbolic_Matrix& a, const std::vector<uint64_t>& bases,
+    std::vector<int>& mapped_order)
+{
+    // At most n columns can be appended, and update bounds use signed indices.
+    if (uint64_t(a.n) * 2 > uint64_t(std::numeric_limits<int>::max()))
+        return;
+    const auto& levels = a.level_ptr;
+    const auto& columns = a.level_idx;
+    const auto eligible = [&](unsigned lev) {
+        // These levels use raw L with a common final normalization.
+        const int width = levels[lev + 1] - levels[lev];
+        return width >= 2 && width <= 16;
+    };
+    std::vector<unsigned> source_level(a.n), member(a.n, a.n), chain;
+    std::vector<bool> assigned(a.n);
+    for (unsigned lev = 0; lev + 1 < levels.size(); ++lev)
+        for (int i = levels[lev]; i < levels[lev + 1]; ++i)
+            source_level[unsigned(columns[i])] = lev;
+
+    for (unsigned lev = 0; lev + 1 < levels.size(); ++lev)
+    {
+        if (!eligible(lev))
+            continue;
+        for (int i = levels[lev]; i < levels[lev + 1]; ++i)
+        {
+            const unsigned root = unsigned(columns[i]);
+            const unsigned rows = a.sym_c_ptr[root + 1] - a.l_col_ptr[root];
+            const unsigned cols = a.csr_r_ptr[root + 1] - a.csr_diag_ptr[root];
+            if (assigned[root] || !mapped_front_shape(a, root, rows, cols))
+                continue;
+            chain.assign(1, root);
+            member[root] = root;
+            for (unsigned current = root;;)
+            {
+                const unsigned next = nested_front_successor(a, current);
+                if (next == a.n || assigned[next] || source_level[next] != source_level[current] + 1 ||
+                    !eligible(source_level[next]))
+                    break;
+                // The next pivot needs its complete row and column. Move it to
+                // this level only if earlier levels or this front provide both.
+                const auto pending = [&](unsigned source) {
+                    return source_level[source] >= lev && member[source] != root;
+                };
+                if (std::any_of(a.sym_r_idx.begin() + a.sym_c_ptr[next], a.sym_r_idx.begin() + a.l_col_ptr[next],
+                        pending) ||
+                    std::any_of(a.csr_c_idx.begin() + a.csr_r_ptr[next], a.csr_c_idx.begin() + a.csr_diag_ptr[next],
+                        pending))
+                    break;
+                member[next] = root;
+                chain.push_back(next);
+                current = next;
+            }
+            if (chain.size() < front_minimum_steps)
+                continue;
+            if (plan.split_levels.empty())
+                plan.split_levels.resize(levels.size() - 1);
+            plan.split_levels[lev].fronts.push_back(
+                {unsigned(chain.size()), rows, cols, a.l_col_ptr[root], a.csr_diag_ptr[root] + 1, bases[root]});
+            for (unsigned source : chain)
+            {
+                assigned[source] = true;
+                plan.split_levels[source_level[source]].split = true;
+            }
+            plan.workspace_elements = std::max(plan.workspace_elements, size_t(rows) * (cols + front_tile));
+        }
+    }
+    for (unsigned lev = 0; lev < plan.split_levels.size(); ++lev)
+    {
+        auto& split = plan.split_levels[lev];
+        if (!split.split)
+            continue;
+        // Keep the original order for other paths. Append only the sparse
+        // remainder of levels that would otherwise require multiple launches.
+        unsigned begin = unsigned(levels[lev]), end = unsigned(levels[lev + 1]);
+        while (begin < end && assigned[unsigned(columns[begin])])
+            ++begin;
+        while (end > begin && assigned[unsigned(columns[end - 1])])
+            --end;
+        const auto is_assigned = [&](int column) { return assigned[unsigned(column)]; };
+        if (std::none_of(columns.begin() + begin, columns.begin() + end, is_assigned))
+            split.sparse = {begin, end};
+        else
+        {
+            const unsigned first = unsigned(mapped_order.size());
+            for (unsigned i = begin; i < end; ++i)
+                if (!is_assigned(columns[i]))
+                    mapped_order.push_back(columns[i]);
+            split.sparse = {first, unsigned(mapped_order.size())};
+        }
+    }
+}
+
+MappedFrontPlan make_mapped_front_plan(
+    const Symbolic_Matrix& a, const std::vector<uint64_t>& bases, std::vector<int>& mapped_order)
 {
     const auto& levels = a.level_ptr;
     const auto& columns = a.level_idx;
     MappedFrontPlan plan;
     // Amortize packing over at least two panels and bound per-task temporary storage.
-    constexpr unsigned minimum_steps = 32;
-    constexpr uint64_t maximum_elements = 1024 * 1024;
     for (size_t lev = 0; lev + 1 < levels.size();)
     {
         if (levels[lev + 1] - levels[lev] != 1)
@@ -206,31 +341,20 @@ MappedFrontPlan make_mapped_front_plan(const Symbolic_Matrix& a, const std::vect
         const unsigned c = unsigned(columns[levels[lev]]);
         const unsigned rows = a.sym_c_ptr[c + 1] - a.l_col_ptr[c];
         const unsigned cols = a.csr_r_ptr[c + 1] - a.csr_diag_ptr[c];
-        if (rows < minimum_steps || cols < minimum_steps || uint64_t(rows) * cols > maximum_elements)
+        if (!mapped_front_shape(a, c, rows, cols))
         {
             ++lev;
             continue;
         }
-        // Each pivot must be the next row and column of the previous front.
-        // Equality of both remaining tails proves that the exterior rows and
-        // columns also belong to the rectangle gathered at the first pivot.
         size_t end = lev + 1;
         for (; end + 1 < levels.size() && levels[end + 1] - levels[end] == 1; ++end)
         {
             const unsigned prior = unsigned(columns[levels[end - 1]]);
             const unsigned next = unsigned(columns[levels[end]]);
-            auto lo = a.sym_r_idx.begin() + a.l_col_ptr[prior] + 1;
-            auto lo_end = a.sym_r_idx.begin() + a.sym_c_ptr[prior + 1];
-            auto up = a.csr_c_idx.begin() + a.csr_diag_ptr[prior] + 1;
-            auto up_end = a.csr_c_idx.begin() + a.csr_r_ptr[prior + 1];
-            if (lo == lo_end || up == up_end || *lo != next || *up != next ||
-                !std::equal(lo + 1, lo_end, a.sym_r_idx.begin() + a.l_col_ptr[next] + 1,
-                    a.sym_r_idx.begin() + a.sym_c_ptr[next + 1]) ||
-                !std::equal(up + 1, up_end, a.csr_c_idx.begin() + a.csr_diag_ptr[next] + 1,
-                    a.csr_c_idx.begin() + a.csr_r_ptr[next + 1]))
+            if (nested_front_successor(a, prior) != next)
                 break;
         }
-        if (end - lev >= minimum_steps)
+        if (end - lev >= front_minimum_steps)
         {
             if (plan.starting_at.empty())
                 plan.starting_at.resize(levels.size() - 1);
@@ -240,6 +364,7 @@ MappedFrontPlan make_mapped_front_plan(const Symbolic_Matrix& a, const std::vect
         }
         lev = end;
     }
+    add_split_mapped_levels(plan, a, bases, mapped_order);
     return plan;
 }
 
