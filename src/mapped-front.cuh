@@ -364,7 +364,8 @@ MappedFrontPlan make_mapped_front_plan(
         }
         lev = end;
     }
-    add_split_mapped_levels(plan, a, bases, mapped_order);
+    if constexpr (!normalize_mapped_levels)
+        add_split_mapped_levels(plan, a, bases, mapped_order);
     return plan;
 }
 
