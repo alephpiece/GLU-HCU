@@ -2212,9 +2212,9 @@ void test_auto_snapshot()
     std::cout << "PASS host/auto-snapshot-per-task-policy-override-and-graph-stability\n";
 }
 
-void test_mapped_level_grids(unsigned width, bool targets, unsigned copies)
+void test_mapped_level_grids(unsigned width, bool targets, unsigned copies, unsigned tail = 3)
 {
-    const unsigned n = width + 3;
+    const unsigned n = width + tail;
     std::vector<unsigned> rows, columns{0};
     std::vector<double> input;
     for (unsigned c = 0; c < n; ++c)
@@ -2237,10 +2237,14 @@ void test_mapped_level_grids(unsigned width, bool targets, unsigned copies)
         throw std::runtime_error("unexpected mapped grid test structure");
     GpuMatrix gpu(matrix, 32, false, UpdateMode::Mapped);
     GpuTask task(gpu, copies);
-    const unsigned updates = targets ? 3 * width : 0;
+    const unsigned updates = targets ? tail * width : 0;
     unsigned expected = 0;
     if (width > 16)
         expected = copies > 1 ? width + updates : width <= 64 ? updates : width;
+#if !defined(GLU_USE_HIP) && !defined(GLU_USE_FP32)
+    if (copies == 1 && width > 16 && width <= 64 && updates * tail >= 100000)
+        expected += width;
+#endif
     if (task.numeric_wide_blocks() != expected)
         throw std::runtime_error("incorrect mapped level grid");
     task.prepare_graph();
@@ -2250,6 +2254,98 @@ void test_mapped_level_grids(unsigned width, bool targets, unsigned copies)
     for (unsigned copy = 0; copy < copies; ++copy)
         if (!(matrix.factor_residual(task.factors(copy)) <= (sizeof(REAL) == 8 ? 2.e-12 : 2.e-5)))
             throw std::runtime_error("mapped level grid factor residual");
+}
+
+void test_mapped_single_normalization(unsigned lower_count, unsigned target_count, bool tail, bool perturb)
+{
+    // Root 0 updates the full rectangle. Root 1 shares its level, has a
+    // non-unit pivot and a lower entry, but never contributes to a target.
+    const unsigned first_target = 2 + lower_count, aux = first_target + target_count;
+    const unsigned n = aux + (tail ? 3 : 1);
+    std::vector<unsigned> rows, columns{0};
+    std::vector<double> input;
+    const auto add = [&](unsigned r, double v) {
+        rows.push_back(r);
+        input.push_back(v);
+    };
+    for (unsigned c = 0; c < n; ++c)
+    {
+        if (c >= first_target && c < aux)
+            add(0, c == first_target ? 8 : 0);
+        double pivot = 4;
+        if (c == 1)
+            pivot = perturb ? 0 : 8;
+        if (tail && c == aux)
+            pivot = 6;
+        if (tail && c == aux + 1)
+            pivot = 8;
+        add(c, pivot);
+        if (c == 0)
+            for (unsigned r = 2; r < first_target; ++r)
+                add(r, r == 2 ? 2 : 0);
+        if (c == 1)
+            add(aux, 4);
+        if (tail && c == aux)
+            add(aux + 1, 3);
+        if (tail && c == aux + 1)
+            add(aux + 2, 4);
+        columns.push_back(unsigned(rows.size()));
+    }
+    std::ostringstream out, err;
+    Symbolic_Matrix matrix(n, out, err);
+    matrix.fill_in(rows.data(), columns.data());
+    matrix.csr();
+    matrix.predictLU(rows.data(), columns.data(), input.data());
+    matrix.leveling();
+    if (matrix.num_lev != (tail ? 4 : 2) || matrix.level_ptr[1] != 2)
+        throw std::runtime_error("unexpected mapped normalization fixture levels");
+#if defined(GLU_USE_HIP)
+    constexpr bool cuda_fp64 = false;
+#else
+    constexpr bool cuda_fp64 = sizeof(REAL) == 8;
+#endif
+    const bool heavy = lower_count * target_count >= 100000;
+    GpuMatrix gpu(matrix, 32, perturb, UpdateMode::Mapped);
+    // Only the zero diagonal at root 1 is perturbed. The maximum column sum is 12.
+    Symbolic_Matrix oracle(matrix);
+    const REAL pivot1 = perturb ? REAL(12) * REAL(3.45e-4f) : REAL(8);
+    oracle.val[matrix.l_col_ptr[1]] = pivot1;
+    const auto schur = matrix.l_col_ptr[first_target] - lower_count;
+    if (matrix.sym_r_idx[schur] != 2)
+        throw std::runtime_error("unexpected mapped normalization Schur entry");
+    for (unsigned copies : {1u, 3u})
+    {
+        GpuTask task(gpu, copies);
+        // AoS has a root update, one wide level and a final normalization.
+        // Early root normalization adds one launch and can remove the final one.
+        const unsigned aos = 3 + unsigned(cuda_fp64 && heavy && tail);
+        // SoA also converts the output. CUDA FP64 normalizes each of the two
+        // optional singleton levels separately, other builds use one final list.
+        const unsigned soa = 4 + (cuda_fp64 && tail ? 2 : 0);
+        if (task.numeric_launches() != (copies == 1 ? aos : soa) ||
+            task.normalizes_each_level() != (copies > 1 && cuda_fp64))
+            throw std::runtime_error("incorrect mapped normalization schedule");
+        for (bool graph : {false, true})
+        {
+            if (graph)
+                task.prepare_graph();
+            task.enqueue();
+            task.wait();
+            task.check();
+            for (unsigned copy = 0; copy < copies; ++copy)
+            {
+                const auto* lu = task.factors(copy);
+                const REAL root1_lower = lu[matrix.l_col_ptr[1] + 1];
+                if (lu[matrix.l_col_ptr[0] + 1] != REAL(0.5) || lu[schur] != REAL(-4) ||
+                    lu[matrix.l_col_ptr[1]] != pivot1 ||
+                    std::abs(root1_lower * pivot1 - REAL(4)) > 8 * std::numeric_limits<REAL>::epsilon() ||
+                    (tail && lu[matrix.l_col_ptr[aux + 1] + 1] != REAL(0.5)))
+                    throw std::runtime_error("mapped normalization pivot, raw lower or Schur entry");
+                if (!(oracle.factor_residual(lu) <= (sizeof(REAL) == 8 ? 2.e-12 : 2.e-5)))
+                    throw std::runtime_error("mapped normalization factor residual");
+            }
+        }
+    }
 }
 
 void test_mapped_front(unsigned steps, unsigned copies, bool perturb, bool graph)
@@ -2358,6 +2454,140 @@ void test_mapped_front(unsigned steps, unsigned copies, bool perturb, bool graph
             }
         }
     }
+}
+
+enum class SplitFixture
+{
+    independent,
+    duplicate_lower,
+    duplicate_upper,
+    pending_parent
+};
+
+constexpr unsigned split_first_row = 66, split_exterior_size = 384;
+constexpr unsigned split_first_target = split_first_row + split_exterior_size;
+constexpr unsigned split_order = split_first_target + split_exterior_size;
+
+void make_split_fixture(Symbolic_Matrix& a, SplitFixture fixture)
+{
+    // Pivot chains [0,4..34] and [2,35..65] share a large exterior rectangle,
+    // with all but its first row and column structurally present but zero.
+    // The sparse roots 1 and 3 also update the first exterior entry.
+    // Original level zero is [0,1,2,3], so two selected fronts leave disjoint
+    // remainder intervals [1,2) and [3,4).
+    const auto left = [](unsigned k) { return k == 0 || (k >= 4 && k <= 34); };
+    const auto right = [](unsigned k) { return k == 2 || (k >= 35 && k <= 65); };
+    const bool blocker = fixture == SplitFixture::pending_parent;
+    std::vector<unsigned> rows, columns{0};
+    std::vector<double> input;
+    for (unsigned c = 0; c < a.n; ++c)
+    {
+        for (unsigned r = 0; r < a.n; ++r)
+        {
+            const bool exterior_row = r >= split_first_row && r < split_first_target;
+            if (r != c && !(left(c) && left(r)) && !(right(c) && right(r)) &&
+                !(exterior_row && c < split_first_row) && !(c >= split_first_target && r < split_first_target) &&
+                !(blocker && ((r == 4 && c == 1) || (r == 1 && c == 4))))
+                continue;
+            // The two dense roots have different non-unit divisors. Both raw
+            // lower entries must be normalized exactly once at factor output.
+            const double pivot = c == 0 ? 2.0 : (c == 2 || (blocker && c == 4)) ? 4.0 : 1.0;
+            double v = r == c ? pivot : 0.0;
+            if (r == split_first_row && c < 4)
+                v = pivot;
+            if (c == split_first_target && r < 4)
+                v = 1.0;
+            if (r == split_first_row && c == split_first_target)
+                v = 8.0;
+            if (blocker && ((r == 4 && c == 1) || (r == 1 && c == 4)))
+                v = 1.0;
+            const bool duplicate = (fixture == SplitFixture::duplicate_lower && r == split_first_row && left(c)) ||
+                                   (fixture == SplitFixture::duplicate_upper && c == split_first_target && left(r));
+            rows.push_back(r);
+            input.push_back(v);
+            if (duplicate)
+            {
+                rows.push_back(r);
+                input.push_back(v);
+            }
+        }
+        columns.push_back(unsigned(rows.size()));
+    }
+    a.fill_in(rows.data(), columns.data());
+    a.csr();
+    a.predictLU(rows.data(), columns.data(), input.data());
+    a.leveling();
+}
+
+void test_split_fixture_plan(const Symbolic_Matrix& a, SplitFixture fixture)
+{
+    if (a.csr_diag_ptr.size() != a.n || a.level_ptr[1] != 4 ||
+        !std::equal(a.level_idx.begin(), a.level_idx.begin() + 4, std::vector<int>{0, 1, 2, 3}.begin()))
+        throw std::runtime_error("split fixture initial level or diagonal count");
+    std::vector<uint64_t> bases{0};
+    for (unsigned c = 0; c < a.n; ++c)
+        bases.push_back(bases.back() + uint64_t(a.sym_c_ptr[c + 1] - a.l_col_ptr[c] - 1) *
+                                           (a.csr_r_ptr[c + 1] - a.csr_diag_ptr[c] - 1));
+    MappedFrontPlan plan;
+    std::vector<int> mapped_order = a.level_idx;
+    add_split_mapped_levels(plan, a, bases, mapped_order);
+    const auto& first = plan.split_levels.at(0);
+    const bool both = fixture == SplitFixture::independent;
+    if (first.fronts.size() != (both ? 2u : 1u))
+        throw std::runtime_error("split fixture accepted incorrect number of fronts");
+    for (unsigned i = 0; i < first.fronts.size(); ++i)
+    {
+        const auto& f = first.fronts[i];
+        const unsigned root = both && i == 0 ? 0 : 2;
+        if (f.steps != 32 || f.rows != 32 + split_exterior_size || f.cols != 32 + split_exterior_size ||
+            f.diagonal != a.l_col_ptr[root] ||
+            f.first_target != a.csr_diag_ptr[root] + 1 || f.map_begin != bases[root])
+            throw std::runtime_error("split fixture selected incorrect branch");
+    }
+    if (!std::equal(a.level_idx.begin(), a.level_idx.end(), mapped_order.begin()))
+        throw std::runtime_error("split fixture changed the original source order");
+    std::vector<int> expected = both ? std::vector<int>{1, 3} : std::vector<int>{0, 1, 3};
+    const auto rem = first.sparse;
+    if (rem.begin < a.n || rem.end > mapped_order.size() ||
+        !std::equal(expected.begin(), expected.end(), mapped_order.begin() + rem.begin, mapped_order.begin() + rem.end))
+        throw std::runtime_error("split fixture changed sparse remainder identities");
+    for (unsigned lev = 1; lev < plan.split_levels.size(); ++lev)
+        if (!plan.split_levels[lev].fronts.empty())
+            throw std::runtime_error("split fixture scheduled an unexpected later root");
+}
+
+void test_mapped_split_front(SplitFixture fixture, bool graph)
+{
+    std::ostringstream out, err;
+    Symbolic_Matrix matrix(split_order, out, err);
+    make_split_fixture(matrix, fixture);
+    test_split_fixture_plan(matrix, fixture);
+    GpuMatrix storage(matrix, 32, false, UpdateMode::Mapped);
+    GpuTask task(storage, 1);
+    if (graph)
+        task.prepare_graph();
+    task.enqueue();
+    task.wait();
+    task.check();
+    const auto* values = task.factors(0);
+    const auto value = [&](unsigned row, unsigned col)
+    {
+        const auto begin = matrix.sym_r_idx.begin() + matrix.sym_c_ptr[col];
+        const auto end = matrix.sym_r_idx.begin() + matrix.sym_c_ptr[col + 1];
+        const auto position = std::find(begin, end, row);
+        if (position == end)
+            throw std::runtime_error("split fixture missing factor entry");
+        return values[position - matrix.sym_r_idx.begin()];
+    };
+    const bool blocked = fixture == SplitFixture::pending_parent;
+    const REAL expected = fixture == SplitFixture::independent ? REAL(4) : blocked ? REAL(11) / 3 : REAL(3);
+    if (std::abs(value(split_first_row, split_first_target) - expected) > 4 * std::numeric_limits<REAL>::epsilon() ||
+        (blocked && value(4, 4) != REAL(3)) || value(split_first_row, 0) != REAL(1) ||
+        value(split_first_row, 2) != REAL(1))
+        throw std::runtime_error("split mapped front numeric result");
+    if ((fixture == SplitFixture::independent || blocked) &&
+        !(matrix.factor_residual(values) <= (sizeof(REAL) == 8 ? 2.e-12 : 2.e-5)))
+        throw std::runtime_error("split mapped front factor residual");
 }
 
 void test_invalid_factor(REAL value, const char* diagnostic)
@@ -2723,6 +2953,14 @@ int main()
             for (bool targets : {false, true})
                 for (unsigned copies : {1u, 3u})
                     test_mapped_level_grids(width, targets, copies);
+        test_mapped_level_grids(40, true, 1, 49); // 96,040 products
+        test_mapped_level_grids(40, true, 1, 50); // 100,000 products
+        for (bool perturb : {false, true})
+        {
+            test_mapped_single_normalization(271, 369, true, perturb); // 99,999 products
+            test_mapped_single_normalization(250, 400, true, perturb); // 100,000 products, deferred tail
+            test_mapped_single_normalization(250, 400, false, perturb); // 100,000 products, empty deferred list
+        }
         for (bool graph : {false, true})
             for (bool perturb : {false, true})
             {
@@ -2731,6 +2969,10 @@ int main()
                 test_mapped_front(39, 1, perturb, graph);
                 test_mapped_front(39, 3, perturb, graph);
             }
+        for (bool graph : {false, true})
+            for (SplitFixture fixture : {SplitFixture::independent, SplitFixture::duplicate_lower,
+                     SplitFixture::duplicate_upper, SplitFixture::pending_parent})
+                test_mapped_split_front(fixture, graph);
         for (UpdateMode mode : {UpdateMode::Scan, UpdateMode::Mapped})
             for (bool graph : {false, true})
                 for (unsigned copies : {1u, 2u, 3u, 16u, 33u, 42u})

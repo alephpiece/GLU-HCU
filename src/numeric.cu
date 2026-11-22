@@ -297,7 +297,7 @@ __global__ void RL_onecol_updateSubmat(const unsigned* __restrict__ sym_c_ptr_de
 }
 
 // Deferred small levels expose source-target parallelism without a separate factor launch.
-template <bool Perturb = false, class Slot = unsigned>
+template <bool Perturb = false, bool Normalized = false, class Slot = unsigned>
 __global__ void mapped_level_update(REAL* __restrict__ values,
     size_t stride,
     const unsigned* __restrict__ col,
@@ -337,16 +337,20 @@ __global__ void mapped_level_update(REAL* __restrict__ values,
         base = bases[source] + target * count;
         pivot_position = pivots[csr_diag[source] + 1 + target];
         pivot = values[pivot_position];
-        divisor = values[diag[source]];
-        if constexpr (Perturb)
-            if (fabs(divisor) < threshold)
-                divisor = threshold;
+        if constexpr (!Normalized)
+        {
+            divisor = values[diag[source]];
+            if constexpr (Perturb)
+                if (fabs(divisor) < threshold)
+                    divisor = threshold;
+        }
     }
     __syncthreads();
     for (unsigned i = threadIdx.x; i < count; i += blockDim.x)
     {
         REAL factor = values[lower + i];
-        factor /= divisor;
+        if constexpr (!Normalized)
+            factor /= divisor;
         if (factor != REAL(0))
             atomicAdd(&values[mapped_position(destinations, base + i, pivot_position)], -factor * pivot);
     }
@@ -806,12 +810,12 @@ unsigned filled_copy_bits(unsigned copies, unsigned cap)
     return bits;
 }
 // CUDA FP64 normalizes small SoA levels before their updates. Other backend /
-// precision combinations defer normalization; the single-copy mapped AoS path always
-// defers it. This policy does not change the task's input/output contract.
+// precision combinations defer normalization. In single-copy execution, CUDA
+// FP64 also normalizes expensive sparse levels before distributing their updates.
 #if !defined(GLU_USE_HIP) && !defined(GLU_USE_FP32)
-constexpr bool normalize_soa_levels = true;
+constexpr bool normalize_mapped_levels = true;
 #else
-constexpr bool normalize_soa_levels = false;
+constexpr bool normalize_mapped_levels = false;
 #endif
 void gpu_check(cudaError_t status, const char* operation)
 {
@@ -1071,6 +1075,8 @@ struct GpuMatrix::Impl
     unsigned fused_block_threads = 256;
     unsigned deferred_columns_count = 0;
     unsigned single_deferred_columns_count = 0; // Includes medium levels assigned one block per target.
+    bool expand_medium_targets = false;
+    std::vector<bool> normalize_single_levels;
     bool perturb;
     UpdateMode update_mode;
     SnapshotPolicy snapshot_policy;
@@ -1114,7 +1120,45 @@ struct GpuMatrix::Impl
     }
     bool expands_medium_targets(size_t lev) const
     {
-        return single_deferred_columns_count > deferred_columns_count && medium_targets_fit(lev);
+        return expand_medium_targets && medium_targets_fit(lev);
+    }
+    bool normalizes_single_level(size_t lev) const
+    {
+        return !normalize_single_levels.empty() && normalize_single_levels[lev];
+    }
+    void choose_single_level_normalization(const Symbolic_Matrix& a, std::vector<int>& deferred)
+    {
+        // Amortize the extra launch on levels with many repeated divisions.
+        constexpr uint64_t minimum_products = 100000;
+        std::vector<bool> normalized(n);
+        normalize_single_levels.resize(levels.size() - 1);
+        for (size_t lev = 0; lev + 1 < levels.size(); ++lev)
+        {
+            const unsigned front_steps = front_plan.starting_at.empty() ? 0 : front_plan.starting_at[lev].steps;
+            if (front_steps)
+            {
+                lev += front_steps - 1;
+                continue;
+            }
+            const int begin = levels[lev], end = levels[lev + 1];
+            if (end - begin > 16 && !expands_medium_targets(lev))
+                continue;
+            uint64_t products = 0;
+            for (int i = begin; i < end; ++i)
+            {
+                const unsigned column = unsigned(columns[i]);
+                products += (target_prefix[i + 1] - target_prefix[i]) *
+                            (a.sym_c_ptr[column + 1] - a.l_col_ptr[column] - 1);
+            }
+            if (products < minimum_products)
+                continue;
+            normalize_single_levels[lev] = true;
+            for (int i = begin; i < end; ++i)
+                normalized[unsigned(columns[i])] = true;
+        }
+        deferred.erase(std::remove_if(deferred.begin(), deferred.end(),
+                           [&](int column) { return normalized[unsigned(column)]; }),
+            deferred.end());
     }
 
     unsigned value_pitch(unsigned copies) const
@@ -1200,7 +1244,8 @@ struct GpuMatrix::Impl
         if (mode != UpdateMode::Fused || perturb)
         {
             diag.upload(a.l_col_ptr);
-            level_idx.upload(a.level_idx);
+            if (mode != UpdateMode::Mapped)
+                level_idx.upload(a.level_idx);
         }
         if (!panel_mode)
         {
@@ -1297,9 +1342,11 @@ struct GpuMatrix::Impl
         if (mode == UpdateMode::Mapped)
         {
             const auto begin = std::chrono::steady_clock::now();
-            build_update_map(a);
+            std::vector<int> mapped_order = columns;
+            build_update_map(a, mapped_order);
+            level_idx.upload(mapped_order);
             target_prefix.push_back(0);
-            for (int column : columns)
+            for (int column : mapped_order)
             {
                 const uint64_t targets = a.sym_c_ptr[column + 1] > a.l_col_ptr[column] + 1
                                              ? uint64_t(csr_rows[column + 1] - csr_diags[column] - 1)
@@ -1333,6 +1380,11 @@ struct GpuMatrix::Impl
                 }
                 deferred.insert(deferred.end(), columns.begin() + levels[lev], columns.begin() + levels[lev + 1]);
             }
+            expand_medium_targets = deferred.size() > deferred_columns_count;
+            // This build normalizes all SoA levels in place, so the remaining
+            // deferred list serves only single-copy tasks.
+            if constexpr (normalize_mapped_levels)
+                choose_single_level_normalization(a, deferred);
             single_deferred_columns_count = unsigned(deferred.size());
             level_targets.upload(target_prefix);
             deferred_columns.upload(deferred);
@@ -1372,7 +1424,7 @@ struct GpuMatrix::Impl
         }
     }
 
-    void build_update_map(const Symbolic_Matrix& a)
+    void build_update_map(const Symbolic_Matrix& a, std::vector<int>& mapped_order)
     {
         // Count before allocating the potentially much larger-than-factor map.
         std::vector<uint64_t> bases(size_t(n) + 1);
@@ -1405,7 +1457,7 @@ struct GpuMatrix::Impl
         // path can build any map that fits without temporary device storage.
         constexpr unsigned small_map_entries = 64 * 1024;
         const bool on_host = total <= small_map_entries || device_workspace > available - map_bytes;
-        front_plan = make_mapped_front_plan(a, bases);
+        front_plan = make_mapped_front_plan(a, bases, mapped_order);
         map_bases.upload(bases);
         if (narrow)
             upload_map(a, bases, on_host, map_deltas);
@@ -1619,12 +1671,31 @@ struct GpuTask::Impl
                     transpose(false);
                 return;
             }
+        auto enqueue_aos_targets = [&](unsigned begin, unsigned end, auto normalized) {
+            const uint64_t targets = a.target_prefix[end] - a.target_prefix[begin];
+            if (!targets)
+                return;
+            mapped_level_update<Perturb, decltype(normalized)::value>
+                <<<dim3(unsigned(targets), copies), 256, 0, stream>>>(values.ptr, a.nnz,
+                a.col.ptr, a.diag.ptr, a.csr_diag.ptr, a.level_idx.ptr, a.level_targets.ptr, begin, end,
+                a.map_bases.ptr, mapped_positions, a.map_pivots.ptr, a.threshold);
+            gpu_check(cudaGetLastError(), "update mapped level");
+        };
         for (size_t lev = 0; lev + 1 < a.levels.size(); ++lev)
         {
             const int begin = a.levels[lev], end = a.levels[lev + 1], width = end - begin;
             if constexpr (Mode == UpdateMode::Mapped)
             {
-                if (front_values.ptr && a.front_plan.starting_at[lev].steps)
+                if (front_values.ptr && !a.front_plan.split_levels.empty() && a.front_plan.split_levels[lev].split)
+                {
+                    const auto& split = a.front_plan.split_levels[lev];
+                    for (const auto& front : split.fronts)
+                        enqueue_mapped_front<Perturb>(front, values.ptr, front_values.ptr, mapped_positions,
+                            a.map_pivots.ptr, a.threshold, stream);
+                    enqueue_aos_targets(split.sparse.begin, split.sparse.end, std::false_type{});
+                    continue;
+                }
+                if (front_values.ptr && !a.front_plan.starting_at.empty() && a.front_plan.starting_at[lev].steps)
                 {
                     const auto& front = a.front_plan.starting_at[lev];
                     enqueue_mapped_front<Perturb>(front, values.ptr, front_values.ptr, mapped_positions,
@@ -1634,7 +1705,7 @@ struct GpuTask::Impl
                 }
                 if (width <= 16 || (!soa && a.expands_medium_targets(lev)))
                 {
-                    if (soa && normalize_soa_levels)
+                    if (soa && normalize_mapped_levels)
                     {
                         mapped_normalize_level_soa<Perturb>
                             <<<dim3(width, copy_tiles(copy_bits)), 256, 0, stream>>>(interleaved_values.ptr, copies,
@@ -1645,17 +1716,26 @@ struct GpuTask::Impl
                     if (targets)
                     {
                         if (soa)
-                            mapped_level_update_soa<Perturb, normalize_soa_levels>
+                        {
+                            mapped_level_update_soa<Perturb, normalize_mapped_levels>
                                 <<<dim3(unsigned(targets), copy_tiles(copy_bits)), 256, 0, stream>>>(
                                     interleaved_values.ptr, copies, a.col.ptr, a.diag.ptr, a.csr_diag.ptr,
                                     a.level_idx.ptr, a.level_targets.ptr, begin, end, a.map_bases.ptr, mapped_positions,
                                     a.map_pivots.ptr, a.threshold, soa_stride, copy_bits);
+                            gpu_check(cudaGetLastError(), "update mapped level");
+                        }
                         else
-                            mapped_level_update<Perturb>
-                                <<<dim3(unsigned(targets), copies), 256, 0, stream>>>(values.ptr, a.nnz, a.col.ptr,
-                                    a.diag.ptr, a.csr_diag.ptr, a.level_idx.ptr, a.level_targets.ptr, begin, end,
-                                    a.map_bases.ptr, mapped_positions, a.map_pivots.ptr, a.threshold);
-                        gpu_check(cudaGetLastError(), "update mapped level");
+                        {
+                            if (a.normalizes_single_level(lev))
+                            {
+                                mapped_normalize_level_soa<Perturb><<<width, 256, 0, stream>>>(values.ptr, 1,
+                                    a.col.ptr, a.diag.ptr, a.level_idx.ptr, begin, 0, a.threshold, 1);
+                                gpu_check(cudaGetLastError(), "normalize single mapped level");
+                                enqueue_aos_targets(begin, end, std::true_type{});
+                            }
+                            else
+                                enqueue_aos_targets(begin, end, std::false_type{});
+                        }
                     }
                     continue;
                 }
@@ -1740,7 +1820,7 @@ struct GpuTask::Impl
         if constexpr (Mode == UpdateMode::Mapped)
         {
             const unsigned count = soa ? a.deferred_columns_count : a.single_deferred_columns_count;
-            if (count && !(soa && normalize_soa_levels))
+            if (count && !(soa && normalize_mapped_levels))
             {
                 // Target-parallel updates divide each raw lower entry by U(k,k).
                 // Successors never update it. Normalize once for factor output.
@@ -1883,7 +1963,7 @@ unsigned GpuTask::wide_copy_tile_size() const { return update_copy_tile_size(); 
 unsigned GpuTask::soa_value_stride() const { return impl_->soa_stride; }
 bool GpuTask::normalizes_each_level() const
 {
-    return impl_->matrix->panel_mode || (impl_->soa_stride && normalize_soa_levels);
+    return impl_->matrix->panel_mode || (impl_->soa_stride && normalize_mapped_levels);
 }
 
 size_t GpuTask::numeric_launches() const
@@ -1910,7 +1990,15 @@ size_t GpuTask::numeric_launches() const
         const unsigned width = unsigned(a.levels[lev + 1] - a.levels[lev]);
         if (a.update_mode == UpdateMode::Mapped)
         {
-            if (t.front_values.ptr && a.front_plan.starting_at[lev].steps)
+            if (t.front_values.ptr && !a.front_plan.split_levels.empty() && a.front_plan.split_levels[lev].split)
+            {
+                const auto& split = a.front_plan.split_levels[lev];
+                for (const auto& front : split.fronts)
+                    count += front.numeric_launches();
+                count += a.target_prefix[split.sparse.end] > a.target_prefix[split.sparse.begin];
+                continue;
+            }
+            if (t.front_values.ptr && !a.front_plan.starting_at.empty() && a.front_plan.starting_at[lev].steps)
             {
                 const auto& front = a.front_plan.starting_at[lev];
                 count += front.numeric_launches();
@@ -1921,7 +2009,7 @@ size_t GpuTask::numeric_launches() const
             if (width > 16 && (t.soa_stride || !a.expands_medium_targets(lev)))
                 count += t.soa_stride ? 1 + targets : 1;
             else
-                count += targets + (t.soa_stride && normalize_soa_levels);
+                count += targets + (t.soa_stride ? normalize_mapped_levels : a.normalizes_single_level(lev));
         }
         else if (width > 16)
             count += (width + a.slots - 1) / a.slots;
@@ -1930,7 +2018,7 @@ size_t GpuTask::numeric_launches() const
                 count += 2 + (a.csr_rows[a.columns[p] + 1] > a.csr_diags[a.columns[p]] + 1);
     }
     const unsigned deferred = t.soa_stride ? a.deferred_columns_count : a.single_deferred_columns_count;
-    if (a.update_mode == UpdateMode::Mapped && deferred && !(t.soa_stride && normalize_soa_levels))
+    if (a.update_mode == UpdateMode::Mapped && deferred && !(t.soa_stride && normalize_mapped_levels))
         ++count;
     return count;
 }
@@ -1947,6 +2035,8 @@ size_t GpuTask::numeric_wide_blocks() const
             if (a.update_mode == UpdateMode::Mapped && !t.soa_stride && a.expands_medium_targets(lev))
             {
                 columns += a.target_prefix[a.levels[lev + 1]] - a.target_prefix[a.levels[lev]];
+                if (a.normalizes_single_level(lev))
+                    columns += a.levels[lev + 1] - a.levels[lev];
                 continue;
             }
             columns += a.levels[lev + 1] - a.levels[lev];
