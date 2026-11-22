@@ -2252,6 +2252,98 @@ void test_mapped_level_grids(unsigned width, bool targets, unsigned copies)
             throw std::runtime_error("mapped level grid factor residual");
 }
 
+void test_mapped_single_normalization(unsigned lower_count, unsigned target_count, bool tail, bool perturb)
+{
+    // Root 0 updates the full rectangle. Root 1 shares its level, has a
+    // non-unit pivot and a lower entry, but never contributes to a target.
+    const unsigned first_target = 2 + lower_count, aux = first_target + target_count;
+    const unsigned n = aux + (tail ? 3 : 1);
+    std::vector<unsigned> rows, columns{0};
+    std::vector<double> input;
+    const auto add = [&](unsigned r, double v) {
+        rows.push_back(r);
+        input.push_back(v);
+    };
+    for (unsigned c = 0; c < n; ++c)
+    {
+        if (c >= first_target && c < aux)
+            add(0, c == first_target ? 8 : 0);
+        double pivot = 4;
+        if (c == 1)
+            pivot = perturb ? 0 : 8;
+        if (tail && c == aux)
+            pivot = 6;
+        if (tail && c == aux + 1)
+            pivot = 8;
+        add(c, pivot);
+        if (c == 0)
+            for (unsigned r = 2; r < first_target; ++r)
+                add(r, r == 2 ? 2 : 0);
+        if (c == 1)
+            add(aux, 4);
+        if (tail && c == aux)
+            add(aux + 1, 3);
+        if (tail && c == aux + 1)
+            add(aux + 2, 4);
+        columns.push_back(unsigned(rows.size()));
+    }
+    std::ostringstream out, err;
+    Symbolic_Matrix matrix(n, out, err);
+    matrix.fill_in(rows.data(), columns.data());
+    matrix.csr();
+    matrix.predictLU(rows.data(), columns.data(), input.data());
+    matrix.leveling();
+    if (matrix.num_lev != (tail ? 4 : 2) || matrix.level_ptr[1] != 2)
+        throw std::runtime_error("unexpected mapped normalization fixture levels");
+#if defined(GLU_USE_HIP)
+    constexpr bool cuda_fp64 = false;
+#else
+    constexpr bool cuda_fp64 = sizeof(REAL) == 8;
+#endif
+    const bool heavy = lower_count * target_count >= 100000;
+    GpuMatrix gpu(matrix, 32, perturb, UpdateMode::Mapped);
+    // Only the zero diagonal at root 1 is perturbed. The maximum column sum is 12.
+    Symbolic_Matrix oracle(matrix);
+    const REAL pivot1 = perturb ? REAL(12) * REAL(3.45e-4f) : REAL(8);
+    oracle.val[matrix.l_col_ptr[1]] = pivot1;
+    const auto schur = matrix.l_col_ptr[first_target] - lower_count;
+    if (matrix.sym_r_idx[schur] != 2)
+        throw std::runtime_error("unexpected mapped normalization Schur entry");
+    for (unsigned copies : {1u, 3u})
+    {
+        GpuTask task(gpu, copies);
+        // AoS has a root update, one wide level and a final normalization.
+        // Early root normalization adds one launch and can remove the final one.
+        const unsigned aos = 3 + unsigned(cuda_fp64 && heavy && tail);
+        // SoA also converts the output. CUDA FP64 normalizes each of the two
+        // optional singleton levels separately, other builds use one final list.
+        const unsigned soa = 4 + (cuda_fp64 && tail ? 2 : 0);
+        if (task.numeric_launches() != (copies == 1 ? aos : soa) ||
+            task.normalizes_each_level() != (copies > 1 && cuda_fp64))
+            throw std::runtime_error("incorrect mapped normalization schedule");
+        for (bool graph : {false, true})
+        {
+            if (graph)
+                task.prepare_graph();
+            task.enqueue();
+            task.wait();
+            task.check();
+            for (unsigned copy = 0; copy < copies; ++copy)
+            {
+                const auto* lu = task.factors(copy);
+                const REAL root1_lower = lu[matrix.l_col_ptr[1] + 1];
+                if (lu[matrix.l_col_ptr[0] + 1] != REAL(0.5) || lu[schur] != REAL(-4) ||
+                    lu[matrix.l_col_ptr[1]] != pivot1 ||
+                    std::abs(root1_lower * pivot1 - REAL(4)) > 8 * std::numeric_limits<REAL>::epsilon() ||
+                    (tail && lu[matrix.l_col_ptr[aux + 1] + 1] != REAL(0.5)))
+                    throw std::runtime_error("mapped normalization pivot, raw lower or Schur entry");
+                if (!(oracle.factor_residual(lu) <= (sizeof(REAL) == 8 ? 2.e-12 : 2.e-5)))
+                    throw std::runtime_error("mapped normalization factor residual");
+            }
+        }
+    }
+}
+
 void test_mapped_front(unsigned steps, unsigned copies, bool perturb, bool graph)
 {
     // Interleaved exterior rows and columns form a rectangular front whose
@@ -2848,6 +2940,12 @@ int main()
             for (bool targets : {false, true})
                 for (unsigned copies : {1u, 3u})
                     test_mapped_level_grids(width, targets, copies);
+        for (bool perturb : {false, true})
+        {
+            test_mapped_single_normalization(271, 369, true, perturb); // 99,999 products
+            test_mapped_single_normalization(250, 400, true, perturb); // 100,000 products, deferred tail
+            test_mapped_single_normalization(250, 400, false, perturb); // 100,000 products, empty deferred list
+        }
         for (bool graph : {false, true})
             for (bool perturb : {false, true})
             {
