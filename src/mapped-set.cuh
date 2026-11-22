@@ -1,4 +1,4 @@
-// All tasks share one update launch at each active dependency level.
+// One update launch per active level covers the tasks with updates at that level.
 // Write L once per level when reusing it across targets offsets the extra launches.
 // With deferred writeback, updates divide their source values on demand.
 #if defined(GLU_USE_HIP) || defined(GLU_USE_FP32)
@@ -7,8 +7,8 @@ constexpr bool defer_set_normalization = true;
 constexpr bool defer_set_normalization = false;
 #endif
 
-// Each source-target update owns its L-column lanes. Independent sources may update
-// the same factor slot, as on the single-copy right-looking Mapped path.
+// Each 32-thread group updates one target column j from source k using U(k,j).
+// Different sources in one task can contribute to the same factor slot.
 struct MappedSetTask
 {
     size_t factors, input;
@@ -113,7 +113,7 @@ update_mapped_set(REAL* factors, const MappedSetTask* tasks, const MappedSetUpda
     REAL divisor = REAL(1);
     if constexpr (defer_set_normalization)
     {
-        // Updates may share the source pivot. Only normalization writes it.
+        // All targets of this source read U(k,k). Normalization writes any perturbation.
         divisor = values[diagonal];
         if constexpr (Perturb)
             if (fabs(divisor) < task.threshold)

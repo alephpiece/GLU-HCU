@@ -10,8 +10,8 @@
 #include <utility>
 #include <vector>
 
-// Structural panel plan. Every entry is a multiply-subtract; stable destination
-// sorting changes ownership, never the contribution set.
+// For an update at (i,j) from source k, lower and pivot are the factor
+// slots of L(i,k) and U(k,j). Sorting by destination preserves each sum's order.
 struct UpdateContribution
 {
     unsigned destination, lower, pivot;
@@ -163,7 +163,7 @@ inline void extract_dense_updates(const Symbolic_Matrix& a,
         groups.push_back({first, last, dst});
         if (last - first <= 32)
         {
-            // Equal complete ORDERED pivot lists, within a fixed 128x128 region.
+            // Group targets in a 128x128 region by their full ordered list of sources k.
             std::vector<unsigned> key{a.sym_r_idx[dst] / 128, column_of[dst] / 128};
             for (size_t q = first; q < last; ++q)
                 key.push_back(a.sym_r_idx[deferred[q].pivot]);
@@ -219,8 +219,8 @@ inline void extract_dense_updates(const Symbolic_Matrix& a,
                 up = u.pivot;
             }
         }
-        // Holes are permitted only in D. Every real contribution must agree
-        // with a complete, separable row/pivot L and column/pivot U product.
+        // Holes are permitted only in D. The L(i,k) and U(k,j) operands
+        // must cover every selected row and column for each source k.
         if (std::find(lower.begin(), lower.end(), missing) != lower.end() ||
             std::find(pivot.begin(), pivot.end(), missing) != pivot.end())
             valid = false;

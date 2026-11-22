@@ -154,7 +154,7 @@ struct Matrix
 // The two source columns are independent, but update common destinations.
 // Neighbouring logical groups have unequal loop lengths on a 64-lane wave.
 // There are enough destinations to reuse every group even in a 1024-thread
-// block. Prefix lengths put pivots at lanes 0/31 and across chunk boundaries;
+// block. Prefix lengths place U(k,j) at lanes 0/31 and across chunk boundaries;
 // long destinations also exercise the one-column kernel's 1024-element loop.
 Matrix make_matrix(bool perturb)
 {
@@ -588,7 +588,7 @@ void test_repeated_tasks(bool graph = false,
 void test_repeated_mapped_indices()
 {
     // Repeated off-diagonal entries still refer to the first matching slot in
-    // the target column, both when reading a pivot and when writing an update.
+    // the target column, both when reading U(k,j) and when writing the update at (i,j).
     for (bool repeated_pivot : {false, true})
     {
         std::vector<unsigned> rows = repeated_pivot ? std::vector<unsigned>{0, 2, 0, 0, 1, 2, 2}
@@ -627,8 +627,8 @@ void test_repeated_mapped_indices()
             "read relative duplicate map");
         if (delta != host_delta || pivots[1] + delta[0] != 5 || pivots[repeated_pivot ? 2 : 1] + delta[1] != 5)
             throw std::runtime_error("relative slots changed first-occurrence lookup");
-        // Remove the required lower row from the target after constructing
-        // its pivots. The device constructor must report the missing entry.
+        // Remove the target row i after recording the slots for U(k,j).
+        // The device map constructor must report the missing entry.
         std::fill(a.sym_r_idx.begin() + a.l_col_ptr[1] + 1, a.sym_r_idx.begin() + a.sym_c_ptr[2], 1u);
         Buffer<unsigned> invalid_output;
         try

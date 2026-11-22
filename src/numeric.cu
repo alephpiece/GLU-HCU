@@ -14,7 +14,8 @@
 
 using namespace std;
 
-// The U pivot already supplies a stable base in the sorted target column.
+// For source k and target column j, pivot is the CSC slot of U(k,j).
+// A 16-bit entry holds slot(i,j) - slot(k,j) for an updated row i > k.
 template <class Slot>
 __device__ inline unsigned mapped_position(const Slot* positions, uint64_t ordinal, unsigned pivot)
 {
@@ -130,12 +131,12 @@ __global__ void RL(const unsigned* __restrict__ sym_c_ptr_dev,
                     const unsigned mask = gpuBallot32(is_pivot);
                     if (mask)
                         pivot = gpuShuffle32(value, __ffs(mask) - 1);
-                    // Sorted row indices put the pivot before all rows using it.
-                    // Keep it in registers across chunks; no implicit warp sync.
+                    // U(k,j) precedes all updated rows in sorted column j.
+                    // Keep it in registers across chunks without implicit warp synchronization.
                     if (active && ridx > currentCol)
                     {
                         const REAL factor = tmpMem[ridx + n * size_t(bid)];
-                        // Avoid zero-contribution writes to another column's pivot.
+                        // Another source may be reading this slot as its U(ridx,j).
                         if (factor != REAL(0))
                             atomicAdd(&val_dev[subColElem], -factor * pivot);
                     }
@@ -884,8 +885,8 @@ template <class Slot> __host__ __device__ Slot encode_mapped_position(unsigned d
     return destination;
 }
 
-// CSC and CSR enumerate the same upper entries in different orders. Preserve
-// the first CSC slot when several entries have the same row.
+// Map each strict-upper CSR entry U(k,j) to its CSC slot in column j.
+// Preserve the first CSC slot when several entries have the same row.
 template <class Slot = unsigned>
 std::vector<unsigned> mapped_pivot_slots(const Symbolic_Matrix& a,
     const std::vector<uint64_t>& bases,
@@ -1389,7 +1390,7 @@ struct GpuMatrix::Impl
             bases[c + 1] = bases[c] + added;
         }
         const uint64_t total = bases.back();
-        // The pivot is at or before every destination in its sorted target column.
+        // Each offset from U(k,j) to an updated slot fits within column j.
         const bool narrow = longest_column <= uint64_t(std::numeric_limits<uint16_t>::max()) + 1;
         map_bytes = checked_sum(checked_bytes(uint64_t(n) + 1, sizeof(uint64_t)),
             checked_sum(checked_bytes(total, narrow ? sizeof(uint16_t) : sizeof(unsigned)),
@@ -1741,7 +1742,7 @@ struct GpuTask::Impl
             const unsigned count = soa ? a.deferred_columns_count : a.single_deferred_columns_count;
             if (count && !(soa && normalize_soa_levels))
             {
-                // Target-parallel updates consume the raw L entry divided by its pivot.
+                // Target-parallel updates divide each raw lower entry by U(k,k).
                 // Successors never update it. Normalize once for factor output.
                 RL_onecol_factorizeCurrentCol<Perturb, false, true>
                     <<<dim3(count, copies), column_threads, 0, stream>>>(a.col.ptr, a.row.ptr,

@@ -143,18 +143,22 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// One ordered collection of independent templates using the same Fused or Mapped mode.
-// Owns one stream and contiguous AoS input/output buffers; shares template plans.
+// An ordered collection of independent numerical tasks. All templates use the
+// same update mode. Mapped groups updates across tasks by dependency level.
+// Fused assigns one block per task. Both use one stream per set and pack input
+// and output in logical task order.
 // Calls on a set are serialized, with the same source/result lifetime and failure
 // rules as GpuTask. Template wrappers may be destroyed after construction.
 class GpuTaskSet
 {
 public:
-    // task_templates[t] indexes templates. Repeated indices create independent
-    // numeric tasks sharing a template. The lists are only needed during construction.
+    // task_templates[t] selects the template for logical task t. Tasks that
+    // share a template have separate values and output. The caller only needs
+    // to retain the two lists through construction.
     GpuTaskSet(const std::vector<const GpuMatrix*>& templates, const std::vector<size_t>& task_templates);
-    // Optionally capture the Mapped level kernels and factor download before
-    // queuing input. Further calls while idle reuse the executable Graph.
+    // Mapped sets submit kernels directly by default. Call while idle to
+    // capture the numerical kernels and factor download in one Graph per set.
+    // Further calls while idle reuse the executable Graph.
     void prepare_graph();
     ~GpuTaskSet();
     GpuTaskSet(const GpuTaskSet&) = delete;
