@@ -339,7 +339,7 @@ MappedFrontPlan make_mapped_front_plan(
     const auto& levels = a.level_ptr;
     const auto& columns = a.level_idx;
     MappedFrontPlan plan;
-    // Amortize packing over at least two panels and bound per-task temporary storage.
+    constexpr unsigned minimum_single_source_steps = 8;
     for (size_t lev = 0; lev + 1 < levels.size();)
     {
         if (levels[lev + 1] - levels[lev] != 1)
@@ -363,7 +363,7 @@ MappedFrontPlan make_mapped_front_plan(
             if (nested_front_successor(a, prior) != next)
                 break;
         }
-        if (end - lev >= front_minimum_steps)
+        if (end - lev >= minimum_single_source_steps)
         {
             if (plan.starting_at.empty())
                 plan.starting_at.resize(levels.size() - 1);
