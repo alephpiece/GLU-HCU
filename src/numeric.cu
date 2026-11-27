@@ -356,6 +356,51 @@ __global__ void mapped_level_update(REAL* __restrict__ values,
     }
 }
 
+// A single block advances through consecutive inexpensive singleton levels.
+// Each step reads the raw L column, and the usual deferred pass normalizes it.
+template <bool Perturb, class Slot>
+__global__ void mapped_tiny_chain(REAL* __restrict__ values,
+    const unsigned* __restrict__ col,
+    const unsigned* __restrict__ diag,
+    const unsigned* __restrict__ csr_diag,
+    const int* __restrict__ level_idx,
+    int begin,
+    int end,
+    const uint64_t* __restrict__ bases,
+    const Slot* __restrict__ destinations,
+    const unsigned* __restrict__ pivots,
+    REAL threshold)
+{
+    for (int position = begin; position < end; ++position)
+    {
+        const unsigned source = unsigned(level_idx[position]);
+        const unsigned diagonal = diag[source];
+        const unsigned lower = diagonal + 1;
+        const unsigned count = col[source + 1] - lower;
+        const uint64_t base = bases[source];
+        const unsigned products = unsigned(bases[source + 1] - base);
+        const unsigned first_target = csr_diag[source] + 1;
+        REAL divisor = values[diagonal];
+        if constexpr (Perturb)
+            if (fabs(divisor) < threshold)
+                divisor = threshold;
+
+        for (unsigned p = threadIdx.x; p < products; p += blockDim.x)
+        {
+            const unsigned target = p / count;
+            const unsigned i = p - target * count;
+            const REAL factor = values[lower + i] / divisor;
+            if (factor != REAL(0))
+            {
+                const unsigned pivot = pivots[first_target + target];
+                // Keep the global atomic arithmetic of mapped_level_update.
+                atomicAdd(&values[mapped_position(destinations, base + p, pivot)], -factor * values[pivot]);
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // Adjacent lanes access one symbolic position across independent value copies.
 template <bool Perturb = false, bool Normalized = false, class Slot = unsigned>
 __global__ void mapped_level_update_soa(REAL* values,
@@ -1071,6 +1116,7 @@ __global__ void scatter_compact_input_soa(REAL* values,
 struct GpuMatrix::Impl
 {
     MappedFrontPlan front_plan;
+    std::vector<unsigned> tiny_chain_steps;
     unsigned n, nnz, slots, max_batch, max_grid_x;
     unsigned fused_block_threads = 256;
     unsigned deferred_columns_count = 0;
@@ -1125,6 +1171,45 @@ struct GpuMatrix::Impl
     bool normalizes_single_level(size_t lev) const
     {
         return !normalize_single_levels.empty() && normalize_single_levels[lev];
+    }
+    void choose_tiny_chains(const Symbolic_Matrix& a)
+    {
+        constexpr uint64_t max_level_products = 2048, max_chain_products = 4096;
+        constexpr size_t min_steps = 4;
+        tiny_chain_steps.resize(levels.size() - 1);
+        size_t first = 0;
+        uint64_t accumulated = 0;
+        auto finish = [&](size_t end, size_t next) {
+            if (end - first >= min_steps)
+                tiny_chain_steps[first] = unsigned(end - first);
+            first = next;
+            accumulated = 0;
+        };
+        for (size_t lev = 0; lev < tiny_chain_steps.size();)
+        {
+            const unsigned front_steps = front_plan.starting_at.empty() ? 0 : front_plan.starting_at[lev].steps;
+            const bool split = !front_plan.split_levels.empty() && front_plan.split_levels[lev].split;
+            const int begin = levels[lev];
+            uint64_t products = 0;
+            if (!front_steps && !split && levels[lev + 1] - begin == 1 && !normalizes_single_level(lev))
+            {
+                const unsigned source = unsigned(columns[begin]);
+                const unsigned lower = a.sym_c_ptr[source + 1] - a.l_col_ptr[source] - 1;
+                products = (target_prefix[begin + 1] - target_prefix[begin]) * lower;
+            }
+            if (!products || products > max_level_products)
+            {
+                const size_t next = lev + std::max(1u, front_steps);
+                finish(lev, next);
+                lev = next;
+                continue;
+            }
+            if (accumulated + products > max_chain_products)
+                finish(lev, lev);
+            accumulated += products;
+            ++lev;
+        }
+        finish(tiny_chain_steps.size(), tiny_chain_steps.size());
     }
     void choose_single_level_normalization(const Symbolic_Matrix& a, std::vector<int>& deferred)
     {
@@ -1385,6 +1470,7 @@ struct GpuMatrix::Impl
             // deferred list serves only single-copy tasks.
             if constexpr (normalize_mapped_levels)
                 choose_single_level_normalization(a, deferred);
+            choose_tiny_chains(a);
             single_deferred_columns_count = unsigned(deferred.size());
             level_targets.upload(target_prefix);
             deferred_columns.upload(deferred);
@@ -1703,6 +1789,16 @@ struct GpuTask::Impl
                     lev += front.steps - 1;
                     continue;
                 }
+                const unsigned tiny_steps = copies == 1 ? a.tiny_chain_steps[lev] : 0;
+                if (tiny_steps)
+                {
+                    mapped_tiny_chain<Perturb><<<1, 256, 0, stream>>>(values.ptr, a.col.ptr, a.diag.ptr,
+                        a.csr_diag.ptr, a.level_idx.ptr, begin, a.levels[lev + tiny_steps], a.map_bases.ptr,
+                        mapped_positions, a.map_pivots.ptr, a.threshold);
+                    gpu_check(cudaGetLastError(), "update tiny mapped chain");
+                    lev += tiny_steps - 1;
+                    continue;
+                }
                 if (width <= 16 || (!soa && a.expands_medium_targets(lev)))
                 {
                     if (soa && normalize_mapped_levels)
@@ -2003,6 +2099,13 @@ size_t GpuTask::numeric_launches() const
                 const auto& front = a.front_plan.starting_at[lev];
                 count += front.numeric_launches();
                 lev += front.steps - 1;
+                continue;
+            }
+            const unsigned tiny_steps = t.copies == 1 ? a.tiny_chain_steps[lev] : 0;
+            if (tiny_steps)
+            {
+                ++count;
+                lev += tiny_steps - 1;
                 continue;
             }
             const bool targets = a.target_prefix[a.levels[lev + 1]] > a.target_prefix[a.levels[lev]];

@@ -2351,8 +2351,9 @@ void test_mapped_single_normalization(unsigned lower_count, unsigned target_coun
 void test_mapped_front(unsigned steps, unsigned copies, bool perturb, bool graph)
 {
     // Interleaved exterior rows and columns form a rectangular front whose
-    // entries occupy different sparse slots in each target column.
-    const unsigned n = steps + 13;
+    // entries occupy different sparse slots in each target column. Give
+    // the short chains at least 32 rows and columns to exercise the step limit.
+    const unsigned n = steps + (steps <= 8 ? 51 : 13);
     std::vector<unsigned> rows, columns{0};
     std::vector<double> input;
     for (unsigned c = 0; c < n; ++c)
@@ -2400,9 +2401,14 @@ void test_mapped_front(unsigned steps, unsigned copies, bool perturb, bool graph
     GpuMatrix mapped(matrix, 32, perturb, UpdateMode::Mapped), scan(matrix, 32, perturb, UpdateMode::Scan);
     GpuTask task(mapped, copies), reference(scan, copies);
     const size_t ordinary_bytes = size_t(matrix.nnz) * (copies + task.soa_value_stride()) * sizeof(REAL);
-    const bool blocked = steps >= 32 && copies == 1;
+    const bool blocked = steps >= 8 && copies == 1;
     if ((mapped.task_device_bytes(copies) > ordinary_bytes) != blocked || (blocked && task.numeric_launches() >= steps))
         throw std::runtime_error("incorrect mapped front workspace or launch count");
+    // In the seven-step case the first four levels use 3,604 products.
+    // The fifth exceeds the chain budget, leaving three separate updates
+    // and the final normalization.
+    if (steps == 7 && copies == 1 && task.numeric_launches() != 5)
+        throw std::runtime_error("incorrect mapped tiny-chain launch count: " + std::to_string(task.numeric_launches()));
     if (graph)
     {
         task.prepare_graph();
@@ -2964,6 +2970,8 @@ int main()
         for (bool graph : {false, true})
             for (bool perturb : {false, true})
             {
+                test_mapped_front(7, 1, perturb, graph);
+                test_mapped_front(8, 1, perturb, graph);
                 test_mapped_front(31, 1, perturb, graph);
                 test_mapped_front(32, 1, perturb, graph);
                 test_mapped_front(39, 1, perturb, graph);

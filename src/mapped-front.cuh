@@ -93,8 +93,8 @@ __global__ void mapped_front_diagonal(REAL* dense, unsigned ld, unsigned offset,
         dense[slot] = tile[c][r];
 }
 
-// Vertical edge threads factor a row against the diagonal tile and retain
-// its normalized L entries for Schur updates. Horizontal threads factor a column.
+// Each group of front_tile lanes solves one vertical or horizontal edge.
+// One lane holds each panel element and broadcasts it when it becomes the pivot.
 template <bool Perturb>
 __global__ void mapped_front_edges(REAL* dense,
     REAL* lower,
@@ -112,31 +112,32 @@ __global__ void mapped_front_edges(REAL* dense,
     if (r < steps && c < steps && r > c)
         tile[c][r] /= mapped_front_divisor<Perturb>(tile[c][c], threshold);
     __syncthreads();
-    const unsigned outer = offset + steps + blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned lane = r;
+    const unsigned outer = offset + steps + blockIdx.x * (blockDim.x / front_tile) + c;
     const bool vertical = blockIdx.y == 0;
-    if (outer >= (vertical ? rows : cols))
-        return;
-    REAL panel[front_tile];
-    for (unsigned k = 0; k < steps; ++k)
-        panel[k] = vertical ? dense[outer + (offset + k) * rows] : dense[offset + k + outer * rows];
+    const bool active = outer < (vertical ? rows : cols) && lane < steps;
+    const unsigned slot = vertical ? outer + (offset + lane) * rows : offset + lane + outer * rows;
+    REAL value = active ? dense[slot] : REAL(0);
     for (unsigned k = 0; k < steps; ++k)
     {
-        if (vertical)
+        REAL current = value;
+        if (vertical && active && lane == k)
         {
-            const REAL factor = panel[k] / mapped_front_divisor<Perturb>(tile[k][k], threshold);
-            lower[k * rows + outer] = factor;
-            for (unsigned j = k + 1; j < steps; ++j)
-                panel[j] = mapped_front_subtract(panel[j], factor, tile[j][k], dense + outer + (offset + j) * rows);
+            current /= mapped_front_divisor<Perturb>(tile[k][k], threshold);
+            lower[k * rows + outer] = current;
         }
-        else
-            for (unsigned i = k + 1; i < steps; ++i)
-                panel[i] = mapped_front_subtract(panel[i], tile[k][i], panel[k], dense + offset + i + outer * rows);
+        // Inactive groups and lanes also participate in the shuffle.
+#if defined(GLU_USE_HIP)
+        const REAL pivot = __shfl(current, k, front_tile);
+#else
+        const REAL pivot = __shfl_sync(0xffffffffu, current, k, front_tile);
+#endif
+        if (active && lane > k)
+            value = mapped_front_subtract(value, vertical ? pivot : tile[k][lane],
+                vertical ? tile[lane][k] : pivot, dense + slot);
     }
-    for (unsigned k = 0; k < steps; ++k)
-    {
-        const unsigned slot = vertical ? outer + (offset + k) * rows : offset + k + outer * rows;
-        dense[slot] = panel[k];
-    }
+    if (active)
+        dense[slot] = value;
 }
 
 __global__ void
@@ -339,7 +340,7 @@ MappedFrontPlan make_mapped_front_plan(
     const auto& levels = a.level_ptr;
     const auto& columns = a.level_idx;
     MappedFrontPlan plan;
-    // Amortize packing over at least two panels and bound per-task temporary storage.
+    constexpr unsigned minimum_single_source_steps = 8;
     for (size_t lev = 0; lev + 1 < levels.size();)
     {
         if (levels[lev + 1] - levels[lev] != 1)
@@ -363,7 +364,7 @@ MappedFrontPlan make_mapped_front_plan(
             if (nested_front_successor(a, prior) != next)
                 break;
         }
-        if (end - lev >= front_minimum_steps)
+        if (end - lev >= minimum_single_source_steps)
         {
             if (plan.starting_at.empty())
                 plan.starting_at.resize(levels.size() - 1);
@@ -404,8 +405,10 @@ void enqueue_mapped_front(const MappedFront& front,
         if (remaining_rows || remaining_cols)
         {
             const unsigned edges = std::max(remaining_rows, remaining_cols);
+            constexpr unsigned edges_per_block = 256 / front_tile;
             mapped_front_edges<Perturb>
-                <<<dim3((edges + 255) / 256, 2), 256, 0, stream>>>(dense, lower, rows, cols, offset, steps, threshold);
+                <<<dim3((edges + edges_per_block - 1) / edges_per_block, 2), 256, 0, stream>>>(
+                    dense, lower, rows, cols, offset, steps, threshold);
             gpu_check(cudaGetLastError(), "factor mapped front edges");
         }
         if (remaining_rows && remaining_cols)
