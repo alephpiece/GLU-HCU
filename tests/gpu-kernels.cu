@@ -2404,6 +2404,11 @@ void test_mapped_front(unsigned steps, unsigned copies, bool perturb, bool graph
     const bool blocked = steps >= 8 && copies == 1;
     if ((mapped.task_device_bytes(copies) > ordinary_bytes) != blocked || (blocked && task.numeric_launches() >= steps))
         throw std::runtime_error("incorrect mapped front workspace or launch count");
+    // In the seven-step case the first four levels use 3,604 products.
+    // The fifth exceeds the chain budget, leaving three separate updates
+    // and the final normalization.
+    if (steps == 7 && copies == 1 && task.numeric_launches() != 5)
+        throw std::runtime_error("incorrect mapped tiny-chain launch count: " + std::to_string(task.numeric_launches()));
     if (graph)
     {
         task.prepare_graph();
