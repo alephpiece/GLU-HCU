@@ -257,8 +257,9 @@ void diagonal_scaling()
     // An arrowhead with five off-diagonal entries in row 0. Its last
     // entry is outside the four recovery witnesses. Eliminating column 0
     // fills the rest of the square, including slots absent from compact input.
+    // Row 0 has off-diagonal sum 3.25 > 3 and needs the weighted certificate.
     auto regular = build_fixture(6, {0, 1, 2, 3, 4, 5, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5},
-        {0, 6, 8, 10, 12, 14, 16}, {3, .125, .125, .125, .125, .125, .125, 3, .125, 3, .125, 3, .125, 3, .125, 3});
+        {0, 6, 8, 10, 12, 14, 16}, {3, .125, .125, .125, .125, .125, 2.75, 3, .125, 3, .125, 3, .125, 3, .125, 3});
     const auto full_positions = regular.positions;
     regular.positions.erase(std::remove_if(regular.positions.begin(), regular.positions.end(),
         [&](unsigned p) { return regular.a->val[p] == 0; }), regular.positions.end());

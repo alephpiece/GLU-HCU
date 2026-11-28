@@ -152,6 +152,42 @@ struct HostPlan
     std::vector<REAL> base, expanded;
 };
 
+// A positive column weight leaves the rank of every leading block unchanged.
+// For exact row/column scale factors R,C, undoing R,C on the rounded input
+// perturbs each nonzero base entry by at most two normal multiply roundings.
+// A 1% margin covers those errors and the double sums of nonnegative terms.
+inline bool has_dominance_certificate(const HostPlan& plan, const std::vector<unsigned>& positions)
+{
+    const size_t n = plan.rows.size();
+    std::vector<double> weights(n, 1.0), off_diagonal(n);
+    // Try unit weights, then one row-sum estimate. Only the explicitly
+    // checked inequality certifies a template. The weights stay on the host.
+    for (unsigned attempt = 0; attempt < 2; ++attempt)
+    {
+        std::fill(off_diagonal.begin(), off_diagonal.end(), 0.0);
+        for (size_t p = 0; p < positions.size(); ++p)
+        {
+            const uint32_t coordinate = plan.factor_coordinates[positions[p]];
+            const unsigned row = coordinate & 65535;
+            const unsigned column = (coordinate & ~strict_lower) >> 16;
+            if (row != column)
+                off_diagonal[row] += std::abs(double(plan.base[p])) * weights[column];
+        }
+        bool dominant = true;
+        for (size_t row = 0; row < n; ++row)
+        {
+            const double diagonal = std::abs(double(plan.base[plan.rows[row].diagonal]));
+            if (!(diagonal * weights[row] > 1.01 * off_diagonal[row]))
+                dominant = false;
+            if (attempt == 0)
+                weights[row] = 1.0 + off_diagonal[row] / diagonal;
+        }
+        if (dominant)
+            return true;
+    }
+    return false;
+}
+
 inline HostPlan make_plan(const Symbolic_Matrix& a, const std::vector<unsigned>& positions)
 {
     if (positions.empty() || !a.n || a.n > max_order)
@@ -170,7 +206,6 @@ inline HostPlan make_plan(const Symbolic_Matrix& a, const std::vector<unsigned>&
         compact_slot[slot] = unsigned(p);
     }
     std::vector<unsigned> anchor_count(a.n);
-    std::vector<double> off_diagonal_sum(a.n);
     for (unsigned col = 0; col < a.n; ++col)
         for (unsigned slot = a.sym_c_ptr[col]; slot < a.sym_c_ptr[col + 1]; ++slot)
         {
@@ -190,24 +225,14 @@ inline HostPlan make_plan(const Symbolic_Matrix& a, const std::vector<unsigned>&
                 continue;
             if (slot == a.l_col_ptr[col])
                 plan.rows[row].diagonal = p;
-            else
-            {
-                off_diagonal_sum[row] += std::abs(double(base));
-                if (anchor_count[row] < 4)
-                    plan.rows[row].off[anchor_count[row]++] = p;
-            }
+            else if (anchor_count[row] < 4)
+                plan.rows[row].off[anchor_count[row]++] = p;
         }
-    // Undo the exact positive row/column scales conceptually. Each entry of
-    // that matrix differs from its base by at most two rounded multiplies.
-    // A 1% row dominance margin covers those roundings and the double row
-    // sums (even UINT32_MAX positive terms have relative error below 5e-7).
-    // Every leading principal block of the rounded input is therefore nonsingular.
-    for (unsigned row = 0; row < a.n; ++row)
-    {
-        const unsigned diagonal = plan.rows[row].diagonal;
-        if (diagonal == missing || std::abs(double(plan.base[diagonal])) <= 1.01 * off_diagonal_sum[row])
+    for (const auto& row : plan.rows)
+        if (row.diagonal == missing)
             return {};
-    }
+    if (!has_dominance_certificate(plan, positions))
+        return {};
     return plan;
 }
 
