@@ -1,4 +1,5 @@
 #include "symbolic.h"
+#include "../src/scale-certificate.h"
 #include <cmath>
 #include <sstream>
 #include <stdexcept>
@@ -57,10 +58,27 @@ void check_transitive_fill() {
         throw std::runtime_error("transitive fill lost a row or its multiplicity");
 }
 
+void check_weighted_scale_templates() {
+    std::ostringstream out, err;
+    Symbolic_Matrix a(3, out, err);
+    a.nnz=5; a.sym_c_ptr={0,1,3,5}; a.sym_r_idx={0,0,1,1,2};
+    a.l_col_ptr={0,2,4}; a.val={1,1.5,1,1.5,1};
+    // The first row still fails after one update. A second update makes all
+    // three weighted rows strictly dominant with the required margin.
+    if (diagonal_scale::make_plan(a,{0,1,2,3,4}).rows.empty())
+        throw std::runtime_error("missed a certifiable triangular template");
+    Symbolic_Matrix singular(2, out, err);
+    singular.nnz=4; singular.sym_c_ptr={0,2,4}; singular.sym_r_idx={0,1,0,1};
+    singular.l_col_ptr={0,3}; singular.val={1,1,1,1};
+    if (!diagonal_scale::make_plan(singular,{0,1,2,3}).rows.empty())
+        throw std::runtime_error("certified a singular template");
+}
+
 int main() {
     try {
         check_symbolic_preparation();
         check_transitive_fill();
+        check_weighted_scale_templates();
         std::ostringstream out, err;
         Symbolic_Matrix a(2,out,err);
         a.nnz=4;
