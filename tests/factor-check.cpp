@@ -1,4 +1,5 @@
 #include "symbolic.h"
+#include "../src/scale-certificate.h"
 #include <cmath>
 #include <sstream>
 #include <stdexcept>
@@ -57,10 +58,44 @@ void check_transitive_fill() {
         throw std::runtime_error("transitive fill lost a row or its multiplicity");
 }
 
+void check_weighted_scale_templates()
+{
+    std::ostringstream out, err;
+    // An upper bidiagonal matrix whose first row passes only after the fourth update.
+    Symbolic_Matrix triangular(4, out, err);
+    triangular.nnz = 7;
+    triangular.sym_c_ptr = {0, 1, 3, 5, 7};
+    triangular.sym_r_idx = {0, 0, 1, 1, 2, 2, 3};
+    triangular.l_col_ptr = {0, 2, 4, 6};
+    triangular.val = {1, 1.5, 1, 1.5, 1, 1.5, 1};
+    if (diagonal_scale::make_plan(triangular, {0, 1, 2, 3, 4, 5, 6}).rows.empty())
+        throw std::runtime_error("missed a template requiring four weight updates");
+
+    Symbolic_Matrix symmetric(2, out, err);
+    symmetric.nnz = 4;
+    symmetric.sym_c_ptr = {0, 2, 4};
+    symmetric.sym_r_idx = {0, 1, 0, 1};
+    symmetric.l_col_ptr = {0, 3};
+    symmetric.val = {1, 1, 1, 1};
+    if (!diagonal_scale::make_plan(symmetric, {0, 1, 2, 3}).rows.empty())
+        throw std::runtime_error("certified a singular template");
+
+    // Strictly dominant, but the diagonal falls short of the required 1% margin.
+    symmetric.val = {1, 255.0 / 256, 255.0 / 256, 1};
+    if (!diagonal_scale::make_plan(symmetric, {0, 1, 2, 3}).rows.empty())
+        throw std::runtime_error("certified a template without the dominance margin");
+
+    // The two strict inequalities would require both w0 > w1 and w1 > w0.
+    symmetric.val = {101, 100, 100, 101};
+    if (!diagonal_scale::make_plan(symmetric, {0, 1, 2, 3}).rows.empty())
+        throw std::runtime_error("certified a template exactly on the dominance margin");
+}
+
 int main() {
     try {
         check_symbolic_preparation();
         check_transitive_fill();
+        check_weighted_scale_templates();
         std::ostringstream out, err;
         Symbolic_Matrix a(2,out,err);
         a.nnz=4;

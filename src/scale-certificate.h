@@ -162,14 +162,19 @@ struct HostPlan
 // A positive column weight leaves the rank of every leading block unchanged.
 // For exact row/column scale factors R,C, undoing R,C on the rounded input
 // perturbs each nonzero base entry by at most two normal multiply roundings.
-// A 1% margin covers those errors and the double sums of nonnegative terms.
+// A 1% margin covers those input rounding errors.
 inline bool has_dominance_certificate(const HostPlan& plan, const std::vector<unsigned>& positions)
 {
     const size_t n = plan.rows.size();
     std::vector<double> weights(n, 1.0), off_diagonal(n);
-    // Try unit weights, then one row-sum estimate. Only the explicitly
-    // checked inequality certifies a template. The weights stay on the host.
-    for (unsigned attempt = 0; attempt < 2; ++attempt)
+    // A row has at most positions.size() nonnegative terms. Allow for their
+    // summation and the rounded products so equality cannot pass the strict test.
+    const double roundoff = (double(positions.size()) + 4) * std::numeric_limits<double>::epsilon();
+    const double margin = 1.01 / (1.0 - roundoff);
+    // Try w + H*w, where H = |D|^-1 |offdiag(B)|. A common scale of w
+    // cancels from the row inequalities, so no normalization is needed.
+    constexpr unsigned max_weight_updates = 4;
+    for (unsigned updates = 0; updates <= max_weight_updates; ++updates)
     {
         std::fill(off_diagonal.begin(), off_diagonal.end(), 0.0);
         for (size_t p = 0; p < positions.size(); ++p)
@@ -182,10 +187,10 @@ inline bool has_dominance_certificate(const HostPlan& plan, const std::vector<un
         for (size_t row = 0; row < n; ++row)
         {
             const double diagonal = std::abs(double(plan.base[plan.rows[row].diagonal]));
-            if (!(diagonal * weights[row] > 1.01 * off_diagonal[row]))
+            if (!(diagonal * weights[row] > margin * off_diagonal[row]))
                 dominant = false;
-            if (attempt == 0)
-                weights[row] = 1.0 + off_diagonal[row] / diagonal;
+            if (updates < max_weight_updates)
+                weights[row] += off_diagonal[row] / diagonal;
         }
         if (dominant)
             return true;
