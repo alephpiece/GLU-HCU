@@ -84,6 +84,11 @@ void check_weighted_scale_templates()
     symmetric.val = {1, 255.0 / 256, 255.0 / 256, 1};
     if (!diagonal_scale::make_plan(symmetric, {0, 1, 2, 3}).rows.empty())
         throw std::runtime_error("certified a template without the dominance margin");
+
+    // The two strict inequalities would require both w0 > w1 and w1 > w0.
+    symmetric.val = {101, 100, 100, 101};
+    if (!diagonal_scale::make_plan(symmetric, {0, 1, 2, 3}).rows.empty())
+        throw std::runtime_error("certified a template exactly on the dominance margin");
 }
 
 int main() {
