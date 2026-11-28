@@ -167,11 +167,10 @@ inline bool has_dominance_certificate(const HostPlan& plan, const std::vector<un
 {
     const size_t n = plan.rows.size();
     std::vector<double> weights(n, 1.0), off_diagonal(n);
-    // For H = |D|^-1 |offdiag(B)|, try positive weights (w + H*w)/2.
-    // All row sums use the same old vector. Only the full inequality below
-    // certifies a template. Four updates bound preparation on rejected inputs.
+    // Try w + H*w, where H = |D|^-1 |offdiag(B)|. A common scale of w
+    // cancels from the row inequalities, so no normalization is needed.
     constexpr unsigned max_weight_updates = 4;
-    for (unsigned attempt = 0; attempt <= max_weight_updates; ++attempt)
+    for (unsigned updates = 0; updates <= max_weight_updates; ++updates)
     {
         std::fill(off_diagonal.begin(), off_diagonal.end(), 0.0);
         for (size_t p = 0; p < positions.size(); ++p)
@@ -186,8 +185,8 @@ inline bool has_dominance_certificate(const HostPlan& plan, const std::vector<un
             const double diagonal = std::abs(double(plan.base[plan.rows[row].diagonal]));
             if (!(diagonal * weights[row] > 1.01 * off_diagonal[row]))
                 dominant = false;
-            if (attempt < max_weight_updates)
-                weights[row] = 0.5 * (weights[row] + off_diagonal[row] / diagonal);
+            if (updates < max_weight_updates)
+                weights[row] += off_diagonal[row] / diagonal;
         }
         if (dominant)
             return true;
