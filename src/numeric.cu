@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 #include <cstdint>
@@ -1171,32 +1172,38 @@ struct GpuMatrix::Impl
     Buffer<unsigned> input_positions;
     std::unique_ptr<diagonal_scale::Template> scaling_template;
 
+    template <bool Perturb> void factor_fused(REAL* factors, unsigned copies, cudaStream_t stream) const
+    {
+        if (panel_records.ptr)
+            fused_panel_factorize<Perturb, true><<<copies, fused_block_threads, 0, stream>>>(factors, nnz,
+                diag.ptr, level_idx.ptr, fused_steps.ptr, unsigned(levels.size() - 1), nullptr,
+                panel_records.ptr, panel_pairs.ptr, fused_strips.ptr, fused_destinations.ptr,
+                fused_normalizations.ptr, inline_singletons, threshold);
+        else
+            fused_panel_factorize<Perturb, false><<<copies, fused_block_threads, 0, stream>>>(factors, nnz,
+                diag.ptr, level_idx.ptr, fused_steps.ptr, unsigned(levels.size() - 1), panel_groups.ptr,
+                nullptr, panel_pairs.ptr, fused_strips.ptr, fused_destinations.ptr,
+                fused_normalizations.ptr, inline_singletons, threshold);
+        gpu_check(cudaGetLastError(), "factor fused matrix blocks");
+    }
+
     void prepare_scaling_template(const Symbolic_Matrix& a, const std::vector<unsigned>& positions)
     {
+        const unsigned min_fill = diagonal_scale::minimum_fill_ratio();
+        if (!min_fill || positions.empty() || nnz / min_fill < positions.size())
+            return;
         auto plan = diagonal_scale::make_plan(a, positions);
         if (plan.rows.empty()) return;
         auto scaling = std::make_unique<diagonal_scale::Template>();
         scaling->factors.upload(plan.expanded);
-        if (panel_records.ptr)
-            fused_panel_factorize<false, true><<<1, fused_block_threads>>>(scaling->factors.ptr, nnz,
-                diag.ptr, level_idx.ptr, fused_steps.ptr, unsigned(levels.size() - 1), nullptr,
-                panel_records.ptr, panel_pairs.ptr, fused_strips.ptr, fused_destinations.ptr,
-                fused_normalizations.ptr, inline_singletons, REAL(0));
-        else
-            fused_panel_factorize<false, false><<<1, fused_block_threads>>>(scaling->factors.ptr, nnz,
-                diag.ptr, level_idx.ptr, fused_steps.ptr, unsigned(levels.size() - 1), panel_groups.ptr,
-                nullptr, panel_pairs.ptr, fused_strips.ptr, fused_destinations.ptr,
-                fused_normalizations.ptr, inline_singletons, REAL(0));
-        gpu_check(cudaGetLastError(), "factor fixed compact base for diagonal reuse");
+        factor_fused<false>(scaling->factors.ptr, 1, nullptr);
         std::vector<REAL> host_factors(nnz);
         gpu_check(cudaMemcpy(host_factors.data(), scaling->factors.ptr, scaling->factors.bytes,
             cudaMemcpyDeviceToHost), "verify fixed compact base factors");
         if (!diagonal_scale::safe_base(a, plan.expanded, host_factors)) return;
         scaling->anchors.upload(plan.rows);
-        scaling->input_coordinates.upload(plan.input_coordinates);
         scaling->factor_coordinates.upload(plan.factor_coordinates);
         scaling->base.upload(plan.base);
-        scaling->inverse.upload(plan.inverse);
         shared_bytes = checked_sum(shared_bytes, scaling->bytes());
         scaling_template = std::move(scaling);
     }
@@ -1531,7 +1538,7 @@ struct GpuMatrix::Impl
             compact_setup_ms +=
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         }
-        if (mode == UpdateMode::Fused && !perturb && diagonal_scale::requested())
+        if (mode == UpdateMode::Fused && !perturb)
             prepare_scaling_template(a, positions);
         if (snapshot_policy == SnapshotPolicy::Device)
         {
@@ -1747,17 +1754,7 @@ struct GpuTask::Impl
         const bool soa = soa_stride != 0;
         if (a.update_mode == UpdateMode::Fused)
         {
-            if (a.panel_records.ptr)
-                fused_panel_factorize<Perturb, true><<<copies, a.fused_block_threads, 0, stream>>>(values.ptr, a.nnz,
-                    a.diag.ptr, a.level_idx.ptr, a.fused_steps.ptr, unsigned(a.levels.size() - 1), nullptr,
-                    a.panel_records.ptr, a.panel_pairs.ptr, a.fused_strips.ptr, a.fused_destinations.ptr,
-                    a.fused_normalizations.ptr, a.inline_singletons, a.threshold);
-            else
-                fused_panel_factorize<Perturb, false><<<copies, a.fused_block_threads, 0, stream>>>(values.ptr, a.nnz,
-                    a.diag.ptr, a.level_idx.ptr, a.fused_steps.ptr, unsigned(a.levels.size() - 1), a.panel_groups.ptr,
-                    nullptr, a.panel_pairs.ptr, a.fused_strips.ptr, a.fused_destinations.ptr,
-                    a.fused_normalizations.ptr, a.inline_singletons, a.threshold);
-            gpu_check(cudaGetLastError(), "factor fused matrix blocks");
+            a.factor_fused<Perturb>(values.ptr, copies, stream);
             return;
         }
         if constexpr (Mode == UpdateMode::Mapped)
@@ -2426,7 +2423,8 @@ struct GpuTaskSet::Impl
         else
         {
             tasks.upload(descriptors);
-            if (all_compact && !perturb && diagonal_scale::requested())
+            const unsigned min_fill = diagonal_scale::minimum_fill_ratio();
+            if (all_compact && !perturb && min_fill)
             {
                 std::vector<diagonal_scale::Job> jobs;
                 size_t order_sum = 0;
@@ -2437,10 +2435,10 @@ struct GpuTaskSet::Impl
                         descriptor.factor_offset) - full_offsets.begin();
                     const auto& matrix = *templates[indices[task]];
                     const auto* plan = matrix.scaling_template.get();
-                    if (plan)
+                    if (plan && matrix.nnz / min_fill >= matrix.compact_elements)
                     {
-                        jobs.push_back({matrix.n, order_sum, plan->anchors.ptr, plan->input_coordinates.ptr,
-                            plan->factor_coordinates.ptr, plan->base.ptr, plan->inverse.ptr, plan->factors.ptr});
+                        jobs.push_back({matrix.n, order_sum, plan->anchors.ptr,
+                            plan->factor_coordinates.ptr, plan->base.ptr, plan->factors.ptr});
                         order_sum = checked_sum(order_sum, matrix.n);
                     }
                     else

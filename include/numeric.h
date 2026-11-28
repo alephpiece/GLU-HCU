@@ -175,6 +175,8 @@ public:
     // that cache and reject templates with static pivot perturbation.
     void upload_input();
     void upload_input(const REAL* values, size_t elements);
+    // The opt-in Fused diagonal-scaling cache can reconstruct certified compact
+    // inputs with different rounding. Eligibility and costs are in docs/numeric-api.md.
     void upload_compact_input(const REAL* values, size_t elements);
     void enqueue(); // Default input is restored when none is queued.
     void wait();    // All factors are on the host before returning.
