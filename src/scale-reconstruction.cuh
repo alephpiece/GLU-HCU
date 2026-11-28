@@ -32,7 +32,7 @@ inline unsigned selected_tiles(unsigned limit)
 struct Template
 {
     Buffer<RowAnchors> anchors;
-    Buffer<uint32_t> factor_coordinates;
+    Buffer<FactorCoordinate> factor_coordinates;
     Buffer<REAL> base, factors;
 
     size_t bytes() const { return anchors.bytes + factor_coordinates.bytes + base.bytes + factors.bytes; }
@@ -76,7 +76,7 @@ struct Job
     unsigned n = 0;
     size_t code_offset = 0;
     const RowAnchors* anchors = nullptr;
-    const uint32_t* factor_coordinates = nullptr;
+    const FactorCoordinate* factor_coordinates = nullptr;
     const REAL *base = nullptr, *base_factors = nullptr;
 };
 
@@ -87,6 +87,9 @@ template <class Real> __device__ bool equal_bits(Real a, Real b)
     else
         return __double_as_longlong(a) == __double_as_longlong(b);
 }
+
+__device__ inline size_t first_tile_slot() { return size_t(blockIdx.y) * blockDim.x + threadIdx.x; }
+__device__ inline size_t tile_stride() { return size_t(gridDim.y) * blockDim.x; }
 
 __global__ void recover_rows(const REAL* values,
     const FusedTaskDescriptor* tasks,
@@ -105,7 +108,7 @@ __global__ void recover_rows(const REAL* values,
     }
     const auto* input = values + tasks[blockIdx.x].compact_offset;
     bool failed = false;
-    for (unsigned row = blockDim.x * blockIdx.y + threadIdx.x; row < job.n; row += blockDim.x * gridDim.y)
+    for (size_t row = first_tile_slot(); row < job.n; row += tile_stride())
     {
         uint16_t pair = 0;
         const bool found = recover_row(job.anchors[row], heads, pairs, input, job.base, pair);
@@ -129,9 +132,9 @@ __global__ void verify_inputs(const REAL* values,
     const auto* input = values + task.compact_offset;
     const auto* scales = codes + job.code_offset;
     bool mismatch = false;
-    for (unsigned p = blockDim.x * blockIdx.y + threadIdx.x; p < task.compact_count; p += blockDim.x * gridDim.y)
+    for (size_t p = first_tile_slot(); p < task.compact_count; p += tile_stride())
     {
-        const uint32_t coordinate = job.factor_coordinates[task.positions[p]];
+        const auto coordinate = job.factor_coordinates[task.positions[p]];
         const REAL expected = rebuild_input(job.base[p], coordinate, scales);
         mismatch |= !equal_bits(expected, input[p]);
     }
@@ -152,7 +155,7 @@ __global__ void write_factors(REAL* values,
     const auto task = tasks[blockIdx.x];
     auto* factors = values + task.factor_offset;
     const auto* scales = codes + job.code_offset;
-    for (unsigned p = blockDim.x * blockIdx.y + threadIdx.x; p < task.nnz; p += blockDim.x * gridDim.y)
+    for (size_t p = first_tile_slot(); p < task.nnz; p += tile_stride())
         factors[p] = rebuild_factor(job.base_factors[p], job.factor_coordinates[p], scales, reciprocals);
 }
 

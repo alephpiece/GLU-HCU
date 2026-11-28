@@ -162,6 +162,8 @@ const REAL* first = tasks.factors(0); // Task 0's factors, in template b's slot 
 
 ## 数值检查
 
-`GpuTask::check()` 与 `GpuTaskSet::check()` 检查各自全部因子的有限性与非零主元。完整因子残差由 `Symbolic_Matrix::factor_residual()` 计算，以该对象的 `val` 作为输入矩阵。每个逻辑任务的检查需使用保存其本轮初值的符号矩阵对象，原系统的解误差还需单独评价。
+`GpuTask::check()` 与 `GpuTaskSet::check()` 检查各自全部因子的有限性与非零主元。对启用缩放复用的集合，显式设置 `GLU_READY_SCALE_REPORT=1` 会在 `check()` 时读回并输出最近一次紧凑输入的命中统计。
+
+`Symbolic_Matrix::factor_residual(factors)` 以该对象的 `val` 计算完整因子残差。各轮共用符号结构时，可用 `factor_residual(factors, input)` 传入本轮初值。两个数组都采用完整的 CSC 因子槽布局，紧凑输入省略的槽在初值中填零。原系统的解误差需单独评价。
 
 完整方法与错误约定见 [numeric.h](../include/numeric.h)，因子残差和 CPU 三角求解接口见 [symbolic.h](../include/symbolic.h)。通用数值与失败路径回归见 [gpu-kernels.cu](../tests/gpu-kernels.cu)，块内执行和集合契约分别见 [fused-execution.cpp](../tests/fused-execution.cpp) 与 [task-set.cpp](../tests/task-set.cpp)。

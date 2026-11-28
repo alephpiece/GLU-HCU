@@ -287,16 +287,20 @@ void diagonal_scaling()
 
     const REAL fragile_scale = REAL(1024 + (sizeof(REAL) == 4 ? 35 : 34)) / REAL(1024);
     const REAL regular_scale = REAL(1049) / REAL(1024);
-    auto scaled = [](const Fixture& f, REAL s) {
-        auto values = f.a->val;
-        for (REAL& v : values)
-            v = (v * s) * s;
-        return values;
-    };
-    const auto singular = scaled(fragile, fragile_scale);
+    auto singular = fragile.a->val;
+    for (REAL& v : singular)
+        v = (v * fragile_scale) * fragile_scale;
     require(std::all_of(singular.begin(), singular.end(), [&](REAL v) { return v == singular[0]; }),
         "scaled fixture must have identical rows");
-    const auto good = scaled(regular, regular_scale);
+    // Keep the first pivot's rounding witness, then vary the other row and
+    // column scales independently so a swapped scale corrupts the residual.
+    const unsigned row_index[]{25, 25, 7, 52, 111, 190};
+    const unsigned column_index[]{25, 25, 29, 103, 151, 204};
+    auto scale = [](unsigned index) { return REAL(1024 + index) / REAL(1024); };
+    auto good = regular.a->val;
+    for (unsigned col = 0; col < regular.a->n; ++col)
+        for (unsigned p = regular.a->sym_c_ptr[col]; p < regular.a->sym_c_ptr[col + 1]; ++p)
+            good[p] = (good[p] * scale(row_index[regular.a->sym_r_idx[p]])) * scale(column_index[col]);
     auto changed = good;
     const auto non_witness = regular.a->sym_c_ptr[5]; // U(0,5) is also copied directly to output.
     changed[non_witness] = std::nextafter(changed[non_witness], std::numeric_limits<REAL>::infinity());

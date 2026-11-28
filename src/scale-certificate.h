@@ -17,9 +17,13 @@ constexpr unsigned choices = 256;
 constexpr unsigned first_product = denominator * denominator;
 constexpr unsigned last_product = (denominator + choices - 1) * (denominator + choices - 1);
 constexpr unsigned missing = std::numeric_limits<unsigned>::max();
-// Bits 0..15 contain the row, bits 16..30 the column, bit 31 identifies L.
 constexpr unsigned max_order = 1u << 15;
-constexpr uint32_t strict_lower = uint32_t(1) << 31;
+
+struct alignas(uint32_t) FactorCoordinate
+{
+    uint16_t row, column;
+};
+static_assert(sizeof(FactorCoordinate) == sizeof(uint32_t));
 
 struct ProductTable
 {
@@ -128,18 +132,21 @@ inline GLU_SCALE_HD bool recover_row(const RowAnchors& anchors,
     return true;
 }
 
-inline GLU_SCALE_HD REAL rebuild_input(REAL base, uint32_t coordinate, const uint16_t* scales)
+inline GLU_SCALE_HD REAL rebuild_input(REAL base, FactorCoordinate position, const uint16_t* scales)
 {
-    const auto row = scales[coordinate & 65535] & 255;
-    const auto column = scales[(coordinate & ~strict_lower) >> 16] >> 8;
+    const auto row = scales[position.row] & 255;
+    const auto column = scales[position.column] >> 8;
     return (base * coefficient(row)) * coefficient(column);
 }
 
-inline GLU_SCALE_HD REAL rebuild_factor(REAL base, uint32_t coordinate, const uint16_t* scales, const REAL* reciprocals)
+inline GLU_SCALE_HD REAL rebuild_factor(REAL base,
+    FactorCoordinate position,
+    const uint16_t* scales,
+    const REAL* reciprocals)
 {
-    const auto row = scales[coordinate & 65535] & 255;
-    const auto column = scales[(coordinate & ~strict_lower) >> 16];
-    const REAL multiplier = coordinate & strict_lower ? reciprocals[column & 255] : coefficient(column >> 8);
+    const auto row = scales[position.row] & 255;
+    const auto column = scales[position.column];
+    const REAL multiplier = position.row > position.column ? reciprocals[column & 255] : coefficient(column >> 8);
     return (base * coefficient(row)) * multiplier;
 }
 
@@ -148,7 +155,7 @@ inline GLU_SCALE_HD REAL rebuild_factor(REAL base, uint32_t coordinate, const ui
 struct HostPlan
 {
     std::vector<RowAnchors> rows;
-    std::vector<uint32_t> factor_coordinates;
+    std::vector<FactorCoordinate> factor_coordinates;
     std::vector<REAL> base, expanded;
 };
 
@@ -167,11 +174,9 @@ inline bool has_dominance_certificate(const HostPlan& plan, const std::vector<un
         std::fill(off_diagonal.begin(), off_diagonal.end(), 0.0);
         for (size_t p = 0; p < positions.size(); ++p)
         {
-            const uint32_t coordinate = plan.factor_coordinates[positions[p]];
-            const unsigned row = coordinate & 65535;
-            const unsigned column = (coordinate & ~strict_lower) >> 16;
-            if (row != column)
-                off_diagonal[row] += std::abs(double(plan.base[p])) * weights[column];
+            const auto position = plan.factor_coordinates[positions[p]];
+            if (position.row != position.column)
+                off_diagonal[position.row] += std::abs(double(plan.base[p])) * weights[position.column];
         }
         bool dominant = true;
         for (size_t row = 0; row < n; ++row)
@@ -210,8 +215,7 @@ inline HostPlan make_plan(const Symbolic_Matrix& a, const std::vector<unsigned>&
         for (unsigned slot = a.sym_c_ptr[col]; slot < a.sym_c_ptr[col + 1]; ++slot)
         {
             const unsigned row = a.sym_r_idx[slot];
-            const uint32_t coord = row | (uint32_t(col) << 16);
-            plan.factor_coordinates[slot] = coord | (slot > a.l_col_ptr[col] ? strict_lower : 0u);
+            plan.factor_coordinates[slot] = {uint16_t(row), uint16_t(col)};
             const unsigned p = compact_slot[slot];
             if (p == missing)
                 continue;
@@ -270,10 +274,8 @@ inline bool safe_base(const Symbolic_Matrix& a, const std::vector<REAL>& expande
     for (const double row : product_rows)
         if (!std::isfinite(row) || row > 32 * greatest)
             return false;
-    auto reference = a;
-    reference.val = expanded;
     const double threshold = sizeof(REAL) == 8 ? 1e-12 : 1e-5;
-    const double residual = reference.factor_residual(factors.data());
+    const double residual = a.factor_residual(factors.data(), expanded.data());
     return std::isfinite(residual) && residual <= threshold;
 }
 

@@ -1193,14 +1193,16 @@ struct GpuMatrix::Impl
         if (!min_fill || positions.empty() || nnz / min_fill < positions.size())
             return;
         auto plan = diagonal_scale::make_plan(a, positions);
-        if (plan.rows.empty()) return;
+        if (plan.rows.empty())
+            return;
         auto scaling = std::make_unique<diagonal_scale::Template>();
         scaling->factors.upload(plan.expanded);
         factor_fused<false>(scaling->factors.ptr, 1, nullptr);
         std::vector<REAL> host_factors(nnz);
         gpu_check(cudaMemcpy(host_factors.data(), scaling->factors.ptr, scaling->factors.bytes,
             cudaMemcpyDeviceToHost), "verify fixed compact base factors");
-        if (!diagonal_scale::safe_base(a, plan.expanded, host_factors)) return;
+        if (!diagonal_scale::safe_base(a, plan.expanded, host_factors))
+            return;
         scaling->anchors.upload(plan.rows);
         scaling->factor_coordinates.upload(plan.factor_coordinates);
         scaling->base.upload(plan.base);
@@ -2427,8 +2429,8 @@ struct GpuTaskSet::Impl
             if (all_compact && !perturb && min_fill)
             {
                 std::vector<diagonal_scale::Job> jobs;
+                jobs.reserve(descriptors.size());
                 size_t order_sum = 0;
-                unsigned max_tiles = std::numeric_limits<unsigned>::max();
                 for (const auto& descriptor : descriptors)
                 {
                     const auto task = std::lower_bound(full_offsets.begin(), full_offsets.end(),
@@ -2443,10 +2445,10 @@ struct GpuTaskSet::Impl
                     }
                     else
                         jobs.emplace_back();
-                    max_tiles = std::min(max_tiles, matrix.max_batch);
                 }
                 if (order_sum)
-                    scaling = std::make_unique<diagonal_scale::TaskSet>(jobs, order_sum, max_tiles);
+                    scaling = std::make_unique<diagonal_scale::TaskSet>(jobs, order_sum,
+                        templates[indices.front()]->max_batch);
             }
         }
         gpu_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create task set stream");
@@ -2526,7 +2528,8 @@ size_t GpuTaskSet::compact_input_offset(size_t task) const { return impl_->compa
 size_t GpuTaskSet::device_bytes() const
 {
     size_t bytes = checked_sum(checked_sum(impl_->values.bytes, impl_->compact_values.bytes), impl_->tasks.bytes);
-    if (impl_->scaling) bytes = checked_sum(bytes, impl_->scaling->bytes());
+    if (impl_->scaling)
+        bytes = checked_sum(bytes, impl_->scaling->bytes());
     if (const auto* m = impl_->mapped.get())
         for (auto size : {m->tasks.bytes, m->columns.bytes, m->updates.bytes})
             bytes = checked_sum(bytes, size);
@@ -2656,9 +2659,12 @@ const REAL* GpuTaskSet::factors(size_t task) const
 }
 void GpuTaskSet::check() const
 {
-    if (impl_->scaling && impl_->compact_queued && impl_->ready && !impl_->failed &&
-        std::getenv("GLU_READY_SCALE_REPORT"))
-        impl_->scaling->report();
+    if (impl_->scaling && impl_->compact_queued && impl_->ready && !impl_->failed)
+    {
+        const char* report = std::getenv("GLU_READY_SCALE_REPORT");
+        if (report && std::strcmp(report, "1") == 0)
+            impl_->scaling->report();
+    }
     for (size_t task = 0; task < task_count(); ++task)
     {
         const auto& a = *impl_->templates[impl_->task_templates[task]];

@@ -272,6 +272,10 @@ vector<REAL> Symbolic_Matrix::solve(SNicsLU *nicslu, const vector<REAL> &rhs, co
 // Accumulate one sparse product column in long double; include product entries
 // outside B's pattern. No dense n*n matrix, sampling, or checksum substitution.
 double Symbolic_Matrix::factor_residual(const REAL* lu) const {
+    return factor_residual(lu, val.data());
+}
+
+double Symbolic_Matrix::factor_residual(const REAL* lu, const REAL* input) const {
     const auto& a = *this;
     std::vector<long double> column(a.n,0), residual_rows(a.n,0), matrix_rows(a.n,0);
     std::vector<unsigned> touched;
@@ -290,8 +294,8 @@ double Symbolic_Matrix::factor_residual(const REAL* lu) const {
                 add(a.sym_r_idx[q],j,static_cast<long double>(lu[q])*u);
         }
         for (unsigned p=a.sym_c_ptr[j]; p<a.sym_c_ptr[j+1]; ++p) {
-            add(a.sym_r_idx[p],j,-static_cast<long double>(a.val[p]));
-            matrix_rows[a.sym_r_idx[p]] += std::abs(static_cast<long double>(a.val[p]));
+            add(a.sym_r_idx[p],j,-static_cast<long double>(input[p]));
+            matrix_rows[a.sym_r_idx[p]] += std::abs(static_cast<long double>(input[p]));
         }
         for (unsigned i : touched) {
             if (!std::isfinite(column[i])) throw std::runtime_error("nonfinite LU product");

@@ -26,6 +26,8 @@ public:
     // Complete preprocessed-matrix ||B-LU||inf / ||B||inf (long double accumulation).
     // Includes product entries outside B's structural pattern.
     double factor_residual(const REAL* factors) const;
+    // Use this round's input in the same filled CSC layout as val.
+    double factor_residual(const REAL* factors, const REAL* input) const;
     void csr();
     void leveling();
     void fill_in(unsigned*, unsigned*);
