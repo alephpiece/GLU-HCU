@@ -68,6 +68,10 @@ int main() {
         a.val={4,1,2,3};
         REAL lu[]{4,0.25,2,2.5};
         expect(a.factor_residual(lu),0);
+        const REAL compact_expanded[]{4,1,0,3};
+        const REAL compact_lu[]{4,0.25,0,3};
+        expect(a.factor_residual(compact_lu, compact_expanded),0);
+        expect(a.factor_residual(compact_lu),2.0/6.0);
         lu[1]=0.5;
         expect(a.factor_residual(lu),0.25);
         // L21*U13 produces a nonzero at (2,3) outside this supplied pattern.

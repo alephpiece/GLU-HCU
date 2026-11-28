@@ -2931,6 +2931,34 @@ void test_inline_update_groups()
     std::cout << "PASS panel/ordinary-inline-packed-groups-order-prefix-tail-and-nonfinite\n";
 }
 
+void test_diagonal_scale_lookup_lifetime()
+{
+    std::weak_ptr<const diagonal_scale::Lookup> previous;
+    {
+        const auto first = diagonal_scale::lookup();
+        const auto second = diagonal_scale::lookup();
+        if (first != second)
+            throw std::runtime_error("live scale lookups did not share their device buffers");
+        previous = first;
+    }
+    if (!previous.expired())
+        throw std::runtime_error("scale lookup outlived its last owner");
+    // All earlier tests have released their device allocations and streams.
+#if defined(GLU_USE_HIP)
+    check_gpu(hipDeviceReset(), "reset device before scale lookup");
+#else
+    check_gpu(cudaDeviceReset(), "reset device before scale lookup");
+#endif
+    GpuMatrix::select_device();
+    const auto fresh = diagonal_scale::lookup();
+    REAL reciprocal = 0;
+    check_gpu(cudaMemcpy(&reciprocal, fresh->reciprocals.ptr + 128, sizeof(REAL), cudaMemcpyDeviceToHost),
+        "read scale lookup in the new context");
+    if (reciprocal != REAL(8) / REAL(9))
+        throw std::runtime_error("invalid scale coefficient after device reset");
+    std::cout << "PASS diagonal scale lookup sharing and device reset\n";
+}
+
 int main()
 {
     try
@@ -3026,6 +3054,7 @@ int main()
         }
         test_invalid_factor(REAL(0), "zero diagonal");
         test_invalid_factor(std::numeric_limits<REAL>::quiet_NaN(), "NaN/Inf");
+        test_diagonal_scale_lookup_lifetime();
         std::cout << "All GPU numeric cases passed.\n";
         return 0;
     }

@@ -144,7 +144,11 @@ const REAL* first = tasks.factors(0); // Task 0's factors, in template b's slot 
 
 集合分别按完整因子数和紧凑位置数计算前缀偏移，`factor_offset(t)` 与 `compact_input_offset(t)` 给出第 `t` 个任务的起点，终点下标 `task_count()` 返回总元素数。完整输入按 `[task][factor slot]` 拼接，紧凑输入按 `[task][input position]` 拼接。紧凑上传要求全部任务的模板都已准备位置表，完整输入和默认恢复不要求位置表。
 
-两种集合每轮各做一次连续 H2D 上传和 D2H 输出，完整因子使用普通 AoS 布局。Fused 把清零、紧凑输入 scatter 和分解合入一次 grid 启动。Mapped 先清零并按固定位置 scatter 紧凑输入，再提交分层数值工作。
+两种集合每轮各做一次连续 H2D 上传和 D2H 输出，完整因子使用普通 AoS 布局。常规 Fused 把清零、紧凑输入 scatter 和分解合入一次 grid 启动。Mapped 先清零并按固定位置 scatter 紧凑输入，再提交分层数值工作。
+
+Fused 集合可对满足特定正行列缩放关系的紧凑新值复用模板因子。在构建模板和集合前设置 `GLU_READY_DIAGONAL_SCALE=1` 选择全部合格模板，或设为 `fill2` 仅选择因子槽数至少为紧凑输入槽数两倍的模板。默认关闭。设置影响模板准备阶段的预分解、残差检查和显存，即使后来只提交默认值或完整输入，也已支付这些成本。每份模板的缓存计入共享设备数组，各集合的状态计入 `device_bytes()`；同时存在的可复用集合还共用一份约 2.48 MB 的设备查表，最后一个持有它的集合析构时释放。
+
+复用限于固定主元顺序、无扰动的 Fused 集合，阶数上限为 32768。准备时先取单位列权重，再按需要取一次正的行和权重。必须验证加权后每行的基准对角绝对值大于该行非对角绝对值之和的 1.01 倍。权重只用于主机准入检查。基准因子还须通过残差和增长检查。此条件让输入的两次浮点缩放舍入保留各前导主子阵的非奇异性。每轮从实际输入恢复系数（每个系数取自 `(1024+k)/1024`，`0 ≤ k < 256`），按原运算次序逐字验证，整份矩阵通过后重建全部因子。不能恢复、未通过验证或缺少合格模板的任务按常规 Fused 分解。返回相同精度及布局，重建和直接分解的因子可以有舍入差异。
 
 `upload_input()` 或没有显式输入的 `enqueue()` 恢复各模板的默认初值。新值上传不分配或修改默认缓存，含静态主元扰动的集合只接受默认初值。
 
@@ -158,6 +162,8 @@ const REAL* first = tasks.factors(0); // Task 0's factors, in template b's slot 
 
 ## 数值检查
 
-`GpuTask::check()` 与 `GpuTaskSet::check()` 检查各自全部因子的有限性与非零主元。完整因子残差由 `Symbolic_Matrix::factor_residual()` 计算，以该对象的 `val` 作为输入矩阵。每个逻辑任务的检查需使用保存其本轮初值的符号矩阵对象，原系统的解误差还需单独评价。
+`GpuTask::check()` 与 `GpuTaskSet::check()` 检查各自全部因子的有限性与非零主元。对启用缩放复用的集合，显式设置 `GLU_READY_SCALE_REPORT=1` 会在 `check()` 时读回并输出最近一次紧凑输入的命中统计。
+
+`Symbolic_Matrix::factor_residual(factors)` 以该对象的 `val` 计算完整因子残差。各轮共用符号结构时，可用 `factor_residual(factors, input)` 传入本轮初值。两个数组都采用完整的 CSC 因子槽布局，紧凑输入省略的槽在初值中填零。原系统的解误差需单独评价。
 
 完整方法与错误约定见 [numeric.h](../include/numeric.h)，因子残差和 CPU 三角求解接口见 [symbolic.h](../include/symbolic.h)。通用数值与失败路径回归见 [gpu-kernels.cu](../tests/gpu-kernels.cu)，块内执行和集合契约分别见 [fused-execution.cpp](../tests/fused-execution.cpp) 与 [task-set.cpp](../tests/task-set.cpp)。

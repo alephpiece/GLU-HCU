@@ -2,7 +2,10 @@
 #include "update-plan.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -243,6 +246,103 @@ Fixture build_fixture(unsigned n, std::vector<unsigned> rows, std::vector<unsign
     for (unsigned p = f.a->nnz; p > 0; --p)
         f.positions.push_back(p - 1);
     return f;
+}
+void diagonal_scaling()
+{
+    // A and B differ by one ULP. Scaling each twice rounds them to the same
+    // value, so this round's 2x2 input has two identical rows.
+    const REAL a = sizeof(REAL) == 4 ? REAL(0x1.ep0) : REAL(0x1.e000000000001p0);
+    const REAL b = std::nextafter(a, std::numeric_limits<REAL>::infinity());
+    auto fragile = build_fixture(2, {0, 1, 0, 1}, {0, 2, 4}, {a, a, a, b});
+    // An arrowhead with five off-diagonal entries in row 0. Its last
+    // entry is outside the four recovery witnesses. Eliminating column 0
+    // fills the rest of the square, including slots absent from compact input.
+    // Row 0 has off-diagonal sum 3.25 > 3 and needs the weighted certificate.
+    auto regular = build_fixture(6, {0, 1, 2, 3, 4, 5, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5},
+        {0, 6, 8, 10, 12, 14, 16}, {3, .125, .125, .125, .125, .125, 2.75, 3, .125, 3, .125, 3, .125, 3, .125, 3});
+    const auto full_positions = regular.positions;
+    regular.positions.erase(std::remove_if(regular.positions.begin(), regular.positions.end(),
+        [&](unsigned p) { return regular.a->val[p] == 0; }), regular.positions.end());
+
+    auto bind = [&]() {
+        GpuMatrix small(*fragile.a, fragile.positions, 1, false, UpdateMode::Fused);
+        GpuMatrix large(*regular.a, regular.positions, 1, false, UpdateMode::Fused);
+        return std::make_unique<GpuTaskSet>(std::vector<const GpuMatrix*>{&small, &large},
+            std::vector<size_t>{0, 1, 1});
+    };
+    // The same arrowhead with every fill slot supplied explicitly has ratio 1.
+    auto low_fill_bytes = [&]() {
+        GpuMatrix matrix(*regular.a, full_positions, 1, false, UpdateMode::Fused);
+        return matrix.shared_device_bytes();
+    };
+    require(unsetenv("GLU_READY_DIAGONAL_SCALE") == 0, "cannot disable diagonal scaling");
+    const size_t low_fill_direct_bytes = low_fill_bytes();
+    auto direct = bind();
+    require(setenv("GLU_READY_DIAGONAL_SCALE", "1", 1) == 0, "cannot enable diagonal scaling");
+    require(low_fill_bytes() > low_fill_direct_bytes, "full reuse did not prepare the low-fill template");
+    auto reuse = bind();
+    require(setenv("GLU_READY_DIAGONAL_SCALE", "fill2", 1) == 0, "cannot select high-fill templates");
+    require(low_fill_bytes() == low_fill_direct_bytes, "fill2 allocated a cache for the low-fill template");
+    auto high_fill = bind();
+
+    const REAL fragile_scale = REAL(1024 + (sizeof(REAL) == 4 ? 35 : 34)) / REAL(1024);
+    const REAL regular_scale = REAL(1049) / REAL(1024);
+    auto singular = fragile.a->val;
+    for (REAL& v : singular)
+        v = (v * fragile_scale) * fragile_scale;
+    require(std::all_of(singular.begin(), singular.end(), [&](REAL v) { return v == singular[0]; }),
+        "scaled fixture must have identical rows");
+    // Keep the first pivot's rounding witness, then vary the other row and
+    // column scales independently so a swapped scale corrupts the residual.
+    const unsigned row_index[]{25, 25, 7, 52, 111, 190};
+    const unsigned column_index[]{25, 25, 29, 103, 151, 204};
+    auto scale = [](unsigned index) { return REAL(1024 + index) / REAL(1024); };
+    auto good = regular.a->val;
+    for (unsigned col = 0; col < regular.a->n; ++col)
+        for (unsigned p = regular.a->sym_c_ptr[col]; p < regular.a->sym_c_ptr[col + 1]; ++p)
+            good[p] = (good[p] * scale(row_index[regular.a->sym_r_idx[p]])) * scale(column_index[col]);
+    auto changed = good;
+    const auto non_witness = regular.a->sym_c_ptr[5]; // U(0,5) is also copied directly to output.
+    changed[non_witness] = std::nextafter(changed[non_witness], std::numeric_limits<REAL>::infinity());
+    const unsigned lower = regular.a->l_col_ptr[0] + 1;
+    const REAL rebuilt_lower = ((REAL(.125) / REAL(3)) * regular_scale) * (REAL(1) / regular_scale);
+    const size_t regular_bytes = regular.a->nnz * sizeof(REAL);
+    for (size_t hit : {1u, 2u})
+    {
+        std::vector<REAL> compact;
+        for (unsigned p : fragile.positions)
+            compact.push_back(singular[p]);
+        for (size_t job : {1u, 2u})
+            for (unsigned p : regular.positions)
+                compact.push_back((job == hit ? good : changed)[p]);
+        for (auto* set : {direct.get(), reuse.get(), high_fill.get()})
+        {
+            set->upload_compact_input(compact.data(), compact.size());
+            set->enqueue();
+            set->wait();
+            require(set->factors(0)[fragile.a->l_col_ptr[1]] == 0,
+                "rounded singular input was given a nonzero final pivot");
+            rejects<std::runtime_error>([&] { set->check(); }, "rounded singular input passed factor checks");
+        }
+        require(direct->factors(hit)[lower] != rebuilt_lower && reuse->factors(hit)[lower] == rebuilt_lower &&
+                high_fill->factors(hit)[lower] == rebuilt_lower,
+            "valid scaled input did not use the expected reconstructed lower factor");
+        residual(*regular.a, good.data(), reuse->factors(hit));
+        const size_t miss = 3 - hit;
+        require(reuse->factors(miss)[non_witness] == changed[non_witness] &&
+                std::memcmp(direct->factors(miss), reuse->factors(miss), regular_bytes) == 0,
+            "single-ULP change outside the witnesses did not preserve every direct factor byte");
+    }
+    for (auto* set : {direct.get(), reuse.get()})
+    {
+        set->enqueue();
+        set->wait();
+        set->check();
+    }
+    const size_t total = direct->factor_offset(direct->task_count());
+    require(std::memcmp(direct->factors(0), reuse->factors(0), total * sizeof(REAL)) == 0,
+        "default input after scale reuse changed direct factors");
+    require(unsetenv("GLU_READY_DIAGONAL_SCALE") == 0, "cannot clear diagonal scaling");
 }
 Fixture collision()
 {
@@ -498,6 +598,7 @@ int main()
         }
         mapped_position_widths();
         api_boundaries();
+        diagonal_scaling();
         std::cout << "PASS heterogeneous task-set offsets, compact reset, snapshots, lifetime and API boundaries\n";
         return 0;
     }

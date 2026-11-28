@@ -4,9 +4,13 @@
 #include <iostream>
 #include "symbolic.h"
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 #include <cstdint>
@@ -702,10 +706,9 @@ struct FusedTaskDescriptor
     REAL threshold;
 };
 
-__global__ void fused_task_set(REAL* factors, const REAL* input, const FusedTaskDescriptor* tasks, bool compact)
+__device__ void fused_task_compute(REAL* values, const REAL* input,
+    const FusedTaskDescriptor& task, bool compact)
 {
-    const auto task = tasks[blockIdx.x];
-    REAL* values = factors + task.factor_offset;
     if (compact)
     {
         for (size_t p = threadIdx.x; p < task.nnz; p += blockDim.x)
@@ -738,6 +741,13 @@ __global__ void fused_task_set(REAL* factors, const REAL* input, const FusedTask
                 task.records, task.pairs, task.strips, task.destinations, task.normalizations, task.inline_singletons,
                 task.threshold);
     }
+}
+
+__global__ void fused_task_set(REAL* factors, const REAL* input, const FusedTaskDescriptor* tasks, bool compact)
+{
+    const auto task = tasks[blockIdx.x];
+    REAL* values = factors + task.factor_offset;
+    fused_task_compute(values, input, task, compact);
 }
 
 #include "update-tiles.cuh"
@@ -926,6 +936,8 @@ template <class T, bool Pinned = false> struct Buffer
             gpu_check(cudaMemcpy(ptr, input.data(), bytes, cudaMemcpyHostToDevice), "upload structure");
     }
 };
+
+#include "scale-reconstruction.cuh"
 
 template <class Slot> __host__ __device__ Slot encode_mapped_position(unsigned destination, unsigned pivot)
 {
@@ -1158,6 +1170,45 @@ struct GpuMatrix::Impl
     Buffer<REAL, true> input;
     Buffer<REAL> initial_values;
     Buffer<unsigned> input_positions;
+    std::unique_ptr<diagonal_scale::Template> scaling_template;
+
+    template <bool Perturb> void factor_fused(REAL* factors, unsigned copies, cudaStream_t stream) const
+    {
+        if (panel_records.ptr)
+            fused_panel_factorize<Perturb, true><<<copies, fused_block_threads, 0, stream>>>(factors, nnz,
+                diag.ptr, level_idx.ptr, fused_steps.ptr, unsigned(levels.size() - 1), nullptr,
+                panel_records.ptr, panel_pairs.ptr, fused_strips.ptr, fused_destinations.ptr,
+                fused_normalizations.ptr, inline_singletons, threshold);
+        else
+            fused_panel_factorize<Perturb, false><<<copies, fused_block_threads, 0, stream>>>(factors, nnz,
+                diag.ptr, level_idx.ptr, fused_steps.ptr, unsigned(levels.size() - 1), panel_groups.ptr,
+                nullptr, panel_pairs.ptr, fused_strips.ptr, fused_destinations.ptr,
+                fused_normalizations.ptr, inline_singletons, threshold);
+        gpu_check(cudaGetLastError(), "factor fused matrix blocks");
+    }
+
+    void prepare_scaling_template(const Symbolic_Matrix& a, const std::vector<unsigned>& positions)
+    {
+        const unsigned min_fill = diagonal_scale::minimum_fill_ratio();
+        if (!min_fill || positions.empty() || nnz / min_fill < positions.size())
+            return;
+        auto plan = diagonal_scale::make_plan(a, positions);
+        if (plan.rows.empty())
+            return;
+        auto scaling = std::make_unique<diagonal_scale::Template>();
+        scaling->factors.upload(plan.expanded);
+        factor_fused<false>(scaling->factors.ptr, 1, nullptr);
+        std::vector<REAL> host_factors(nnz);
+        gpu_check(cudaMemcpy(host_factors.data(), scaling->factors.ptr, scaling->factors.bytes,
+            cudaMemcpyDeviceToHost), "verify fixed compact base factors");
+        if (!diagonal_scale::safe_base(a, plan.expanded, host_factors))
+            return;
+        scaling->anchors.upload(plan.rows);
+        scaling->factor_coordinates.upload(plan.factor_coordinates);
+        scaling->base.upload(plan.base);
+        shared_bytes = checked_sum(shared_bytes, scaling->bytes());
+        scaling_template = std::move(scaling);
+    }
 
     bool medium_targets_fit(size_t lev) const
     {
@@ -1489,6 +1540,8 @@ struct GpuMatrix::Impl
             compact_setup_ms +=
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         }
+        if (mode == UpdateMode::Fused && !perturb)
+            prepare_scaling_template(a, positions);
         if (snapshot_policy == SnapshotPolicy::Device)
         {
             const auto start = std::chrono::steady_clock::now();
@@ -1703,17 +1756,7 @@ struct GpuTask::Impl
         const bool soa = soa_stride != 0;
         if (a.update_mode == UpdateMode::Fused)
         {
-            if (a.panel_records.ptr)
-                fused_panel_factorize<Perturb, true><<<copies, a.fused_block_threads, 0, stream>>>(values.ptr, a.nnz,
-                    a.diag.ptr, a.level_idx.ptr, a.fused_steps.ptr, unsigned(a.levels.size() - 1), nullptr,
-                    a.panel_records.ptr, a.panel_pairs.ptr, a.fused_strips.ptr, a.fused_destinations.ptr,
-                    a.fused_normalizations.ptr, a.inline_singletons, a.threshold);
-            else
-                fused_panel_factorize<Perturb, false><<<copies, a.fused_block_threads, 0, stream>>>(values.ptr, a.nnz,
-                    a.diag.ptr, a.level_idx.ptr, a.fused_steps.ptr, unsigned(a.levels.size() - 1), a.panel_groups.ptr,
-                    nullptr, a.panel_pairs.ptr, a.fused_strips.ptr, a.fused_destinations.ptr,
-                    a.fused_normalizations.ptr, a.inline_singletons, a.threshold);
-            gpu_check(cudaGetLastError(), "factor fused matrix blocks");
+            a.factor_fused<Perturb>(values.ptr, copies, stream);
             return;
         }
         if constexpr (Mode == UpdateMode::Mapped)
@@ -2326,6 +2369,7 @@ struct GpuTaskSet::Impl
     Buffer<REAL> values, compact_values;
     Buffer<REAL, true> output, default_input;
     Buffer<FusedTaskDescriptor> tasks;
+    std::unique_ptr<diagonal_scale::TaskSet> scaling;
     std::unique_ptr<MappedSetPlan> mapped;
     unsigned block_threads = 256;
     cudaStream_t stream = nullptr;
@@ -2379,7 +2423,34 @@ struct GpuTaskSet::Impl
         if (mapped)
             mapped->build(templates, indices, full_offsets, compact_offsets);
         else
+        {
             tasks.upload(descriptors);
+            const unsigned min_fill = diagonal_scale::minimum_fill_ratio();
+            if (all_compact && !perturb && min_fill)
+            {
+                std::vector<diagonal_scale::Job> jobs;
+                jobs.reserve(descriptors.size());
+                size_t order_sum = 0;
+                for (const auto& descriptor : descriptors)
+                {
+                    const auto task = std::lower_bound(full_offsets.begin(), full_offsets.end(),
+                        descriptor.factor_offset) - full_offsets.begin();
+                    const auto& matrix = *templates[indices[task]];
+                    const auto* plan = matrix.scaling_template.get();
+                    if (plan && matrix.nnz / min_fill >= matrix.compact_elements)
+                    {
+                        jobs.push_back({matrix.n, order_sum, plan->anchors.ptr,
+                            plan->factor_coordinates.ptr, plan->base.ptr, plan->factors.ptr});
+                        order_sum = checked_sum(order_sum, matrix.n);
+                    }
+                    else
+                        jobs.emplace_back();
+                }
+                if (order_sum)
+                    scaling = std::make_unique<diagonal_scale::TaskSet>(jobs, order_sum,
+                        templates[indices.front()]->max_batch);
+            }
+        }
         gpu_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create task set stream");
     }
     ~Impl()
@@ -2457,6 +2528,8 @@ size_t GpuTaskSet::compact_input_offset(size_t task) const { return impl_->compa
 size_t GpuTaskSet::device_bytes() const
 {
     size_t bytes = checked_sum(checked_sum(impl_->values.bytes, impl_->compact_values.bytes), impl_->tasks.bytes);
+    if (impl_->scaling)
+        bytes = checked_sum(bytes, impl_->scaling->bytes());
     if (const auto* m = impl_->mapped.get())
         for (auto size : {m->tasks.bytes, m->columns.bytes, m->updates.bytes})
             bytes = checked_sum(bytes, size);
@@ -2538,9 +2611,14 @@ void GpuTaskSet::enqueue()
         }
         else
         {
-            fused_task_set<<<unsigned(task_count()), t.block_threads, 0, t.stream>>>(t.values.ptr, t.compact_values.ptr,
-                t.tasks.ptr, t.compact_queued);
-            gpu_check(cudaGetLastError(), "factor task set");
+            if (t.scaling && t.compact_queued)
+                t.scaling->enqueue(t.values.ptr, t.compact_values.ptr, t.tasks.ptr, t.block_threads, t.stream);
+            else
+            {
+                fused_task_set<<<unsigned(task_count()), t.block_threads, 0, t.stream>>>(t.values.ptr,
+                    t.compact_values.ptr, t.tasks.ptr, t.compact_queued);
+                gpu_check(cudaGetLastError(), "factor task set");
+            }
             t.download();
         }
     }
@@ -2581,6 +2659,12 @@ const REAL* GpuTaskSet::factors(size_t task) const
 }
 void GpuTaskSet::check() const
 {
+    if (impl_->scaling && impl_->compact_queued && impl_->ready && !impl_->failed)
+    {
+        const char* report = std::getenv("GLU_READY_SCALE_REPORT");
+        if (report && std::strcmp(report, "1") == 0)
+            impl_->scaling->report();
+    }
     for (size_t task = 0; task < task_count(); ++task)
     {
         const auto& a = *impl_->templates[impl_->task_templates[task]];
